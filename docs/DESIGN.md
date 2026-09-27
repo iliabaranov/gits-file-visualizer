@@ -1,6 +1,6 @@
-# gits-file-visualizer — Design (DRAFT v2)
+# gits-file-visualizer — Design (v3)
 
-Status: planning. Decided items are marked ✅; open items are marked ❓.
+Status: design agreed; next step is M0 look-dev. Decided items are marked ✅.
 
 ## 1. Goal
 
@@ -9,20 +9,26 @@ filesystem as the glowing security-system tower from the LOCUS SOLUS hack in
 *Ghost in the Shell 2: Innocence* (2004). Files are arc segments of stacked
 rings; reads, writes, creation and deletion drive the animation in real time.
 
-Priority order: **looks like the film > efficient > informative.**
+Priority order: **looks like the film > peaceful > efficient > informative.**
+It is a wallpaper: it should be calm to have behind your work all day, with the
+motion coming from the data, not from the camera.
 
-## 2. Decisions so far
+## 2. Decisions
 
 | Topic | Decision |
 |-------|----------|
 | Reference | ✅ Togusa hacking the LOCUS SOLUS ship (YouTube `idEMI562YM0`, "Ghost in the Shell [Hacking Scene]") |
 | Scope | ✅ `$HOME` first (unprivileged inotify); pipeline designed so a root fanotify helper can be added later |
-| Layout | ✅ The film's language wins over strict usability; multiple looks. ❓ Details in §5 |
-| Monitors | ✅ One view per monitor: shared data, independent camera ("director") per monitor |
+| Layout | ✅ One tower, drum ↔ coil states, a fixed composition per monitor (§5) |
+| Camera | ✅ Largely static and peaceful: fixed composition, at most imperceptible drift, no cuts by default |
+| Colours | ✅ Crimson for writes (not only deletes), cream-white for reads. All colours and decay times are configurable (§8) |
+| Alerts | ✅ Escalation only raises intensity, then everything simply fades back. Nothing latches, no acknowledgement |
+| Calligraphy | ✅ Zeami verse columns as a dim background layer (on by default, configurable) |
+| Monitors | ✅ One view per monitor: shared data, own composition per monitor |
 | Text | ✅ Real paths; auto-obfuscated while screen sharing |
-| Performance | ✅ Ambient 24 fps (film rate), ≈0 when hidden/idle, iGPU preferred |
+| Performance | ✅ Up to 24 fps (film rate), much lower when calm, ≈0 when hidden, iGPU preferred |
 | Interaction | ✅ Passive only |
-| Desktops | ❓ See §4.1 |
+| Desktops | ✅ GNOME first, behind a small surface-backend interface; layer-shell backend optional later (§4.1) |
 | Stack | ✅ Rust + wgpu |
 
 ## 3. Visual reference: what the scene actually shows
@@ -87,7 +93,7 @@ required to embed the renderer as the wallpaper. Prior art:
 [Hanabi](https://github.com/jeffshee/gnome-ext-hanabi). Rendering inside
 gnome-shell itself is rejected: a stall there freezes the whole session.
 
-### 4.1 Desktop support ❓ (discussion)
+### 4.1 Desktop support ✅ GNOME first, layer-shell later
 
 | | GNOME extension backend | layer-shell backend |
 |---|---|---|
@@ -99,17 +105,21 @@ gnome-shell itself is rejected: a stall there freezes the whole session.
 | Rust plumbing | `winit` toplevel window | `smithay-client-toolkit` + raw wgpu surface |
 | Extra test burden | 3 GNOME versions (pinned by LTS) | 1–2 more environments |
 
-Proposal: a small surface-backend interface from day one, GNOME first, and
-layer-shell as an optional later milestone. Universal fallback for any desktop:
+Decision: a small `SurfaceBackend` interface from day one, with GNOME
+implemented first. The GNOME backend's extra signals (visibility, lock,
+screencast) are optional capabilities, so other backends can report "unknown".
+layer-shell is an optional later milestone. Universal fallback for any desktop:
 render a still frame every N seconds and set it as the normal wallpaper.
 
-## 5. Visual concept: one tower, many shots
+## 5. Visual concept: one tower, still compositions
 
 Instead of separate modes with separate geometry there is **one scene**: the
-tower in its chamber. It has **two states** (drum ↔ coil) and **several camera
-"shots"** taken from the film's editing. A per-monitor *director* chooses and
-holds shots. This matches the film, keeps a single dataset on the GPU, and
-makes every shot cheap.
+tower in its chamber. It has **two states** (drum ↔ coil) and several
+**compositions** (camera framings taken from the film's shots). Each monitor
+holds one composition, like a painting. **The camera stays essentially still**:
+all motion comes from the data itself (spinning rings, unwinding subtrees,
+probes, falling flakes). This matches the film, keeps a single dataset on the
+GPU, and is both peaceful and cheap.
 
 ### 5.1 Data → tower mapping
 
@@ -121,7 +131,8 @@ makes every shot cheap.
 - **Radius steps inward slightly with depth**, which gives the layered
   see-through parallax visible in the wide shot.
 - Each ring spins slowly at its own rate (seeded by a hash, alternating
-  direction) and speeds up briefly when touched.
+  direction) and speeds up gently when touched. Spin rates are kept slow and
+  eased so the tower "breathes" rather than whirls.
 
 ### 5.2 Drum ↔ coil (activity = the hack)
 
@@ -136,52 +147,69 @@ makes every shot cheap.
 - The result: a calm machine looks like the intact gold drum, and a busy one
   looks like the breached, multicoloured coil from the wide shot.
 
-### 5.3 Event colours and motions (proposal ❓)
+### 5.3 Event colours and motions ✅ (defaults; all configurable)
 
-| Event | Look |
-|-------|------|
+| Event | Default look |
+|-------|--------------|
 | idle, by mtime age | gold (recent) → amber/orange → dim bronze (ancient) |
-| read/open | segment flashes **cream-white**; the probe visits; afterglow decays over minutes |
-| write/modify | segment turns **crimson** ("altered"), and the ring spins up; decays back to gold over ~10–30 min |
-| create | a new segment **grows along the arc** from zero length with a white-hot leading tip |
-| delete | segment goes bright crimson; its "string is cut": it detaches, falls, and breaks into drifting gold flakes. The gap stays as a faint crimson ghost for hours |
+| read/open | segment brightens to **cream-white**; the probe glides to it; afterglow decays over minutes |
+| write/modify | segment turns **crimson** ("altered"), and the ring spins up gently; decays back to gold over ~15 min |
+| create | a new segment **grows along the arc** from zero length with a bright leading tip |
+| delete | segment goes crimson; its "string is cut": it detaches, drifts down, and breaks into slowly falling gold flakes. The gap stays as a faint crimson ghost for a few hours |
 | move/rename | segment slides along the tower to its new ring |
 | symlink / aggregated remainder | dashed or dotted arcs |
-| a burst in one subtree | white/red **arrowhead swarm** + probe fly-in; HUD lines such as `SECURITY WALL 014 BREACHED` |
+| a burst in one subtree | white/red **arrowheads** drift toward it; a HUD line such as `SECURITY WALL 014 BREACHED` fades in and out |
 
 Mapping *write* to crimson (not just delete) matters for the look: the film's
 wide shot is full of red, so a busy work session should look like that, while
 an idle machine stays gold.
 
-### 5.4 Shots (camera presets + HUD layouts)
+**Peacefulness rules** (apply to every effect):
+- Soft attack (≥150 ms fade-in) and long exponential release; no hard strobes.
+- Global flash-rate limiter: no region brightens more than ~2×/s, which keeps
+  it photosensitivity-safe even during a big build.
+- Brightness ceiling and bloom are tuned so a crimson storm reads as "warm
+  glow", never glare.
 
-| Shot | From the film | Use |
-|------|---------------|-----|
-| **Wide tower** | thumbnail frame | Default "establishing" shot. Slow orbit, teal lattice and floor lights visible |
-| **Drum close-up** | panels 2, 5, 6 | Camera near the surface, slow vertical pan along the dense gold striations; micro file-name text. Great for the portrait monitor |
-| **Dial** | panels 4, 7 | Looking straight down the axis: the rings become concentric circles. Names are set along the arcs, leader lines point to the hottest files, and a centre box shows an event log in the security-system voice |
-| **Band** | panel 3 | Face-on crop of one segmented ring band (the active directory) with bar-length size readouts |
-| **Vortex** | panels 10–12 | Fly-through following the probe down the ribbons to a burst. Only used during "intrusion" |
+### 5.4 Compositions (fixed per monitor)
 
-**Director:** holds calm shots for long periods (30–120 s, slow drifts,
-cross-dissolves), goes to Dial/Band when activity is sustained, and to Vortex
-only on bursts. Each monitor can have its own shot preferences, e.g. 4K = wide
-tower, portrait = drum close-up, 1920×1200 = dial.
+| Composition | From the film | Notes |
+|-------------|---------------|-------|
+| **Wide tower** | thumbnail frame | Tower centred in its chamber with the teal lattice and floor lights. Default for the 4K monitor |
+| **Drum close-up** | panels 2, 5, 6 | Near the dense gold surface; micro file-name text. Default for the portrait monitor |
+| **Dial** | panels 4, 7 | Looking down the axis, so the rings become concentric circles with names set along the arcs and a small event log in the security-system voice. Default for 1920×1200 |
+| **Band** | panel 3 | Face-on crop of the segmented ring band of the most active directory |
 
-### 5.5 Alert escalation
+Camera behaviour:
+- **Default: completely still.** Optional *drift* (off by default, configurable)
+  of at most a few degrees of orbit or parallax over many minutes. That is slow
+  enough to be imperceptible from moment to moment, and it also avoids OLED
+  burn-in.
+- **No automatic cuts** by default. An optional slow rotation of compositions
+  (e.g. every few hours, 10 s cross-dissolve) can be enabled in config.
+- The film's **Vortex** fly-through is not used as a camera move. Its energy
+  shows up in the data instead (probe and arrowheads travelling along the
+  ribbons).
 
-1. **Calm:** gold drum, slow drift, occasional scan-line sweep.
-2. **Activity:** subtrees unwind, cards and probe appear, HUD fragments.
-3. **Intrusion** (mass delete, huge write burst): crimson dominates, arrowhead
-   swarm, Vortex shot allowed, plus security-voice HUD (`REBUILDING LEVEL 1
-   EXTERNAL SECURITY WALL`). Dramatic, and doubles as a "something is deleting
-   lots of files" alarm.
+### 5.5 Activity levels (intensity only, always fades)
 
-### 5.6 Optional flourishes
+1. **Calm:** gold drum, gentle ring spin, a rare slow scan-line sweep.
+2. **Activity:** subtrees unwind; cards, probe and HUD fragments appear.
+3. **Surge** (mass delete, huge write burst): more crimson, arrowheads,
+   security-voice HUD lines (`REBUILDING LEVEL 1 EXTERNAL SECURITY WALL`).
 
-- Zeami calligraphy columns as a dim, far background layer in the chamber.
-- HUD/glyph layers animated "on twos" (12 fps), a nod to Innocence's
+Levels rise and fall smoothly with a moving average of event rates. Nothing
+latches and nothing needs acknowledging: once activity stops, the scene fades
+back to the calm drum over a few minutes.
+
+### 5.6 Background & texture
+
+- **Zeami calligraphy columns** (生死去来 棚頭傀儡 一線断時 落落磊磊) as a dim,
+  far, slightly defocused layer on the chamber walls. On by default, with
+  configurable brightness.
+- HUD/glyph layers animate "on twos" (12 fps), a nod to Innocence's
   step-printed ghosts. It also halves their cost.
+- Fine film grain and gentle halation; no aggressive scanlines.
 
 ## 6. Scale
 
@@ -213,8 +241,12 @@ Measured on this machine: `$HOME` = **~134k directories, ~1.24M files**.
   bloom, grain, vignette.
 - **Text:** SDF/MSDF glyph atlas (Latin + CJK subset), only for cards, dial
   labels and HUD.
+- **Static layers are cached.** Because the camera is still, the chamber, teal
+  lattice, floor lights and calligraphy wall are rendered once per composition
+  (or on resize) into a background texture. Each frame only redraws the tower
+  and its effects on top.
 - **One process, one GPU device, one surface per monitor**, with all buffers
-  shared. Only camera and HUD differ per monitor.
+  shared. Only composition and HUD differ per monitor.
 - **CPU per frame ≈ 0:** the collector sends deltas at ≤10 Hz, and the renderer
   patches buffer and texture rows.
 
@@ -222,14 +254,97 @@ Measured on this machine: `$HOME` = **~134k directories, ~1.24M files**.
 
 - 0 fps when a monitor is covered, a fullscreen app is running, the screen is
   locked, or the display is blanked.
-- 24 fps while visible; drop to ~6–12 fps in calm shots (slow drifts hide it,
-  and the motion-smear buffer smooths it). Lower cap on battery.
+- Frame rate follows activity, not the camera (the camera is still):
+  ~6–12 fps when calm (slow ring spin and the motion-smear buffer hide it),
+  up to 24 fps during activity. Lower caps on battery.
+- Static background layers are cached (see §7), so a calm frame is mostly one
+  cylinder shader plus bloom at reduced resolution.
 - Internal resolution 0.5–0.75× on 4K, upscaled (glow hides it).
 - Low-power adapter so the Intel iGPU is used and the NVIDIA dGPU stays asleep.
 - Budgets: visible <2% of one core, hidden ≈0%, RSS <150 MB total. Measured
   in M3.
 
-## 9. Components
+## 9. Configuration
+
+One TOML file, `~/.config/gits-file-visualizer/config.toml`, hot-reloaded by
+the renderer (collector settings apply on restart). Every value has a default,
+so an empty file is valid. Sketch:
+
+```toml
+[palette]                      # hex colours, all overridable
+background  = "#0a0604"
+gold        = "#ffb21e"
+cream       = "#fff1c8"
+orange      = "#ff7a18"
+crimson     = "#d0203a"
+teal        = "#2fe0c4"        # environment only
+bloom       = 0.8
+grain       = 0.15
+
+[events.read]
+color   = "cream"              # palette name or hex
+decay   = "4m"                 # afterglow half-life
+probe   = true
+
+[events.write]
+color   = "crimson"
+decay   = "15m"
+spin_up = 0.3                  # extra ring spin, 0 = none
+
+[events.create]
+color   = "cream"
+grow    = "1.5s"
+
+[events.delete]
+color       = "crimson"
+fall        = true             # snapped-string fall + gold flakes
+ghost_hours = 3
+
+[age]                          # idle colour by mtime age
+fresh = "gold"                 # < 1 day
+old   = "orange"               # ~1 month
+stale = "#5a3a14"              # > 1 year
+
+[calm]
+max_flash_hz  = 2.0
+attack_ms     = 150
+spin_speed    = 0.2            # base ring spin, rev/min
+surge_hud     = true           # security-voice HUD lines
+
+[background]
+calligraphy = true
+calligraphy_brightness = 0.12
+
+[camera]
+drift = 0.0                    # 0 = perfectly still; 1 = max gentle drift
+rotate_compositions = "off"    # or e.g. "3h"
+
+[monitors."*"]
+composition = "wide"
+[monitors."DP-2"]              # connector name
+composition = "drum"
+[monitors."eDP-1"]
+composition = "dial"
+
+[performance]
+fps_active   = 24
+fps_calm     = 8
+fps_battery  = 6
+render_scale = 0.66
+prefer_igpu  = true
+
+[privacy]
+text = "paths"                 # paths | dirs | glyphs | none
+obfuscate_when_sharing = true
+
+[collector]
+roots    = ["~"]
+excludes = ["~/.cache", "**/node_modules", "**/target", "**/.git/objects",
+            "~/snap", "~/.local/share/Steam", "~/esp-idf*"]
+max_rings = 16384
+```
+
+## 10. Components
 
 ```
 ┌───────────────────────┐   unix socket    ┌────────────────────────┐
@@ -252,17 +367,21 @@ Measured on this machine: `$HOME` = **~134k directories, ~1.24M files**.
 - Note: stat atime is coarse because of `relatime`. Access visuals come from
   live events.
 
-## 10. Milestones
+## 11. Milestones
 
-1. **M0 look-dev:** windowed renderer on synthetic data: drum shader + coil
-   unwinding + post FX + Wide tower shot. Iterate against `docs/ref/` frames.
+1. **M0 look-dev:** windowed renderer on synthetic data (a scripted "work
+   session" event generator): drum shader, coil unwinding, event colours,
+   bloom/smear/grain, cached chamber + calligraphy background, Wide tower
+   composition, config file with hot reload. Iterate against `docs/ref/`.
 2. **M1 collector:** `$HOME` scan with excludes, inotify, snapshot, IPC; real
    data drives M0.
-3. **M2 embed:** GNOME 42 extension on this machine (Wayland, 3 monitors incl.
-   portrait).
-4. **M3 efficiency:** visibility pause, adaptive fps, iGPU, budgets measured,
-   screencast privacy switch.
-5. **M4 shots & director:** Drum close-up, Dial, Band, Vortex, alert escalation,
-   per-monitor preferences.
+3. **M2 embed:** `SurfaceBackend` interface + GNOME 42 extension on this machine
+   (Wayland, 3 monitors incl. portrait).
+4. **M3 efficiency:** visibility pause, activity-driven fps, iGPU, budgets
+   measured, screencast privacy switch.
+5. **M4 compositions:** Drum close-up, Dial, Band; per-monitor assignment;
+   activity levels + security-voice HUD; optional drift/rotation.
 6. **M5 portability:** GNOME 45+ ESM extension, 24.04/26.04 VM tests, install
-   script or `.deb`. Optional: layer-shell backend, fanotify helper.
+   script or `.deb`, user systemd units.
+7. **Later / optional:** layer-shell backend, root fanotify helper (whole
+   system + process names), still-frame fallback for other desktops.
