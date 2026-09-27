@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/gits-core", "crates/gits-render"]
+members = ["crates/gits-core", "crates/gits-render", "crates/gits-collector"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,6 +15,7 @@ clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
 fontdue = "0.9"
 glam = { version = "0.33", features = ["bytemuck"] }
+libc = "0.2"
 log = "0.4"
 png = "0.18"
 pollster = "1"

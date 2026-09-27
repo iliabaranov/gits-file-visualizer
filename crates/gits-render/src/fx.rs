@@ -126,7 +126,7 @@ impl Fx {
 
     pub fn step(mut self, w: &World, dt: f32) -> Self {
         let t = w.t;
-        self.cards.retain(|c| t - c.t_last < CARD_HOLD + CARD_FADE && w.home.model.is_live(c.file));
+        self.cards.retain(|c| t - c.t_last < CARD_HOLD + CARD_FADE && w.model.is_live(c.file));
 
         // Probe glides toward the most recently touched file.
         let target = self.probe.target.and_then(|f| Self::seg_of(w, f)).and_then(|s| w.segment_point(s, 0.5));
@@ -257,7 +257,7 @@ impl Fx {
                 height,
             );
             text_px(out, &atlas.mono, &label, lx, ly, size, [gold[0], gold[1], gold[2], 1.6 * la], width, height);
-            let size_bytes = w.home.model.files[c.file as usize].size;
+            let size_bytes = w.model.files[c.file as usize].size;
             let (tag, tag_col) = match c.kind {
                 EventKind::Write => ("WRITE", write_col),
                 _ => ("READ ", cream),

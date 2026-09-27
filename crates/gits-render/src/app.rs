@@ -28,6 +28,10 @@ pub struct Options {
     pub height: u32,
     pub warmup: f64,
     pub speed: Option<f64>,
+    /// Collector socket, or None for synthetic data.
+    pub collector: Option<PathBuf>,
+    /// "auto" found no collector and fell back to synthetic data.
+    pub fell_back: bool,
 }
 
 struct State {
@@ -96,8 +100,15 @@ impl App {
             self.cfg.performance.render_scale,
             self.cfg.performance.max_internal_megapixels,
         );
-        let mut world = World::new(self.cfg.clone(), renderer.max_rings());
-        let steps = (self.opts.warmup * 24.0) as usize;
+        let mut world = World::new(self.cfg.clone(), renderer.max_rings(), self.opts.collector.clone());
+        if self.opts.fell_back {
+            world.notice = Some(Notice {
+                text: "gits-collector is not running: showing synthetic data".into(),
+                error: false,
+                until: self.opts.warmup + 10.0,
+            });
+        }
+        let steps = if world.is_synthetic() { (self.opts.warmup * 24.0) as usize } else { 0 };
         for _ in 0..steps {
             world.step(1.0 / 24.0);
         }
@@ -158,8 +169,9 @@ impl App {
     }
 
     fn frame(&mut self) {
-        let speed = self.opts.speed.unwrap_or(self.cfg.synthetic.speed as f64);
         let Some(s) = &mut self.state else { return };
+        // Live data runs in real time; the synthetic session can be sped up.
+        let speed = if s.world.is_synthetic() { self.opts.speed.unwrap_or(self.cfg.synthetic.speed as f64) } else { 1.0 };
         let now = Instant::now();
         let real_dt = now.duration_since(s.last_frame).as_secs_f64();
         s.last_frame = now;

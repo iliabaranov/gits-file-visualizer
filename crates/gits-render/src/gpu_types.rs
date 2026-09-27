@@ -34,7 +34,9 @@ pub struct RingGpu {
     pub boost: f32,
     pub boost_t0: f32,
     pub hash: f32,
-    pub _pad: [f32; 2],
+    /// Index of this ring's first segment (segments are stored in ring order).
+    pub first_seg: u32,
+    pub _pad: f32,
 }
 
 #[repr(C)]

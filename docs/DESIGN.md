@@ -1,6 +1,6 @@
 # gits-file-visualizer — Design (v3)
 
-Status: M0 (look-dev) done, next is M1 (real collector). Decided items are marked ✅.
+Status: M0 (look-dev) and M1 (real data) done, next is M2 (GNOME embedding). Decided items are marked ✅.
 
 ## 1. Goal
 
@@ -353,6 +353,48 @@ Sections: `palette`, `events.{read,write,create,delete}`, `age`, `calm`,
   (see backlog).
 - The window simulates in fixed 1/24 s steps, identical to headless snapshots.
 
+### M1 — done (2026-09-27)
+
+- `gits-collector` (new crate) is a separate process, installed as a systemd
+  user service (`packaging/systemd`, `tools/install-user.sh`). It scans the
+  root at idle CPU/IO priority, watches with inotify within a budget, and
+  serves `$XDG_RUNTIME_DIR/gits-file-visualizer/collector.sock` (mode 0600).
+  Extra tools: `scan` (counts + budget) and `monitor` (prints the live stream).
+- Protocol (`gits-core::protocol`): length-prefixed binary frames — Hello,
+  Status, one Snapshot, then Ops batches every 100 ms. Ops (MkDir, RmDir,
+  Create, Delete, Read, Write) are applied identically on both sides, so ids
+  never need to be sent on creation. Hand-written encoding, no new dependencies.
+  The renderer decodes snapshots on a client thread, reconnects automatically,
+  and gets a fresh snapshot after a collector restart. Directory keys are
+  derived from paths, so ring animation state survives reconnects.
+- Watch limit kept at the Ubuntu default and documented in README
+  "Watch limit". The budget is half of `max_user_watches` (leaving at least
+  4096 free). The top levels and the most recently changed folders are
+  watched; the rest are crawled every `crawl_interval`, and a folder where the
+  crawl finds changes is promoted to a watch.
+- Default excludes grew after measuring this home: caches, build output,
+  package stores (`~/.npm`, `~/.cargo/registry`, `~/.arduino15`, …),
+  containers and app sandboxes. Result: 134k → 52k folders, 1.24M → 360k files.
+  The scan takes 2.1–2.7 s warm, so the planned on-disk snapshot cache is deferred.
+- Layout for large trees: the old depth-based collapse was replaced by greedy
+  expansion within the ring budget, prioritised by current activity, then by
+  the newest change anywhere below. Unexpanded folders are single dashed
+  aggregate segments. Busy collapsed folders unfold at the next layout (at
+  most every 5 s live). Real home: 15.7k rings, 86k segments, ~6.3k folders
+  expanded, ~3k aggregates; a rebuild takes 25–70 ms. The segment atlas is now
+  8-bit (index within the ring) instead of 32-bit.
+- Live observations: steady background of ~40 ops/s on this machine (the
+  `pstop_soak_8h` soak test writes ~15/s; Chrome IndexedDB). An ESP-IDF build
+  peaks around 300 ops/s (header reads under `esp-idf-5.5`). Both render well,
+  and the build unwinding into the coil is the look we want.
+- Costs with the real tree (this laptop, iGPU): 14.3 ms/frame at 1080p and
+  24.7 ms at 4K (vs 8 / 16 ms synthetic, since there are twice the rings).
+  RSS: renderer 220 MB (170 MB even on synthetic data), collector ~100 MB.
+  Both are over the 150 MB total budget; see the backlog.
+- Not yet: multiple roots (only the first is used), moved directories are
+  handled as delete + create, and there is no process attribution (needs the
+  later fanotify helper).
+
 ### Efficiency backlog for M3
 
 - Tower fragment shader is ~65% of GPU time: cheaper samples in the dense drum,
@@ -368,6 +410,11 @@ Sections: `palette`, `events.{read,write,create,delete}`, `age`, `calm`,
   cheaper. Keep one point sample for event highlights.
 - Portrait: the tower covers more pixels; consider a composition that pulls
   back further.
+- Memory: intern file names into one arena (both processes), drop the
+  collector's per-directory `PathBuf`s (rebuild paths from parents), and find
+  what makes up the renderer's 170 MB baseline (Vulkan driver, wgpu, staging).
+- Relayout cost on live trees (25–70 ms on the render thread): move the layout
+  build to a worker thread and swap it in, or rebuild only the changed bands.
 
 ## 12. Milestones
 

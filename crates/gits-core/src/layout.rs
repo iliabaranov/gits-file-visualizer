@@ -1,8 +1,16 @@
-//! Tower layout: every directory becomes a band of one or more rings (depth-first
-//! order, `~` at the top); files are arc segments on those rings.
+//! Tower layout: every expanded directory becomes a band of one or more rings
+//! (depth-first order, `~` at the top); files are arc segments on those rings.
+//!
+//! Large trees do not fit the ring budget, so directories are expanded greedily
+//! by priority (current activity first, then how recently anything below them
+//! changed) until the budget is used. A directory that is not expanded appears
+//! as a single dashed "aggregate" segment in its parent's band, standing for
+//! its whole subtree.
 
 use crate::model::{DirId, FileId, Model};
 use crate::rng::mix64;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 pub const SEG_DIR: u32 = 1;
 pub const SEG_AGG: u32 = 2;
@@ -11,6 +19,9 @@ pub const SEG_HIDDEN: u32 = 8;
 pub const SEG_DELETED: u32 = 16;
 
 pub const NONE: u32 = u32::MAX;
+
+/// Ring estimates are inflated by this factor to account for packing waste.
+const PACKING: f32 = 1.15;
 
 #[derive(Clone, Debug)]
 pub struct LayoutParams {
@@ -27,12 +38,14 @@ pub struct Ring {
     pub dir: DirId,
     pub depth: u16,
     pub index_in_dir: u16,
+    /// The directory's path-derived key (see `Dir::key`).
+    pub dir_key: u64,
 }
 
 impl Ring {
-    /// Stable identity across relayouts (used to keep animation state).
+    /// Stable identity across relayouts and reconnects (keeps animation state).
     pub fn key(&self) -> u64 {
-        ((self.dir as u64) << 16) | self.index_in_dir as u64
+        mix64(self.dir_key ^ (self.index_in_dir as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
     }
 
     pub fn hash(&self) -> u64 {
@@ -65,8 +78,31 @@ pub struct Layout {
     pub seg_of_file: Vec<u32>,
     /// First ring of each directory's band ([`NONE`] if the directory is collapsed).
     pub dir_first_ring: Vec<u32>,
-    /// Directory depth at and below which subtrees were collapsed, if any.
-    pub collapse_depth: Option<u16>,
+    /// For each collapsed directory directly below an expanded one: its aggregate segment.
+    pub agg_seg: Vec<u32>,
+    /// Number of directories expanded / collapsed into aggregates.
+    pub expanded: usize,
+    pub collapsed: usize,
+}
+
+impl Layout {
+    pub fn is_expanded(&self, d: DirId) -> bool {
+        self.dir_first_ring.get(d as usize).is_some_and(|&r| r != NONE)
+    }
+
+    /// The segment standing for directory `d`: none if `d` is expanded, otherwise
+    /// the aggregate of its nearest collapsed ancestor-or-self.
+    pub fn agg_for(&self, model: &Model, mut d: DirId) -> Option<u32> {
+        loop {
+            if self.is_expanded(d) {
+                return None;
+            }
+            if let Some(&s) = self.agg_seg.get(d as usize).filter(|&&s| s != NONE) {
+                return Some(s);
+            }
+            d = model.dirs.get(d as usize)?.parent?;
+        }
+    }
 }
 
 pub fn arc_for_size(size: u64, p: &LayoutParams) -> f32 {
@@ -74,25 +110,119 @@ pub fn arc_for_size(size: u64, p: &LayoutParams) -> f32 {
     p.min_arc + (p.max_arc - p.min_arc) * x.powf(1.3)
 }
 
-/// Builds the layout, collapsing deep subtrees until it fits in `max_rings`.
-pub fn build(model: &mut Model, p: &LayoutParams) -> Layout {
+#[derive(PartialEq)]
+struct Cand {
+    score: f64,
+    dir: DirId,
+}
+
+impl Eq for Cand {}
+
+impl PartialOrd for Cand {
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+impl Ord for Cand {
+    fn cmp(&self, o: &Self) -> Ordering {
+        self.score.total_cmp(&o.score).then_with(|| o.dir.cmp(&self.dir))
+    }
+}
+
+/// Builds the layout within `max_rings`. `hot` (per directory, may be shorter
+/// than the directory list) boosts directories with current activity.
+pub fn build(model: &mut Model, p: &LayoutParams, hot: &[f32]) -> Layout {
     for f in &mut model.files {
         if f.arc <= 0.0 {
             f.arc = arc_for_size(f.size, p);
         }
     }
-    let max_depth = model.max_depth();
-    let mut collapse: Option<u16> = None;
-    loop {
-        let l = build_with(model, p, collapse);
-        if l.rings.len() <= p.max_rings.max(1) || collapse == Some(1) || max_depth <= 1 {
-            return l;
+    let expanded = choose_expanded(model, p, hot);
+    place(model, p, &expanded)
+}
+
+fn choose_expanded(model: &Model, p: &LayoutParams, hot: &[f32]) -> Vec<bool> {
+    let n = model.dirs.len();
+    let mark = if p.dir_marks { p.dir_mark_arc } else { 0.0 };
+    let mut own_arc = vec![0f32; n];
+    let mut size = vec![0u64; n];
+    let mut newest = vec![i64::MIN; n];
+    let mut heat = vec![0f32; n];
+    for (d, dir) in model.dirs.iter().enumerate() {
+        if dir.purged {
+            continue;
         }
-        collapse = Some(match collapse {
-            None => max_depth.saturating_sub(1).max(1),
-            Some(d) => (d - 1).max(1),
-        });
+        own_arc[d] = mark;
+        for &f in &dir.files {
+            let file = &model.files[f as usize];
+            if file.purged {
+                continue;
+            }
+            own_arc[d] += file.arc.max(p.min_arc);
+            size[d] += file.size;
+            newest[d] = newest[d].max(file.mtime);
+        }
+        heat[d] = hot.get(d).copied().unwrap_or(0.0);
     }
+    // Children always have larger ids than parents: a reverse sweep aggregates bottom-up.
+    for d in (1..n).rev() {
+        if model.dirs[d].purged {
+            continue;
+        }
+        if let Some(pa) = model.dirs[d].parent {
+            let pa = pa as usize;
+            size[pa] += size[d];
+            newest[pa] = newest[pa].max(newest[d]);
+            heat[pa] = heat[pa].max(heat[d]);
+        }
+    }
+    let agg_arc = |d: usize| arc_for_size(size[d], p);
+    // Band arc of `d` when expanded with all its children collapsed.
+    let band_arc = |d: usize| -> f32 {
+        own_arc[d] + model.dirs[d].dirs.iter().filter(|&&c| !model.dirs[c as usize].purged).map(|&c| agg_arc(c as usize)).sum::<f32>()
+    };
+    let rings_for = |arc: f32| -> usize { ((arc * PACKING).ceil() as usize).max(1) };
+    let score = |d: usize| -> f64 {
+        let recency = if newest[d] == i64::MIN { 0.0 } else { newest[d] as f64 };
+        // Active subtrees first; then the most recently changed; top levels win ties.
+        heat[d] as f64 * 1.0e12 + recency - model.dirs[d].depth as f64
+    };
+
+    let mut expanded = vec![false; n];
+    let root = model.root as usize;
+    expanded[root] = true;
+    let mut arc_of = vec![0f32; n];
+    arc_of[root] = band_arc(root);
+    let mut total = rings_for(arc_of[root]);
+    let budget = p.max_rings.max(1);
+    let mut heap: BinaryHeap<Cand> = BinaryHeap::new();
+    for &c in &model.dirs[root].dirs {
+        if !model.dirs[c as usize].purged {
+            heap.push(Cand { score: score(c as usize), dir: c });
+        }
+    }
+    while let Some(Cand { dir, .. }) = heap.pop() {
+        let c = dir as usize;
+        let Some(pa) = model.dirs[c].parent.map(|x| x as usize) else { continue };
+        let new_parent_arc = (arc_of[pa] - agg_arc(c)).max(0.0);
+        let child_arc = band_arc(c);
+        let delta = rings_for(child_arc) as isize + rings_for(new_parent_arc) as isize - rings_for(arc_of[pa]) as isize;
+        // The top level is always shown in full.
+        if total as isize + delta > budget as isize && model.dirs[c].depth > 1 {
+            continue;
+        }
+        expanded[c] = true;
+        arc_of[pa] = new_parent_arc;
+        arc_of[c] = child_arc;
+        total = (total as isize + delta).max(0) as usize;
+        for &g in &model.dirs[c].dirs {
+            if !model.dirs[g as usize].purged {
+                heap.push(Cand { score: score(g as usize), dir: g });
+            }
+        }
+    }
+    expanded
 }
 
 struct Placer<'a> {
@@ -101,14 +231,16 @@ struct Placer<'a> {
     cursor: f32,
     cur_dir: DirId,
     cur_depth: u16,
+    cur_key: u64,
     ring_in_dir: u16,
     have_ring: bool,
 }
 
 impl Placer<'_> {
-    fn begin_dir(&mut self, dir: DirId, depth: u16) {
+    fn begin_dir(&mut self, dir: DirId, depth: u16, key: u64) {
         self.cur_dir = dir;
         self.cur_depth = depth;
+        self.cur_key = key;
         self.ring_in_dir = 0;
         self.have_ring = false;
         self.cursor = 0.0;
@@ -122,7 +254,7 @@ impl Placer<'_> {
         if self.ring_in_dir == 0 {
             self.layout.dir_first_ring[self.cur_dir as usize] = idx;
         }
-        self.layout.rings.push(Ring { dir: self.cur_dir, depth: self.cur_depth, index_in_dir: self.ring_in_dir });
+        self.layout.rings.push(Ring { dir: self.cur_dir, depth: self.cur_depth, index_in_dir: self.ring_in_dir, dir_key: self.cur_key });
         self.have_ring = true;
         self.cursor = 0.0;
     }
@@ -139,19 +271,21 @@ impl Placer<'_> {
     }
 }
 
-fn build_with(model: &Model, p: &LayoutParams, collapse: Option<u16>) -> Layout {
-    let subtree_size = subtree_sizes(model);
+fn place(model: &Model, p: &LayoutParams, expanded: &[bool]) -> Layout {
+    let sizes = subtree_sizes(model);
+    let n = model.dirs.len();
     let mut placer = Placer {
         p,
         layout: Layout {
             seg_of_file: vec![NONE; model.files.len()],
-            dir_first_ring: vec![NONE; model.dirs.len()],
-            collapse_depth: collapse,
+            dir_first_ring: vec![NONE; n],
+            agg_seg: vec![NONE; n],
             ..Default::default()
         },
         cursor: 0.0,
         cur_dir: model.root,
         cur_depth: 0,
+        cur_key: 0,
         ring_in_dir: 0,
         have_ring: false,
     };
@@ -159,7 +293,8 @@ fn build_with(model: &Model, p: &LayoutParams, collapse: Option<u16>) -> Layout 
     let mut stack = vec![model.root];
     while let Some(d) = stack.pop() {
         let dir = &model.dirs[d as usize];
-        placer.begin_dir(d, dir.depth);
+        placer.layout.expanded += 1;
+        placer.begin_dir(d, dir.depth, dir.key);
         if p.dir_marks {
             placer.place(SegSource::Dir(d), p.dir_mark_arc, SEG_DIR);
         }
@@ -178,14 +313,17 @@ fn build_with(model: &Model, p: &LayoutParams, collapse: Option<u16>) -> Layout 
             let s = placer.place(SegSource::File(f), file.arc.max(p.min_arc), flags);
             placer.layout.seg_of_file[f as usize] = s;
         }
-        if collapse.is_some_and(|c| dir.depth >= c) {
-            for &c in &dir.dirs {
-                let size = subtree_size[c as usize];
-                let s = placer.place(SegSource::Agg(c), arc_for_size(size, p), SEG_AGG);
-                assign_subtree(model, c, s, &mut placer.layout.seg_of_file);
+        for &c in &dir.dirs {
+            if model.dirs[c as usize].purged || expanded[c as usize] {
+                continue;
             }
-        } else {
-            for &c in dir.dirs.iter().rev() {
+            let s = placer.place(SegSource::Agg(c), arc_for_size(sizes[c as usize], p), SEG_AGG);
+            placer.layout.agg_seg[c as usize] = s;
+            placer.layout.collapsed += 1;
+            assign_subtree(model, c, s, &mut placer.layout.seg_of_file);
+        }
+        for &c in dir.dirs.iter().rev() {
+            if !model.dirs[c as usize].purged && expanded[c as usize] {
                 stack.push(c);
             }
         }
@@ -205,8 +343,8 @@ fn assign_subtree(model: &Model, d: DirId, seg: u32, seg_of_file: &mut [u32]) {
 }
 
 fn subtree_sizes(model: &Model) -> Vec<u64> {
-    let mut sizes: Vec<u64> = model.dirs.iter().map(|d| d.files.iter().map(|&f| model.files[f as usize].size).sum()).collect();
-    // Children always have larger ids than parents, so a reverse sweep sums bottom-up.
+    let mut sizes: Vec<u64> =
+        model.dirs.iter().map(|d| d.files.iter().map(|&f| &model.files[f as usize]).filter(|f| !f.purged).map(|f| f.size).sum()).collect();
     for d in (0..model.dirs.len()).rev() {
         if let Some(parent) = model.dirs[d].parent {
             sizes[parent as usize] += sizes[d];
@@ -227,9 +365,11 @@ mod tests {
         let mut m = Model::new("~", 0);
         let a = m.add_dir(0, "a");
         let b = m.add_dir(a, "b");
+        let c = m.add_dir(a, "c");
         for i in 0..40 {
             m.add_existing_file(a, format!("f{i}.rs"), 1000 * i, 0);
-            m.add_existing_file(b, format!("g{i}.png"), 2_000_000, 0);
+            m.add_existing_file(b, format!("g{i}.png"), 2_000_000, 100);
+            m.add_existing_file(c, format!("h{i}.png"), 2_000_000, 50);
         }
         m
     }
@@ -237,7 +377,7 @@ mod tests {
     #[test]
     fn segments_fit_rings_and_do_not_overlap() {
         let mut m = sample();
-        let l = build(&mut m, &params(10_000));
+        let l = build(&mut m, &params(10_000), &[]);
         assert!(l.segments.iter().all(|s| s.a0 >= 0.0 && s.a1 <= 1.0 && s.a0 < s.a1));
         for w in l.segments.windows(2) {
             if w[0].ring == w[1].ring {
@@ -245,15 +385,24 @@ mod tests {
             }
         }
         assert!(l.seg_of_file.iter().all(|&s| s != NONE));
+        assert_eq!(l.collapsed, 0);
     }
 
     #[test]
-    fn collapses_to_fit_budget() {
+    fn collapses_to_fit_budget_preferring_recent_and_hot() {
         let mut m = sample();
-        let full = build(&mut m, &params(10_000)).rings.len();
-        let l = build(&mut m, &params(full - 1));
-        assert!(l.collapse_depth.is_some());
+        let full = build(&mut m, &params(10_000), &[]).rings.len();
+        let l = build(&mut m, &params(full - 4), &[]);
+        assert!(l.rings.len() <= full - 4 + 2);
         assert!(l.segments.iter().any(|s| s.flags & SEG_AGG != 0));
         assert!(l.seg_of_file.iter().all(|&s| s != NONE));
+        // b (newest) stays expanded, c (older) collapses.
+        assert!(l.is_expanded(2) && !l.is_expanded(3));
+        assert!(l.agg_for(&m, 3).is_some());
+        // Heat on c flips the choice.
+        let mut hot = vec![0.0; m.dirs.len()];
+        hot[3] = 5.0;
+        let l = build(&mut m, &params(full - 4), &hot);
+        assert!(l.is_expanded(3) && !l.is_expanded(2));
     }
 }

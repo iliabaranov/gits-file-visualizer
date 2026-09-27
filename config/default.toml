@@ -105,11 +105,38 @@ prefer_igpu  = true
 text                   = "paths"   # paths | dirs | glyphs | none
 obfuscate_when_sharing = true
 
+[data]
+source = "auto"             # auto | collector | synthetic. "auto" uses the collector
+                            # service if it is running, otherwise synthetic data.
+
 [collector]
+# The collector service (gits-collector) scans these folders, watches them for
+# changes and streams them to the renderer. Excluded paths never appear in the
+# tower. Patterns: "~/..." is anchored at home, "**/name" matches at any depth,
+# "*" matches within one path component.
 roots     = ["~"]
-excludes  = ["~/.cache", "**/node_modules", "**/target", "**/.git/objects",
-             "~/snap", "~/.local/share/Steam"]
+excludes  = [
+  # caches and trash
+  "~/.cache", "~/.local/share/Trash", "**/Cache", "**/Code Cache", "**/GPUCache",
+  "**/CachedData", "**/cache2", "**/__pycache__",
+  # build output and package stores
+  "**/node_modules", "**/target", "**/.git/objects", "**/site-packages", "**/.venv",
+  "~/.npm", "~/.cargo/registry", "~/.cargo/git", "~/.rustup", "~/.nvm",
+  "~/.arduino15", "~/.espressif",
+  # application sandboxes and containers
+  "~/snap", "~/.var", "~/.local/share/containers", "~/.local/share/Steam", "~/.zoom",
+]
 max_rings = 16384
+# Live change detection uses Linux inotify, which needs one "watch" per folder.
+# The per-user limit (fs.inotify.max_user_watches, 65536 on Ubuntu) is shared with
+# every other app (sync clients, editors, ...), so the collector only takes part
+# of it: 0 = automatic = half the limit, and never less than 4096 left free.
+# The most recently changed folders are watched live; the rest are re-checked by
+# a slow background crawl (new/removed files show up after a delay and reads are
+# not seen there). A folder where the crawl finds changes is promoted to a live
+# watch in place of the least active one. See README "Watch limit".
+max_watches    = 0
+crawl_interval = "2m"
 
 [synthetic]                 # fake filesystem + work session used for look-dev
 seed  = 14                  # early clean-up, download, browsing, editing, build, commit

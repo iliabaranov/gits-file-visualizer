@@ -8,6 +8,7 @@ mod gpu;
 mod gpu_types;
 mod renderer;
 mod snapshot;
+mod source;
 mod text;
 mod world;
 
@@ -29,6 +30,13 @@ struct Cli {
     /// Override [synthetic].scale.
     #[arg(long, global = true)]
     scale: Option<f32>,
+    /// Data source: auto | collector | synthetic [window default: [data].source;
+    /// snapshot/bench/stats default: synthetic, for reproducible output].
+    #[arg(long, global = true)]
+    source: Option<String>,
+    /// Collector socket [default: $XDG_RUNTIME_DIR/gits-file-visualizer/collector.sock].
+    #[arg(long, global = true)]
+    socket: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -108,14 +116,23 @@ fn main() -> Result<()> {
         cfg.synthetic.scale = scale;
     }
 
-    match cli.cmd.unwrap_or(Cmd::Window { width: 1600, height: 900, warmup: 0.0, speed: None }) {
-        Cmd::Window { width, height, warmup, speed } => app::run(cfg, app::Options { config_path, width, height, warmup, speed }),
-        Cmd::Snapshot { out, width, height, at, frames, every } => {
-            snapshot::run(cfg, snapshot::Options { out, width, height, at, frames, every })
+    let socket = cli.socket.clone().unwrap_or_else(gits_core::protocol::default_socket_path);
+    let cmd = cli.cmd.unwrap_or(Cmd::Window { width: 1600, height: 900, warmup: 0.0, speed: None });
+    let requested = cli.source.clone().unwrap_or_else(|| match cmd {
+        Cmd::Window { .. } => cfg.data.source.clone(),
+        _ => "synthetic".into(),
+    });
+    let (collector, fell_back) = resolve_source(&requested, &socket)?;
+    match cmd {
+        Cmd::Window { width, height, warmup, speed } => {
+            app::run(cfg, app::Options { config_path, width, height, warmup, speed, collector, fell_back })
         }
-        Cmd::Bench { width, height, at, frames } => snapshot::bench(cfg, width, height, at, frames),
+        Cmd::Snapshot { out, width, height, at, frames, every } => {
+            snapshot::run(cfg, snapshot::Options { out, width, height, at, frames, every }, collector)
+        }
+        Cmd::Bench { width, height, at, frames } => snapshot::bench(cfg, width, height, at, frames, collector),
         Cmd::Stats { minutes, timeline } => {
-            stats(cfg, minutes, timeline);
+            stats(cfg, minutes, timeline, collector);
             Ok(())
         }
         Cmd::DefaultConfig => {
@@ -125,10 +142,37 @@ fn main() -> Result<()> {
     }
 }
 
-fn stats(cfg: Config, minutes: f64, timeline: bool) {
-    let mut w = world::World::new(cfg, 16384);
-    println!("directories: {}", w.home.model.dirs.len());
-    println!("files:       {}", w.home.model.live_file_count());
+/// Returns the collector socket to use (None = synthetic) and whether "auto"
+/// fell back to synthetic data because no collector is running.
+fn resolve_source(requested: &str, socket: &std::path::Path) -> Result<(Option<PathBuf>, bool)> {
+    match requested {
+        "synthetic" => Ok((None, false)),
+        "collector" => Ok((Some(socket.to_path_buf()), false)),
+        "auto" => {
+            if source::collector_available(socket) {
+                log::info!("using gits-collector at {}", socket.display());
+                Ok((Some(socket.to_path_buf()), false))
+            } else {
+                log::info!("no gits-collector at {}; showing synthetic data", socket.display());
+                Ok((None, true))
+            }
+        }
+        other => anyhow::bail!("unknown source '{other}' (expected auto, collector or synthetic)"),
+    }
+}
+
+fn stats(cfg: Config, minutes: f64, timeline: bool, collector: Option<PathBuf>) {
+    let live = collector.is_some();
+    let mut w = world::World::new(cfg, 16384, collector);
+    if live {
+        let t0 = std::time::Instant::now();
+        while !w.has_data() && t0.elapsed().as_secs() < 180 {
+            w.step(0.1);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    println!("directories: {}", w.model.dirs.len());
+    println!("files:       {}", w.model.live_file_count());
     println!("rings:       {}", w.rings.len());
     println!("segments:    {}", w.segs.len());
     let mut phases = std::collections::BTreeMap::<&str, f64>::new();
@@ -148,7 +192,7 @@ fn stats(cfg: Config, minutes: f64, timeline: bool) {
     }
     println!(
         "after {minutes} simulated minutes: {} files, {} rings, peak activity {:.1} events/s",
-        w.home.model.live_file_count(),
+        w.model.live_file_count(),
         w.rings.len(),
         peak
     );

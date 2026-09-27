@@ -21,13 +21,32 @@ const DT: f64 = 1.0 / 24.0;
 /// Frames rendered before each capture so motion smear and bloom settle.
 const WARM_SECONDS: f64 = 1.5;
 
-pub fn run(cfg: Config, opts: Options) -> Result<()> {
+/// Steps a live (collector) world in real time until its first snapshot arrives.
+fn wait_for_data(world: &mut World) -> Result<()> {
+    let t0 = std::time::Instant::now();
+    while !world.has_data() {
+        anyhow::ensure!(t0.elapsed().as_secs() < 180, "no snapshot from gits-collector within 3 minutes");
+        world.step(0.1);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Let the (possibly large) first layout settle.
+    world.step(0.5);
+    Ok(())
+}
+
+/// With live data `--at` is ignored: captures start once the snapshot arrives
+/// and are spaced `every` real seconds apart.
+pub fn run(cfg: Config, opts: Options, collector: Option<std::path::PathBuf>) -> Result<()> {
     let instance = gpu::instance();
     let g = pollster::block_on(gpu::init(&instance, None, cfg.performance.prefer_igpu))?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format)?;
     renderer.resize(opts.width, opts.height, cfg.performance.render_scale, cfg.performance.max_internal_megapixels);
-    let mut world = World::new(cfg, renderer.max_rings());
+    let mut world = World::new(cfg, renderer.max_rings(), collector);
+    let live = !world.is_synthetic();
+    if live {
+        wait_for_data(&mut world)?;
+    }
 
     let out_tex = g.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("snapshot"),
@@ -45,13 +64,20 @@ pub fn run(cfg: Config, opts: Options) -> Result<()> {
     }
 
     let aspect = opts.width as f32 / opts.height as f32;
+    let start_t = world.t;
     for i in 0..opts.frames.max(1) {
-        let capture_t = opts.at + i as f64 * opts.every;
+        let capture_t = if live { start_t + WARM_SECONDS + i as f64 * opts.every } else { opts.at + i as f64 * opts.every };
         while world.t < capture_t - WARM_SECONDS {
             world.step(DT);
+            if live {
+                std::thread::sleep(std::time::Duration::from_secs_f64(DT));
+            }
         }
         while world.t < capture_t {
             world.step(DT);
+            if live {
+                std::thread::sleep(std::time::Duration::from_secs_f64(DT));
+            }
             let cam = Camera::wide(aspect, world.y_top(), world.cfg.camera.drift, world.t as f32);
             renderer.render(&mut world, &cam, &view, DT as f32);
             let _ = g.device.poll(wgpu::PollType::Poll);
@@ -72,7 +98,7 @@ pub fn run(cfg: Config, opts: Options) -> Result<()> {
 
 /// Renders `frames` frames at 24 fps simulated time, waiting for the GPU after
 /// each one, and reports CPU (simulation + encoding) and total frame times.
-pub fn bench(cfg: Config, width: u32, height: u32, at: f64, frames: u32) -> Result<()> {
+pub fn bench(cfg: Config, width: u32, height: u32, at: f64, frames: u32, collector: Option<std::path::PathBuf>) -> Result<()> {
     let instance = gpu::instance();
     let g = pollster::block_on(gpu::init(&instance, None, cfg.performance.prefer_igpu))?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -80,7 +106,10 @@ pub fn bench(cfg: Config, width: u32, height: u32, at: f64, frames: u32) -> Resu
     let max_mp = cfg.performance.max_internal_megapixels;
     let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format)?;
     renderer.resize(width, height, scale, max_mp);
-    let mut world = World::new(cfg, renderer.max_rings());
+    let mut world = World::new(cfg, renderer.max_rings(), collector);
+    if !world.is_synthetic() {
+        wait_for_data(&mut world)?;
+    }
     let out_tex = g.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("bench"),
         size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -92,7 +121,7 @@ pub fn bench(cfg: Config, width: u32, height: u32, at: f64, frames: u32) -> Resu
         view_formats: &[],
     });
     let view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
-    while world.t < at {
+    while world.is_synthetic() && world.t < at {
         world.step(DT);
     }
     let aspect = width as f32 / height as f32;

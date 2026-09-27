@@ -11,7 +11,7 @@ struct Segment {
 
 struct Ring {
     depth: f32, speed: f32, phase0: f32, boost: f32,
-    boost_t0: f32, hash: f32, pad0: f32, pad1: f32,
+    boost_t0: f32, hash: f32, first_seg: u32, pad1: f32,
 };
 
 @group(1) @binding(0) var<storage, read> segs: array<Segment>;
@@ -192,11 +192,11 @@ fn fs_tower(in: TowerOut, @builtin(front_facing) front: bool) -> @location(0) ve
         }
         let turn = fract(turn0 - ring_phase(ring, t));
         let x = min(u32(turn * atlas_w), u32(atlas_w) - 1u);
-        let id = textureLoad(atlas, vec2<u32>(x, ri), 0).r;
-        if (id == 0u) {
+        let local = textureLoad(atlas, vec2<u32>(x, ri), 0).r;
+        if (local == 0u) {
             continue;
         }
-        let sg = segs[id - 1u];
+        let sg = segs[ring.first_seg + local - 1u];
         let open = ring_open[ri];
         // Unwound segments shrink toward their centre, opening wider gaps.
         let shrink = 0.5 * (sg.a1 - sg.a0) * 0.12 * open;

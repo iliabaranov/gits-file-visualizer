@@ -709,6 +709,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gits-collector"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "gits-core",
+ "libc",
+ "log",
+]
+
+[[package]]
 name = "gits-core"
 version = "0.1.0"
 dependencies = [

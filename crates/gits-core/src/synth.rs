@@ -649,12 +649,11 @@ impl Session {
 
     /// Advances the session from `t` by `dt` seconds, mutating the model.
     /// `t` is the model time used for event timestamps; phases run on the session clock.
-    pub fn step(&mut self, home: &mut SynthHome, t: f64, dt: f64) {
+    pub fn step(&mut self, m: &mut Model, ix: &Index, t: f64, dt: f64) {
         self.clock += dt;
         if self.clock >= self.phase_end {
-            self.next_phase(home, t);
+            self.next_phase(m, ix, t);
         }
-        let SynthHome { model: m, index: ix } = home;
         let rng = &mut self.rng;
 
         // Background noise from daemons and apps.
@@ -749,8 +748,7 @@ impl Session {
         }
     }
 
-    fn next_phase(&mut self, home: &mut SynthHome, t: f64) {
-        let SynthHome { model: m, index: ix } = home;
+    fn next_phase(&mut self, m: &mut Model, ix: &Index, t: f64) {
         let rng = &mut self.rng;
         let r = rng.f64();
         let pick_project = |rng: &mut Rng| -> usize {
@@ -891,7 +889,7 @@ mod tests {
             let dt = 1.0 / 24.0;
             let mut log = vec![];
             for i in 1..(24 * 400) {
-                s.step(&mut home, t0 + i as f64 * dt, dt);
+                s.step(&mut home.model, &home.index, t0 + i as f64 * dt, dt);
                 log.extend(home.model.drain_events().into_iter().map(|e| (e.kind, e.file, ((e.t - t0) * 24.0).round() as i64)));
             }
             log
@@ -908,7 +906,7 @@ mod tests {
         let mut n = 0;
         let dt = 1.0 / 24.0;
         for i in 0..(24 * 600) {
-            s.step(&mut home, i as f64 * dt, dt);
+            s.step(&mut home.model, &home.index, i as f64 * dt, dt);
             n += home.model.drain_events().len();
         }
         assert!(n > 100, "only {n} events in 10 minutes");

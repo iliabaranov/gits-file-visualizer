@@ -1,0 +1,16 @@
+[Unit]
+Description=gits-file-visualizer collector (scans and watches your files for the wallpaper)
+Documentation=https://github.com/iliabaranov/gits-file-visualizer
+
+[Service]
+Type=simple
+# Installed by tools/install-user.sh. The collector lowers its own CPU and I/O
+# priority to idle; configuration is read from
+# ~/.config/gits-file-visualizer/config.toml when present.
+ExecStart=%h/.local/bin/gits-collector
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

@@ -165,7 +165,7 @@ fn atlas_texture(device: &wgpu::Device, rows: u32) -> (wgpu::Texture, wgpu::Text
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R32Uint,
+        format: wgpu::TextureFormat::R8Uint,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -554,8 +554,8 @@ impl Renderer {
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
                     },
-                    bytemuck::cast_slice(&w.atlas[..(rows * ATLAS_W) as usize]),
-                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(ATLAS_W * 4), rows_per_image: Some(rows) },
+                    &w.atlas[..(rows * ATLAS_W) as usize],
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(ATLAS_W), rows_per_image: Some(rows) },
                     wgpu::Extent3d { width: ATLAS_W, height: rows, depth_or_array_layers: 1 },
                 );
             }

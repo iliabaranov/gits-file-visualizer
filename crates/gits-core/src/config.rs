@@ -22,6 +22,7 @@ pub struct Config {
     pub monitors: BTreeMap<String, Monitor>,
     pub performance: Performance,
     pub privacy: Privacy,
+    pub data: Data,
     pub collector: Collector,
     pub synthetic: Synthetic,
 }
@@ -171,10 +172,20 @@ pub struct Privacy {
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct Data {
+    /// "auto", "collector" or "synthetic".
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Collector {
     pub roots: Vec<String>,
     pub excludes: Vec<String>,
     pub max_rings: usize,
+    /// inotify watches to use; 0 = automatic.
+    pub max_watches: usize,
+    pub crawl_interval: Dur,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

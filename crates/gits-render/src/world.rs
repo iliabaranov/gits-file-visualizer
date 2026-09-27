@@ -1,14 +1,16 @@
-//! CPU-side world: the filesystem model + synthetic session, the tower layout,
+//! CPU-side world: the filesystem model (synthetic or from the collector), the tower layout,
 //! and the animation state that feeds the GPU buffers.
 
 use crate::fx::Fx;
 use crate::gpu_types::{RingGpu, SegmentGpu};
+use crate::source::{CollectorClient, Incoming, Source};
 use gits_core::config::Config;
 use gits_core::layout::{self, Layout, LayoutParams, NONE, SEG_DELETED, SegSource};
 use gits_core::model::{EventKind, Model, NEVER};
 use gits_core::rng::{Rng, hash01};
-use gits_core::synth::{self, Session, SynthHome};
+use gits_core::synth::{self, Session};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 pub const ATLAS_W: u32 = 1024;
 pub const LUT_BINS: usize = 16384;
@@ -16,6 +18,13 @@ pub const BOOST_TAU: f32 = 6.0;
 /// Max tilt of an unwound ring, in ring pitches (mirrors TILT in tower.wgsl).
 pub const TILT: f32 = 0.3;
 const RELAYOUT_MIN_INTERVAL: f64 = 0.5;
+/// Live trees are large (a rebuild takes tens of ms), so rebuild at most this often.
+const RELAYOUT_LIVE_INTERVAL: f64 = 5.0;
+/// Directory activity below this does not count as "hot" for layout priority.
+const HOT_MIN: f32 = 0.5;
+/// Activity at which a collapsed directory is unfolded, and how often that may happen.
+const UNFOLD_ACT: f32 = 1.5;
+const UNFOLD_INTERVAL: f64 = 5.0;
 const OPEN_TAU: f32 = 2.2;
 const PRESENCE_TAU: f32 = 1.2;
 /// Rings leaving the tower ease out slowly so the drum barely drifts.
@@ -61,8 +70,8 @@ pub struct Notice {
 pub struct World {
     pub cfg: Config,
     pub notice: Option<Notice>,
-    pub home: SynthHome,
-    pub session: Session,
+    pub model: Model,
+    pub source: Source,
     pub t: f64,
     pub layout: Layout,
     pub layout_version: u64,
@@ -75,7 +84,8 @@ pub struct World {
     pub rings: Vec<RingGpu>,
     pub ring_open: Vec<f32>,
     ring_presence: Vec<f32>,
-    pub atlas: Vec<u32>,
+    /// Per ring row: 1-based index of the segment within its ring (0 = gap).
+    pub atlas: Vec<u8>,
     pub lut: Vec<f32>,
     /// Centre height (distance from the tower top) and pitch of each ring.
     pub ring_s: Vec<f32>,
@@ -115,12 +125,23 @@ pub struct World {
 }
 
 impl World {
-    pub fn new(cfg: Config, max_rings_limit: usize) -> Self {
-        let home = synth::generate_home(cfg.synthetic.seed, cfg.synthetic.scale);
-        let session = Session::new(cfg.synthetic.seed);
+    /// `collector`: socket of a running gits-collector, or None for synthetic data.
+    pub fn new(cfg: Config, max_rings_limit: usize, collector: Option<PathBuf>) -> Self {
         let max_rings = cfg.collector.max_rings.min(max_rings_limit).max(64);
-        log::info!("synthetic home: {} directories, {} files", home.model.dirs.len(), home.model.live_file_count());
-        let initial_model = home.model.clone();
+        let (model, source, notice) = match collector {
+            None => {
+                let home = synth::generate_home(cfg.synthetic.seed, cfg.synthetic.scale);
+                log::info!("synthetic home: {} directories, {} files", home.model.dirs.len(), home.model.live_file_count());
+                let session = Session::new(cfg.synthetic.seed);
+                (home.model, Source::Synthetic { index: home.index, session }, None)
+            }
+            Some(socket) => {
+                log::info!("waiting for the collector at {}", socket.display());
+                let notice = Notice { text: "connecting to gits-collector…".into(), error: false, until: f64::INFINITY };
+                (Model::new("~", wall_clock()), Source::Collector(CollectorClient::spawn(socket)), Some(notice))
+            }
+        };
+        let initial_model = model.clone();
         let initial_files = initial_model.files.len();
         let mut w = Self {
             initial_model,
@@ -134,9 +155,9 @@ impl World {
             age_offset: 0.0,
             ring_presence_target: vec![],
             cfg,
-            notice: None,
-            home,
-            session,
+            notice,
+            model,
+            source,
             t: 0.0,
             layout: Layout::default(),
             layout_version: 0,
@@ -170,7 +191,8 @@ impl World {
     fn layout_params(&self) -> LayoutParams {
         let t = &self.cfg.tower;
         LayoutParams {
-            min_arc: t.min_arc,
+            // The atlas stores a segment's position within its ring in 8 bits.
+            min_arc: t.min_arc.max(1.0 / 250.0),
             max_arc: t.max_arc,
             gap: t.gap.max(2.5 / ATLAS_W as f32),
             dir_marks: t.dir_marks,
@@ -187,7 +209,7 @@ impl World {
         }
         self.cfg = cfg;
         if relayout {
-            for f in &mut self.home.model.files {
+            for f in &mut self.model.files {
                 f.arc = 0.0;
             }
             self.relayout();
@@ -222,6 +244,7 @@ impl World {
     }
 
     pub fn relayout(&mut self) {
+        let started = std::time::Instant::now();
         let first = self.layout_version == 0;
         let mut persist: HashMap<u64, RingPersist> = HashMap::with_capacity(self.layout.rings.len());
         for (i, r) in self.layout.rings.iter().enumerate() {
@@ -231,8 +254,11 @@ impl World {
         }
 
         let params = self.layout_params();
-        self.layout = layout::build(&mut self.home.model, &params);
-        let m = &self.home.model;
+        // Directories with current activity get expanded first ("unfolding").
+        let hot: Vec<f32> = self.dir_act.iter().map(|&a| if a >= HOT_MIN { a } else { 0.0 }).collect();
+        self.layout = layout::build(&mut self.model, &params, &hot);
+        let t_build = started.elapsed().as_secs_f64() * 1e3;
+        let m = &self.model;
         let n_rings = self.layout.rings.len();
 
         // Segments.
@@ -307,25 +333,36 @@ impl World {
                     boost: 0.0,
                     boost_t0: -1.0e9,
                     hash: hash01(h ^ 0x77),
-                    _pad: [0.0; 2],
+                    first_seg: 0,
+                    _pad: 0.0,
                 });
                 self.ring_open.push(0.0);
                 self.ring_presence.push(if first { 1.0 } else { 0.0 });
             }
         }
 
-        // Segment-id atlas: one row per ring, ATLAS_W texels around it.
+        let t_segs = started.elapsed().as_secs_f64() * 1e3;
+        // Segment atlas: one row per ring, ATLAS_W texels around it, holding the
+        // segment's 1-based position within its ring (segments are stored in ring
+        // order, so the shader adds the ring's first segment index).
         let w = ATLAS_W as usize;
-        self.atlas = vec![0u32; w * n_rings.max(1)];
+        self.atlas = vec![0u8; w * n_rings.max(1)];
+        let mut first = u32::MAX;
+        let mut cur_ring = u32::MAX;
         for (i, s) in self.layout.segments.iter().enumerate() {
+            if s.ring != cur_ring {
+                cur_ring = s.ring;
+                first = i as u32;
+                self.rings[s.ring as usize].first_seg = first;
+            }
+            let local = (i as u32 - first + 1).min(255) as u8;
             let row = s.ring as usize * w;
             let x0 = (s.a0 * w as f32).floor().max(0.0) as usize;
             let x1 = ((s.a1 * w as f32).ceil() as usize).min(w);
-            for x in x0..x1 {
-                self.atlas[row + x] = i as u32 + 1;
-            }
+            self.atlas[row + x0..row + x1].fill(local);
         }
 
+        let t_atlas = started.elapsed().as_secs_f64() * 1e3;
         let n_dirs = m.dirs.len();
         self.dir_act.resize(n_dirs, 0.0);
         self.dir_open_target.resize(n_dirs, 0.0);
@@ -357,25 +394,41 @@ impl World {
             }
         }
         self.update_lut();
-        log::debug!("layout v{}: {} rings, {} segments", self.layout_version, n_rings, self.segs.len());
+        log::debug!(
+            "layout v{}: {} rings, {} segments, {} dirs expanded, {} collapsed, {:.1} ms (build {t_build:.1}, segs+rings {:.1}, atlas {:.1})",
+            self.layout_version,
+            n_rings,
+            self.segs.len(),
+            self.layout.expanded,
+            self.layout.collapsed,
+            started.elapsed().as_secs_f64() * 1e3,
+            t_segs - t_build,
+            t_atlas - t_segs
+        );
     }
 
     /// Advances the simulation by `dt` seconds.
     pub fn step(&mut self, dt: f64) {
         let dt = dt.clamp(0.0, 0.5);
         let t = self.t + dt;
-        if self.loop_stage == LoopStage::Running {
-            self.session.step(&mut self.home, t, dt);
+        match &mut self.source {
+            Source::Synthetic { index, session } => {
+                if self.loop_stage == LoopStage::Running {
+                    session.step(&mut self.model, index, t, dt);
+                }
+            }
+            Source::Collector(_) => self.poll_collector(t),
         }
         self.t = t;
         let tf = t as f32;
 
-        let events = self.home.model.drain_events();
+        let events = self.model.drain_events();
         let n_events = events.len();
         let min_flash = 1.0 / self.cfg.calm.max_flash_hz.max(0.1);
         let mut falls = vec![];
+        let mut touched: Vec<u32> = vec![];
         for ev in events {
-            let file = &self.home.model.files[ev.file as usize];
+            let file = &self.model.files[ev.file as usize];
             let dir = file.dir as usize;
             let seg = self.layout.seg_of_file.get(ev.file as usize).copied().unwrap_or(NONE);
             let impulse = match ev.kind {
@@ -388,9 +441,20 @@ impl World {
                 self.dir_act[dir] += impulse;
             }
             if ev.kind == EventKind::Create {
-                self.needs_relayout = true;
+                if self.layout.is_expanded(dir as u32) {
+                    self.needs_relayout = true;
+                } else if let Some(a) = self.layout.agg_for(&self.model, dir as u32)
+                    && let Some(g) = self.segs.get_mut(a as usize)
+                    && tf - g.t_write >= min_flash
+                {
+                    // New file inside a collapsed subtree: its aggregate flashes.
+                    g.t_write = tf;
+                    self.dirty_segs.push(a);
+                }
+                touched.push(dir as u32);
                 continue;
             }
+            touched.push(dir as u32);
             if seg == NONE || seg as usize >= self.segs.len() {
                 continue;
             }
@@ -463,12 +527,20 @@ impl World {
         if !self.looping() && t - self.last_purge_t > 30.0 {
             self.last_purge_t = t;
             let before = t - self.cfg.events.delete.ghost_hours as f64 * 3600.0;
-            if self.home.model.purge_deleted(before) > 0 {
+            if self.model.purge_deleted(before) > 0 {
                 self.needs_relayout = true;
             }
         }
-        if self.needs_relayout && t - self.layout_t >= RELAYOUT_MIN_INTERVAL {
+        let min_interval = if self.is_synthetic() { RELAYOUT_MIN_INTERVAL } else { RELAYOUT_LIVE_INTERVAL };
+        if self.needs_relayout && t - self.layout_t >= min_interval {
             self.relayout();
+        }
+
+        // A busy directory that is collapsed gets unfolded by the next layout.
+        if t - self.layout_t >= UNFOLD_INTERVAL
+            && touched.iter().any(|&d| !self.layout.is_expanded(d) && self.dir_act.get(d as usize).is_some_and(|&a| a >= UNFOLD_ACT))
+        {
+            self.needs_relayout = true;
         }
 
         self.update_loop();
@@ -483,24 +555,96 @@ impl World {
 
     fn dir_mark_segment(&self, first_ring: u32) -> Option<u32> {
         // The directory tick is the first segment placed on the band's first ring.
-        let row = first_ring as usize * ATLAS_W as usize;
-        self.atlas
-            .get(row..row + ATLAS_W as usize)?
-            .iter()
-            .find(|&&id| id != 0)
-            .map(|&id| id - 1)
-            .filter(|&s| self.segs[s as usize].flags & layout::SEG_DIR != 0)
+        let s = self.rings.get(first_ring as usize)?.first_seg;
+        self.segs.get(s as usize).filter(|g| g.flags & layout::SEG_DIR != 0).map(|_| s)
     }
 
     fn looping(&self) -> bool {
-        self.cfg.synthetic.loop_len.0 > 0.0
+        self.is_synthetic() && self.cfg.synthetic.loop_len.0 > 0.0
     }
 
-    /// Current work-session phase, or "wind-down" at the end of a loop.
+    pub fn is_synthetic(&self) -> bool {
+        matches!(self.source, Source::Synthetic { .. })
+    }
+
+    /// True once there is data to show (always for synthetic data).
+    pub fn has_data(&self) -> bool {
+        match &self.source {
+            Source::Synthetic { .. } => true,
+            Source::Collector(c) => c.has_snapshot,
+        }
+    }
+
+    /// Current work-session phase, "wind-down" at the end of a loop, or "live".
     pub fn phase_name(&self) -> &'static str {
-        match self.loop_stage {
-            LoopStage::Running => self.session.phase_name(),
-            LoopStage::WindDown(_) => "wind-down",
+        match (&self.source, self.loop_stage) {
+            (Source::Collector(_), _) => "live",
+            (Source::Synthetic { session, .. }, LoopStage::Running) => session.phase_name(),
+            (_, LoopStage::WindDown(_)) => "wind-down",
+        }
+    }
+
+    /// Applies whatever the collector sent since the last frame.
+    fn poll_collector(&mut self, t: f64) {
+        let Source::Collector(client) = &mut self.source else { return };
+        let mut snapshot = None;
+        let mut ops = Vec::new();
+        let mut notice = None;
+        while let Some(msg) = client.try_recv() {
+            match msg {
+                Incoming::Snapshot(m) => {
+                    // A new snapshot supersedes anything queued before it.
+                    ops.clear();
+                    snapshot = Some(m);
+                    client.has_snapshot = true;
+                }
+                Incoming::Ops(o) => ops.extend(o),
+                Incoming::Status(s) => {
+                    if !client.has_snapshot {
+                        notice = Some(Notice { text: format!("gits-collector: {s}…"), error: false, until: f64::INFINITY });
+                    }
+                }
+                Incoming::Disconnected(e) => {
+                    notice = Some(Notice { text: format!("{e} (retrying)"), error: true, until: f64::INFINITY });
+                }
+            }
+        }
+        if let Some(n) = notice {
+            self.notice = Some(n);
+        }
+        if let Some(mut m) = snapshot {
+            m.epoch_unix = wall_clock() - t as i64;
+            log::info!("collector snapshot: {} directories, {} files", m.live_dir_count(), m.live_file_count());
+            self.notice = Some(Notice {
+                text: format!("gits-collector: {} folders, {} files", m.live_dir_count(), m.live_file_count()),
+                error: false,
+                until: t + 6.0,
+            });
+            self.model = *m;
+            self.fx = Fx::default();
+            self.dir_act.clear();
+            self.needs_relayout = true;
+            self.layout_t = -1.0e9;
+        }
+        let mut applied = 0usize;
+        for op in &ops {
+            if self.model.apply(op, t) {
+                applied += 1;
+            }
+        }
+        if applied < ops.len() {
+            log::debug!("ignored {} ops for unknown ids", ops.len() - applied);
+        }
+        use gits_core::protocol::Op;
+        let layout = &self.layout;
+        let model = &self.model;
+        let expanded_parent = |d: u32| model.dirs.get(d as usize).and_then(|x| x.parent).is_some_and(|p| layout.is_expanded(p));
+        if ops.iter().any(|o| match o {
+            Op::MkDir { parent, .. } => layout.is_expanded(*parent),
+            Op::RmDir { dir } => layout.is_expanded(*dir) || expanded_parent(*dir),
+            _ => false,
+        }) {
+            self.needs_relayout = true;
         }
     }
 
@@ -542,7 +686,7 @@ impl World {
         let epoch = self.initial_model.epoch_unix;
         for f in 0..self.initial_files {
             let orig = &self.initial_model.files[f];
-            let cur = &mut self.home.model.files[f];
+            let cur = &mut self.model.files[f];
             cur.t_read = NEVER;
             cur.t_write = NEVER;
             cur.t_delete = NEVER;
@@ -601,10 +745,12 @@ impl World {
         let mut model = self.initial_model.clone();
         for (f, file) in model.files.iter_mut().enumerate() {
             // Keep the arcs currently on screen (they differ if the tower config changed).
-            file.arc = self.home.model.files[f].arc;
+            file.arc = self.model.files[f].arc;
         }
-        self.home.model = model;
-        self.session = Session::new(self.cfg.synthetic.seed);
+        self.model = model;
+        if let Source::Synthetic { session, .. } = &mut self.source {
+            *session = Session::new(self.cfg.synthetic.seed);
+        }
         self.dir_act.iter_mut().for_each(|a| *a = 0.0);
         self.age_offset = self.t;
         self.loop_start = self.t;
@@ -748,7 +894,7 @@ impl World {
 
     /// Short label for a file according to the privacy setting.
     pub fn label_for(&self, file: u32) -> Option<String> {
-        let m = &self.home.model;
+        let m = &self.model;
         let f = m.files.get(file as usize)?;
         match self.cfg.privacy.text.as_str() {
             "none" => None,
@@ -757,6 +903,10 @@ impl World {
             _ => Some(f.name.clone()),
         }
     }
+}
+
+pub fn wall_clock() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 pub fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {

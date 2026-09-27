@@ -51,6 +51,26 @@ pub struct Dir {
     pub depth: u16,
     pub dirs: Vec<DirId>,
     pub files: Vec<FileId>,
+    /// Deleted from disk; kept (with its files as deletion ghosts) until purged.
+    pub removed: bool,
+    /// Dropped from its parent's listing.
+    pub purged: bool,
+    /// Stable identity derived from the path, independent of ids (survives rescans).
+    pub key: u64,
+}
+
+/// FNV-1a, for stable directory keys.
+pub fn hash_str(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+pub fn child_key(parent_key: u64, name: &str) -> u64 {
+    crate::rng::mix64(parent_key ^ hash_str(name).rotate_left(17))
 }
 
 #[derive(Clone, Debug)]
@@ -103,20 +123,25 @@ pub struct Model {
 
 impl Model {
     pub fn new(root_name: &str, epoch_unix: i64) -> Self {
-        Self {
-            dirs: vec![Dir { name: root_name.into(), parent: None, depth: 0, dirs: vec![], files: vec![] }],
+        let root = Dir {
+            name: root_name.into(),
+            parent: None,
+            depth: 0,
+            dirs: vec![],
             files: vec![],
-            root: 0,
-            epoch_unix,
-            structure_gen: 0,
-            events: vec![],
-        }
+            removed: false,
+            purged: false,
+            key: hash_str(root_name),
+        };
+        Self { dirs: vec![root], files: vec![], root: 0, epoch_unix, structure_gen: 0, events: vec![] }
     }
 
     pub fn add_dir(&mut self, parent: DirId, name: impl Into<String>) -> DirId {
         let id = self.dirs.len() as DirId;
-        let depth = self.dirs[parent as usize].depth + 1;
-        self.dirs.push(Dir { name: name.into(), parent: Some(parent), depth, dirs: vec![], files: vec![] });
+        let name = name.into();
+        let p = &self.dirs[parent as usize];
+        let (depth, key) = (p.depth + 1, child_key(p.key, &name));
+        self.dirs.push(Dir { name, parent: Some(parent), depth, dirs: vec![], files: vec![], removed: false, purged: false, key });
         self.dirs[parent as usize].dirs.push(id);
         self.structure_gen += 1;
         id
@@ -216,10 +241,100 @@ impl Model {
             n += drop.len();
             self.dirs[d].files = keep;
         }
+        // Children have larger ids than parents: a reverse sweep empties bottom-up.
+        for d in (1..self.dirs.len()).rev() {
+            let dir = &self.dirs[d];
+            if dir.removed && !dir.purged && dir.files.is_empty() && dir.dirs.is_empty() {
+                if let Some(p) = dir.parent {
+                    self.dirs[p as usize].dirs.retain(|&c| c as usize != d);
+                }
+                self.dirs[d].purged = true;
+                n += 1;
+            }
+        }
         if n > 0 {
             self.structure_gen += 1;
         }
         n
+    }
+
+    /// Marks a directory subtree as deleted; its live files become deletion events.
+    pub fn remove_dir(&mut self, d: DirId, t: f64) {
+        if d == self.root {
+            return;
+        }
+        let mut stack = vec![d];
+        while let Some(d) = stack.pop() {
+            let dir = &mut self.dirs[d as usize];
+            if dir.removed {
+                continue;
+            }
+            dir.removed = true;
+            stack.extend_from_slice(&dir.dirs);
+            let files = dir.files.clone();
+            for f in files {
+                self.delete(f, t);
+            }
+        }
+        self.structure_gen += 1;
+    }
+
+    /// Immediately forgets a file (no ghost), keeping ids stable.
+    pub fn purge_file(&mut self, f: FileId) {
+        let file = &mut self.files[f as usize];
+        if file.purged {
+            return;
+        }
+        file.purged = true;
+        if file.t_delete == NEVER {
+            file.t_delete = 0.0;
+        }
+        let d = file.dir as usize;
+        self.dirs[d].files.retain(|&x| x != f);
+        self.structure_gen += 1;
+    }
+
+    /// Immediately forgets a directory subtree (no ghosts), keeping ids stable.
+    pub fn purge_dir(&mut self, d: DirId) {
+        if d == self.root {
+            return;
+        }
+        if let Some(p) = self.dirs[d as usize].parent {
+            self.dirs[p as usize].dirs.retain(|&c| c != d);
+        }
+        let mut stack = vec![d];
+        while let Some(d) = stack.pop() {
+            let dir = &mut self.dirs[d as usize];
+            dir.removed = true;
+            dir.purged = true;
+            let (dirs, files) = (std::mem::take(&mut dir.dirs), std::mem::take(&mut dir.files));
+            stack.extend(dirs);
+            for f in files {
+                let file = &mut self.files[f as usize];
+                file.purged = true;
+                if file.t_delete == NEVER {
+                    file.t_delete = 0.0;
+                }
+            }
+        }
+        self.structure_gen += 1;
+    }
+
+    /// Builds a model from raw parts (used when decoding a snapshot).
+    pub fn from_parts(dirs: Vec<Dir>, files: Vec<File>, epoch_unix: i64) -> Self {
+        Self { dirs, files, root: 0, epoch_unix, structure_gen: 1, events: vec![] }
+    }
+
+    pub fn find_file(&self, d: DirId, name: &str) -> Option<FileId> {
+        self.dirs.get(d as usize)?.files.iter().copied().find(|&f| self.files[f as usize].name == name && self.is_live(f))
+    }
+
+    pub fn find_dir(&self, parent: DirId, name: &str) -> Option<DirId> {
+        self.dirs.get(parent as usize)?.dirs.iter().copied().find(|&d| self.dirs[d as usize].name == name && !self.dirs[d as usize].removed)
+    }
+
+    pub fn live_dir_count(&self) -> usize {
+        self.dirs.iter().filter(|d| !d.removed).count()
     }
 
     pub fn drain_events(&mut self) -> Vec<Event> {
