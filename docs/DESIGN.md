@@ -1,6 +1,6 @@
 # gits-file-visualizer — Design (v3)
 
-Status: design agreed; next step is M0 look-dev. Decided items are marked ✅.
+Status: M0 (look-dev) done, next is M1 (real collector). Decided items are marked ✅.
 
 ## 1. Goal
 
@@ -33,8 +33,8 @@ motion coming from the data, not from the camera.
 
 ## 3. Visual reference: what the scene actually shows
 
-Reference frames are kept locally in `docs/ref/` (gitignored; film stills are
-not committed). They come from YouTube storyboard sprites of the clip plus one
+Reference frames are in `docs/ref/` (low resolution, committed to this private
+repo so look-dev works on any machine). They come from YouTube storyboard sprites of the clip plus one
 still of the ship sequence.
 
 1. **The drum** (`hack-keyframes.jpg`, panels 2, 5, 6). A massive glowing
@@ -266,83 +266,14 @@ Measured on this machine: `$HOME` = **~134k directories, ~1.24M files**.
 
 ## 9. Configuration
 
-One TOML file, `~/.config/gits-file-visualizer/config.toml`, hot-reloaded by
-the renderer (collector settings apply on restart). Every value has a default,
-so an empty file is valid. Sketch:
-
-```toml
-[palette]                      # hex colours, all overridable
-background  = "#0a0604"
-gold        = "#ffb21e"
-cream       = "#fff1c8"
-orange      = "#ff7a18"
-crimson     = "#d0203a"
-teal        = "#2fe0c4"        # environment only
-bloom       = 0.8
-grain       = 0.15
-
-[events.read]
-color   = "cream"              # palette name or hex
-decay   = "4m"                 # afterglow half-life
-probe   = true
-
-[events.write]
-color   = "crimson"
-decay   = "15m"
-spin_up = 0.3                  # extra ring spin, 0 = none
-
-[events.create]
-color   = "cream"
-grow    = "1.5s"
-
-[events.delete]
-color       = "crimson"
-fall        = true             # snapped-string fall + gold flakes
-ghost_hours = 3
-
-[age]                          # idle colour by mtime age
-fresh = "gold"                 # < 1 day
-old   = "orange"               # ~1 month
-stale = "#5a3a14"              # > 1 year
-
-[calm]
-max_flash_hz  = 2.0
-attack_ms     = 150
-spin_speed    = 0.2            # base ring spin, rev/min
-surge_hud     = true           # security-voice HUD lines
-
-[background]
-calligraphy = true
-calligraphy_brightness = 0.12
-
-[camera]
-drift = 0.0                    # 0 = perfectly still; 1 = max gentle drift
-rotate_compositions = "off"    # or e.g. "3h"
-
-[monitors."*"]
-composition = "wide"
-[monitors."DP-2"]              # connector name
-composition = "drum"
-[monitors."eDP-1"]
-composition = "dial"
-
-[performance]
-fps_active   = 24
-fps_calm     = 8
-fps_battery  = 6
-render_scale = 0.66
-prefer_igpu  = true
-
-[privacy]
-text = "paths"                 # paths | dirs | glyphs | none
-obfuscate_when_sharing = true
-
-[collector]
-roots    = ["~"]
-excludes = ["~/.cache", "**/node_modules", "**/target", "**/.git/objects",
-            "~/snap", "~/.local/share/Steam", "~/esp-idf*"]
-max_rings = 16384
-```
+One TOML file. [`config/default.toml`](../config/default.toml) is compiled into
+the binary and is the single source of defaults and documentation. A user
+file (`~/.config/gits-file-visualizer/config.toml` or `--config`) is deep-merged
+over it, so it only needs the keys being changed. Unknown keys are rejected.
+The renderer hot-reloads the file; `[synthetic]` changes need a restart.
+Sections: `palette`, `events.{read,write,create,delete}`, `age`, `calm`,
+`tower`, `background`, `camera`, `monitors."<connector>"`, `performance`,
+`privacy`, `collector`, `synthetic`.
 
 ## 10. Components
 
@@ -367,7 +298,53 @@ max_rings = 16384
 - Note: stat atime is coarse because of `relatime`. Access visuals come from
   live events.
 
-## 11. Milestones
+## 11. Progress notes
+
+### M0 — done (2026-09-27)
+
+- Workspace: `gits-core` (model, layout, config, synthetic data) and
+  `gits-render` (wgpu 30 + winit 0.30). Rust toolchain pinned. Fonts
+  bundled as subsets, defaults compiled in, reference frames in `docs/ref/`.
+  Nothing depends on the host beyond the GPU driver and the display server.
+- Implemented: drum shader over a segment-id atlas + LUT; unwinding driven by
+  per-directory activity (capped at 5 ring pitches per directory and 35% of the
+  tower height); event colours with soft attack and a flash-rate limit;
+  unwound rings tilt slightly and show more cream "scanned" arcs; cards +
+  labels, probe, falling segments → gold flakes; cached chamber (lattice, floor
+  lights, dim Zeami calligraphy); motion smear, bloom, hue-preserving tonemap,
+  grain and vignette; config hot reload; headless `snapshot` and `bench`.
+- Look-dev findings that changed the design:
+  - Files need long arcs (0.035–0.42 turns); short dashes read as noise.
+  - The camera must look down about 23° so rings read as ellipses.
+  - A per-channel tonemap bleached gold to yellow and crimson to pink. The
+    tonemap is now applied to the brightest channel so hues are kept.
+  - Unwound ribbons must be thin (22% of pitch) with a soft halo, otherwise
+    they read as bricks.
+- Measured on this laptop (Intel UHD 630 iGPU, Mesa Vulkan), per frame, with
+  internal resolution capped at 1.6 MP:
+
+  | Output | GPU+CPU | GPU busy at 24 fps / 8 fps |
+  |--------|---------|----------------------------|
+  | 1920×1080 | 8.1 ms | 19% / 6% |
+  | 3840×2160 | 15.6 ms | 37% / 12% |
+  | 1440×2560 portrait | 23.5 ms | 56% / 19% |
+
+  CPU is about 1 ms/frame. The window holds 24 fps. Before the sample-count
+  and resolution-cap fixes, 4K took 40 ms.
+
+### Efficiency backlog for M3
+
+- Tower fragment shader is ~65% of GPU time: cheaper samples in the dense drum,
+  scissor to the tower's screen rectangle, fewer layers for back faces.
+- Full-output passes are bandwidth-bound on iGPUs: skip `combine` when smear is
+  off, use `Rg11b10Ufloat` targets where supported, merge passes.
+- Calm policy: after a few idle minutes, slow the ring spin and drop to 2–4 fps.
+  The motion smear hides the low rate.
+- Per-pass GPU timestamps in `bench` (the `GITS_SKIP` env var is a stopgap).
+- Portrait: the tower covers more pixels; consider a composition that pulls
+  back further.
+
+## 12. Milestones
 
 1. **M0 look-dev:** windowed renderer on synthetic data (a scripted "work
    session" event generator): drum shader, coil unwinding, event colours,

@@ -1,0 +1,117 @@
+# gits-file-visualizer — default configuration.
+#
+# This file is compiled into the binary and is the single source of defaults.
+# To customise, copy any subset of it to
+#   ~/.config/gits-file-visualizer/config.toml
+# (or pass --config <file>). Your file is merged over these defaults, so it only
+# needs the keys you want to change. The renderer reloads it while running.
+#
+# Durations accept a number of seconds or a string with a unit: "150ms", "4s",
+# "15m", "3h". Colours accept a palette name (gold, cream, orange, crimson,
+# teal, background) or a hex value like "#ffb21e".
+
+[palette]
+background = "#0a0604"
+gold       = "#ffb21e"
+cream      = "#fff1c8"
+orange     = "#ff7a18"
+crimson    = "#c41230"
+teal       = "#2fe0c4"      # environment only (lattice, floor lights)
+exposure   = 1.35
+bloom      = 0.7
+grain      = 0.05
+vignette   = 0.55
+smear      = "110ms"        # motion-smear time constant (0 disables)
+
+[events.read]
+color     = "cream"
+decay     = "4m"            # time until the afterglow has (almost) faded
+intensity = 1.6
+probe     = true            # wireframe probe glides to the file being read
+
+[events.write]
+color     = "crimson"
+decay     = "15m"           # time for a written segment to fade back to gold
+intensity = 1.3
+spin_up   = 0.35            # extra ring spin (turns) given by a write; 0 = none
+
+[events.create]
+color     = "cream"
+grow      = "1.5s"          # time for a new segment to grow along its ring
+intensity = 1.8
+
+[events.delete]
+color       = "crimson"
+intensity   = 2.0
+fall        = true          # the cut segment falls and breaks into gold flakes
+ghost_hours = 3.0           # faint crimson ghost left in the gap
+
+[age]                       # idle colour by modification age
+fresh      = "gold"
+old        = "orange"
+stale      = "#5a3a14"
+fresh_days = 1.0
+old_days   = 30.0
+stale_days = 365.0
+
+[calm]
+max_flash_hz    = 2.0       # a segment re-flashes at most this often
+attack          = "150ms"   # every brightening fades in over at least this long
+spin_speed      = 0.25      # base ring spin, revolutions per minute
+activity_decay  = "75s"     # how long a directory stays "unwound" after activity
+max_open_dirs   = 5         # at most this many directories unwound at once
+surge_hud       = true      # security-voice HUD lines during surges
+
+[tower]
+height          = 12.0      # world units
+radius          = 1.75
+depth_step      = 0.075     # radius shrink per directory depth layer
+depth_layers    = 4         # distinct radii (deeper directories share the last)
+min_arc         = 0.035     # turns, smallest file segment
+max_arc         = 0.42      # turns, largest file segment
+gap             = 0.012     # turns between segments
+dir_marks       = true      # small tick at the start of every directory band
+open_pitch      = 0.2       # vertical spacing of an unwound ring (world units)
+ribbon          = 0.035     # max ribbon thickness (world units)
+fill            = 0.6       # ribbon thickness as a fraction of pitch, when packed
+fill_open       = 0.22      # ribbon thickness as a fraction of pitch, when unwound
+idle_wound      = 0.62      # idle brightness inside the packed drum
+idle_open       = 0.95      # idle brightness of an unwound ring
+back_face       = 0.38      # brightness of the far side of the tower
+
+[background]
+calligraphy            = true
+calligraphy_brightness = 0.10
+lattice                = true
+lattice_brightness     = 0.55
+floor_lights           = true
+
+[camera]
+drift               = 0.0   # 0 = perfectly still; 1 = maximum gentle drift
+rotate_compositions = "off" # or a duration such as "3h"
+
+[monitors."*"]
+composition = "wide"        # wide | drum | dial | band (M0 implements wide)
+
+[performance]
+fps_active   = 24
+fps_calm     = 8
+fps_battery  = 6
+render_scale = 0.66         # internal resolution relative to the output
+max_internal_megapixels = 1.6   # cap, so 4K costs about the same as 1080p
+prefer_igpu  = true
+
+[privacy]
+text                   = "paths"   # paths | dirs | glyphs | none
+obfuscate_when_sharing = true
+
+[collector]
+roots     = ["~"]
+excludes  = ["~/.cache", "**/node_modules", "**/target", "**/.git/objects",
+             "~/snap", "~/.local/share/Steam"]
+max_rings = 16384
+
+[synthetic]                 # fake filesystem + work session used for look-dev
+seed  = 2501
+scale = 1.0                 # 1.0 ≈ 1.7k directories, 39k files
+speed = 1.0                 # simulated seconds per real second

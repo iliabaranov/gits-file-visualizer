@@ -1,6 +1,3 @@
 /target
-*.zip
+/out
 *.log
-# Film stills are for local look-dev reference only; do not commit them.
-/docs/ref/*.jpg
-/docs/ref/*.png

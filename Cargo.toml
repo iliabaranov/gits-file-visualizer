@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/gits-core", "crates/gits-render"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+fontdue = "0.9"
+glam = { version = "0.33", features = ["bytemuck"] }
+log = "0.4"
+png = "0.18"
+pollster = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+wgpu = "30"
+winit = "0.30"
+
+[profile.release]
+debug = 1
+lto = "thin"
+
+[profile.dev.package."*"]
+opt-level = 2
