@@ -25,6 +25,8 @@ const HOT_MIN: f32 = 0.5;
 /// Activity at which a collapsed directory is unfolded, and how often that may happen.
 const UNFOLD_ACT: f32 = 1.5;
 const UNFOLD_INTERVAL: f64 = 5.0;
+/// Ceiling for a folder's activity score.
+const DIR_ACT_MAX: f32 = 6.0;
 const OPEN_TAU: f32 = 2.2;
 const PRESENCE_TAU: f32 = 1.2;
 /// Rings leaving the tower ease out slowly so the drum barely drifts.
@@ -72,6 +74,8 @@ pub struct World {
     /// Nothing is being drawn: skip work that only matters on screen (layout
     /// rebuilds are deferred until the next visible frame).
     pub hidden: bool,
+    /// A screencast/screen share is running (labels are obfuscated if configured).
+    pub sharing: bool,
     pub notice: Option<Notice>,
     pub model: Model,
     pub source: Source,
@@ -148,6 +152,7 @@ impl World {
         let initial_files = initial_model.files.len();
         let mut w = Self {
             hidden: false,
+            sharing: false,
             initial_model,
             initial_files,
             loop_start: 0.0,
@@ -442,7 +447,10 @@ impl World {
                 EventKind::Delete => 1.2,
             };
             if dir < self.dir_act.len() {
-                self.dir_act[dir] += impulse;
+                // Saturates: a folder written to constantly (a log, a soak test)
+                // stays open but does not dominate the layout forever.
+                let a = &mut self.dir_act[dir];
+                *a += impulse * (1.0 - *a / DIR_ACT_MAX).max(0.0);
             }
             if ev.kind == EventKind::Create {
                 if self.layout.is_expanded(dir as u32) {
@@ -565,6 +573,14 @@ impl World {
 
     fn looping(&self) -> bool {
         self.is_synthetic() && self.cfg.synthetic.loop_len.0 > 0.0
+    }
+
+    /// Switches from synthetic data to a collector that became available; the
+    /// synthetic tower stays on screen until the collector's snapshot arrives.
+    pub fn switch_to_collector(&mut self, socket: PathBuf) {
+        self.source = Source::Collector(CollectorClient::spawn(socket));
+        self.loop_stage = LoopStage::Running;
+        self.loop_fade = 1.0;
     }
 
     pub fn is_synthetic(&self) -> bool {
@@ -900,7 +916,8 @@ impl World {
     pub fn label_for(&self, file: u32) -> Option<String> {
         let m = &self.model;
         let f = m.files.get(file as usize)?;
-        match self.cfg.privacy.text.as_str() {
+        let mode = if self.sharing && self.cfg.privacy.obfuscate_when_sharing { "glyphs" } else { self.cfg.privacy.text.as_str() };
+        match mode {
             "none" => None,
             "dirs" => Some(m.dirs[f.dir as usize].name.clone()),
             "glyphs" => Some(format!("{:08X}", gits_core::rng::mix64(file as u64) as u32)),

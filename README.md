@@ -15,8 +15,10 @@ Design: [docs/DESIGN.md](docs/DESIGN.md).
   work session, used for look-dev and reproducible snapshots.
 - **M1 (real data) — done.** `gits-collector` scans your home folder, watches
   it for changes and streams them to the renderer.
-- **Next: M2**, a GNOME extension that places the renderer behind the desktop.
-  Until then the renderer runs in a normal window.
+- **M2 (wallpaper) — done for GNOME 42–44** (Ubuntu 22.04). A GNOME Shell
+  extension starts the renderer and shows it as the background on every
+  monitor, including the overview and workspace switching, and pauses monitors
+  that are covered. GNOME 45+ (Ubuntu 24.04/26.04) follows in M5.
 
 ## Build and run
 
@@ -25,12 +27,37 @@ compiler, and rustup installs it automatically. No system `-dev` packages are
 required. At runtime the binary loads the GPU driver (Vulkan) and
 Wayland/X11 libraries that every Ubuntu desktop already has.
 
-### With your real files
+### As your wallpaper (Ubuntu 22.04 / GNOME 42)
 
 ```sh
-tools/install-user.sh              # build, install to ~/.local/bin, start the collector service
-gits-render window                 # renders your files (Esc or q quits)
-tools/install-user.sh uninstall    # remove again
+tools/install-user.sh              # build; install to ~/.local; start the collector service
+gnome-extensions enable gits-file-visualizer@iliabaranov.github.io     # wallpaper on
+gnome-extensions disable gits-file-visualizer@iliabaranov.github.io    # wallpaper off
+tools/install-user.sh uninstall    # remove everything again
+```
+
+On Wayland, GNOME only notices a newly installed extension after logging out
+and back in once; the script says when that is needed. The extension:
+
+- starts `gits-render wallpaper` (from `~/.local/bin`, `PATH`, or
+  `GITS_RENDER_BIN`) and shows its output as the background of every monitor,
+  in the overview and during workspace switches; the lock screen keeps the normal
+  wallpaper;
+- keeps the renderer's windows out of the dock, alt-tab and the overview;
+- pauses a monitor while windows cover it, and everything while the screen is
+  locked (with every monitor covered the renderer uses ~1.6% of one core, from
+  applying live file changes);
+- switches file names to obfuscated glyphs while a screencast or screen share is
+  running (`[privacy] obfuscate_when_sharing`);
+- restarts the renderer if it crashes (at most 5 times in 5 minutes) and when
+  monitors change; if the renderer is missing, the normal wallpaper stays.
+
+Logs: `journalctl --user -f -o cat /usr/bin/gnome-shell | grep gits`.
+
+### With your real files, in a window
+
+```sh
+gits-render window                 # uses the collector if running (Esc or q quits)
 ```
 
 Or without installing anything, in two terminals:
@@ -58,6 +85,14 @@ cargo run --release -p gits-render -- bench --width 3840 --height 2160
 cargo run --release -p gits-render -- stats --minutes 15
 cargo run --release -p gits-render -- default-config > my-config.toml
 ```
+
+### Testing the extension safely
+
+`tools/sandbox-shell.sh` runs a separate, headless GNOME Shell with its own
+home, runtime directory, D-Bus and three virtual monitors; nothing touches the
+real session. `start`, `eval 'JS'`, `shot file.png`, `run gnome-calculator`,
+`log`, `stop`. `GITS_COLLECTOR_SOCKET=$XDG_RUNTIME_DIR/gits-file-visualizer/collector.sock`
+connects it to the real collector.
 
 `--warmup` simulates that many seconds of activity before the first frame.
 `--seed` and `--scale` change the synthetic home. `snapshot`, `bench` and
@@ -117,8 +152,9 @@ are rejected, so typos surface immediately.
 | `crates/gits-render` | wgpu renderer, window mode, headless snapshots, benchmark |
 | `crates/gits-render/shaders` | WGSL: tower, sprites, post-processing |
 | `config/default.toml` | All defaults (compiled in) |
+| `extension/gnome-42` | GNOME Shell 42–44 extension (wallpaper embedding) |
 | `packaging/systemd` | User service for the collector |
-| `tools/` | `install-user.sh` (per-user install), `make-fonts.sh` |
+| `tools/` | `install-user.sh` (per-user install), `sandbox-shell.sh` (isolated test shell), `make-fonts.sh` |
 | `assets/fonts` | Bundled font subsets + licenses (compiled in; see `tools/make-fonts.sh`) |
 | `docs/DESIGN.md` | Design, decisions, milestones |
 | `docs/ref` | Low-res reference frames from the film (look-dev only) |

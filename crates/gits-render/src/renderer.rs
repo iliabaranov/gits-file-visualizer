@@ -1,5 +1,9 @@
 //! GPU resources and the per-frame pass sequence:
 //! cached background → scene (tower + sprites) → smear → bloom → tonemap.
+//!
+//! [`Renderer`] holds everything shared by all outputs (pipelines, the world's
+//! GPU buffers, the glyph atlas). Each output (monitor or window) has a [`View`]
+//! with its own render targets, cached background and sprite buffers.
 
 use crate::camera::Camera;
 use crate::fx;
@@ -94,11 +98,6 @@ pub struct Renderer {
 
     sprite_pipeline: wgpu::RenderPipeline,
     sprite_bg: wgpu::BindGroup,
-    fx_vb: wgpu::Buffer,
-    fx_cap: usize,
-    fx_count: u32,
-    bg_vb: wgpu::Buffer,
-    bg_count: u32,
 
     bg_pipeline: wgpu::RenderPipeline,
     combine_pipeline: wgpu::RenderPipeline,
@@ -109,13 +108,33 @@ pub struct Renderer {
     sampler: wgpu::Sampler,
     dummy: Target,
 
+    layout_version: u64,
+    scratch: Vec<SpriteVertex>,
+    pub atlas: GlyphAtlas,
+}
+
+/// Per-output state: render targets, cached background, sprite buffers.
+pub struct View {
     targets: Option<Targets>,
     trail_idx: usize,
     bg_dirty: bool,
-    layout_version: u64,
     frame: u64,
-    scratch: Vec<SpriteVertex>,
-    pub atlas: GlyphAtlas,
+    fx_vb: wgpu::Buffer,
+    fx_cap: usize,
+    fx_count: u32,
+    bg_vb: wgpu::Buffer,
+    bg_count: u32,
+}
+
+impl View {
+    pub fn internal_size(&self) -> (u32, u32) {
+        self.targets.as_ref().map(|t| (t.w, t.h)).unwrap_or((0, 0))
+    }
+
+    /// Re-renders the cached chamber background on the next frame.
+    pub fn invalidate_background(&mut self) {
+        self.bg_dirty = true;
+    }
 }
 
 fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -415,11 +434,6 @@ impl Renderer {
             ring_buf: storage_buffer(&device, "rings", (ring_cap * std::mem::size_of::<RingGpu>()) as u64),
             open_buf: storage_buffer(&device, "ring open", (ring_cap * 4) as u64),
             lut_buf: storage_buffer(&device, "lut", ((LUT_BINS + 1) * 4) as u64),
-            fx_vb: vertex_buffer(&device, "fx sprites", 4096),
-            bg_vb: vertex_buffer(&device, "background sprites", 64),
-            fx_cap: 4096,
-            fx_count: 0,
-            bg_count: 0,
             seg_cap,
             ring_cap,
             atlas_tex,
@@ -447,11 +461,7 @@ impl Renderer {
             post_bgl,
             sampler,
             dummy,
-            targets: None,
-            trail_idx: 0,
-            bg_dirty: true,
             layout_version: 0,
-            frame: 0,
             scratch: Vec::new(),
             atlas,
         })
@@ -462,12 +472,18 @@ impl Renderer {
         self.max_atlas_rows as usize
     }
 
-    pub fn internal_size(&self) -> (u32, u32) {
-        self.targets.as_ref().map(|t| (t.w, t.h)).unwrap_or((0, 0))
-    }
-
-    pub fn invalidate_background(&mut self) {
-        self.bg_dirty = true;
+    pub fn new_view(&self) -> View {
+        View {
+            targets: None,
+            trail_idx: 0,
+            bg_dirty: true,
+            frame: 0,
+            fx_vb: vertex_buffer(&self.device, "fx sprites", 4096),
+            fx_cap: 4096,
+            fx_count: 0,
+            bg_vb: vertex_buffer(&self.device, "background sprites", 64),
+            bg_count: 0,
+        }
     }
 
     fn post_group(&self, label: &str, a: &wgpu::TextureView, b: &wgpu::TextureView, c: &wgpu::TextureView) -> wgpu::BindGroup {
@@ -484,7 +500,7 @@ impl Renderer {
     }
 
     /// (Re)creates the internal render targets for an output of `out_w`×`out_h`.
-    pub fn resize(&mut self, out_w: u32, out_h: u32, render_scale: f32, max_megapixels: f32) {
+    pub fn resize(&self, view: &mut View, out_w: u32, out_h: u32, render_scale: f32, max_megapixels: f32) {
         let mut s = render_scale.clamp(0.2, 1.0);
         let max_px = (max_megapixels.max(0.1) * 1.0e6) as f64;
         let px = out_w as f64 * out_h as f64 * (s * s) as f64;
@@ -492,7 +508,7 @@ impl Renderer {
             s *= (max_px / px).sqrt() as f32;
         }
         let (w, h) = (((out_w as f32 * s) as u32).max(16), ((out_h as f32 * s) as u32).max(16));
-        if self.targets.as_ref().is_some_and(|t| t.w == w && t.h == h) {
+        if view.targets.as_ref().is_some_and(|t| t.w == w && t.h == h) {
             return;
         }
         let d = &self.device;
@@ -513,8 +529,8 @@ impl Renderer {
             self.post_group("final a", &trail[0].view, &bloom[0].view, dm),
             self.post_group("final b", &trail[1].view, &bloom[0].view, dm),
         ];
-        self.targets = Some(Targets { w, h, bg, scene, trail, bloom, combine_bg, down0_bg, down_bg, up_bg, final_bg });
-        self.bg_dirty = true;
+        view.targets = Some(Targets { w, h, bg, scene, trail, bloom, combine_bg, down0_bg, down_bg, up_bg, final_bg });
+        view.bg_dirty = true;
     }
 
     fn upload_world(&mut self, w: &mut World) {
@@ -615,14 +631,14 @@ impl Renderer {
         }
     }
 
-    fn globals(&self, w: &World, cam: &Camera, frame_dt: f32) -> Globals {
+    fn globals(&self, view: &View, w: &World, cam: &Camera, frame_dt: f32) -> Globals {
         let c = &w.cfg;
         let tw = &c.tower;
         let rgb = |name: &str, a: f32| {
             let v = c.color(name);
             [v[0], v[1], v[2], a]
         };
-        let (iw, ih) = self.internal_size();
+        let (iw, ih) = view.internal_size();
         let smear = c.palette.smear.0;
         let smear_decay = if smear > 1e-3 { (-frame_dt.max(0.0) / smear).exp() } else { 0.0 };
         Globals {
@@ -646,42 +662,44 @@ impl Renderer {
             age: [c.age.fresh_days.max(1e-3).log10(), c.age.old_days.max(1e-3).log10(), c.age.stale_days.max(1e-3).log10(), 0.0],
             screen: [iw as f32, ih as f32, 1.0 / iw.max(1) as f32, 1.0 / ih.max(1) as f32],
             post: [c.palette.exposure, c.palette.bloom, c.palette.grain, c.palette.vignette],
-            post2: [smear_decay, (self.frame % 997) as f32, if self.out_format.is_srgb() { 0.0 } else { 1.0 }, 1.0 / BLOOM_LEVELS as f32],
+            post2: [smear_decay, (view.frame % 997) as f32, if self.out_format.is_srgb() { 0.0 } else { 1.0 }, 1.0 / BLOOM_LEVELS as f32],
         }
     }
 
-    /// Renders one frame of `w` seen through `cam` into `view` (the output size
-    /// given to [`Renderer::resize`]).
-    pub fn render(&mut self, w: &mut World, cam: &Camera, view: &wgpu::TextureView, frame_dt: f32) {
-        if self.targets.is_none() {
+    /// Renders one frame of `w` seen through `cam` into `out` (the output size
+    /// given to [`Renderer::resize`] for this view).
+    pub fn render(&mut self, view: &mut View, w: &mut World, cam: &Camera, out: &wgpu::TextureView, frame_dt: f32) {
+        if view.targets.is_none() {
             return;
         }
+        // Shared world buffers: uploads are consumed by whichever view draws first.
         self.upload_world(w);
-        let globals = self.globals(w, cam, frame_dt);
+        // One globals buffer for all views: writes are ordered with submissions.
+        let globals = self.globals(view, w, cam, frame_dt);
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
-        let (iw, ih) = self.internal_size();
+        let (iw, ih) = view.internal_size();
 
         let mut scratch = std::mem::take(&mut self.scratch);
-        if self.bg_dirty {
+        if view.bg_dirty {
             scratch.clear();
             fx::build_background(&w.cfg, &self.atlas, w.y_top(), cam, &mut scratch);
-            self.bg_vb = vertex_buffer(&self.device, "background sprites", scratch.len());
-            self.queue.write_buffer(&self.bg_vb, 0, bytemuck::cast_slice(&scratch));
-            self.bg_count = scratch.len() as u32;
+            view.bg_vb = vertex_buffer(&self.device, "background sprites", scratch.len());
+            self.queue.write_buffer(&view.bg_vb, 0, bytemuck::cast_slice(&scratch));
+            view.bg_count = scratch.len() as u32;
         }
         scratch.clear();
         w.fx.build(w, cam, &self.atlas, iw as f32, ih as f32, &mut scratch);
-        if scratch.len() > self.fx_cap {
-            self.fx_cap = scratch.len() * 3 / 2;
-            self.fx_vb = vertex_buffer(&self.device, "fx sprites", self.fx_cap);
+        if scratch.len() > view.fx_cap {
+            view.fx_cap = scratch.len() * 3 / 2;
+            view.fx_vb = vertex_buffer(&self.device, "fx sprites", view.fx_cap);
         }
         if !scratch.is_empty() {
-            self.queue.write_buffer(&self.fx_vb, 0, bytemuck::cast_slice(&scratch));
+            self.queue.write_buffer(&view.fx_vb, 0, bytemuck::cast_slice(&scratch));
         }
-        self.fx_count = scratch.len() as u32;
+        view.fx_count = scratch.len() as u32;
         self.scratch = scratch;
 
-        let tg = self.targets.as_ref().unwrap();
+        let tg = view.targets.as_ref().unwrap();
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
 
         let pass = |enc: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, clear: bool, label: &str| -> wgpu::RenderPass<'static> {
@@ -701,19 +719,19 @@ impl Renderer {
             .forget_lifetime()
         };
 
-        if self.bg_dirty {
+        if view.bg_dirty {
             let mut p = pass(&mut enc, &tg.bg.view, true, "background");
             p.set_bind_group(0, &self.globals_bg, &[]);
             p.set_pipeline(&self.bg_pipeline);
             p.draw(0..3, 0..1);
-            if self.bg_count > 0 {
+            if view.bg_count > 0 {
                 p.set_pipeline(&self.sprite_pipeline);
                 p.set_bind_group(1, &self.sprite_bg, &[]);
-                p.set_vertex_buffer(0, self.bg_vb.slice(..));
-                p.draw(0..self.bg_count, 0..1);
+                p.set_vertex_buffer(0, view.bg_vb.slice(..));
+                p.draw(0..view.bg_count, 0..1);
             }
             drop(p);
-            self.bg_dirty = false;
+            view.bg_dirty = false;
         }
 
         // Profiling aid: GITS_SKIP=tower,sprites,bloom skips passes.
@@ -728,15 +746,15 @@ impl Renderer {
                 p.set_index_buffer(self.tower_ib.slice(..), wgpu::IndexFormat::Uint32);
                 p.draw_indexed(0..self.tower_index_count, 0, 0..w.cfg.tower.depth_layers.max(1));
             }
-            if self.fx_count > 0 && !skip.contains("sprites") {
+            if view.fx_count > 0 && !skip.contains("sprites") {
                 p.set_pipeline(&self.sprite_pipeline);
                 p.set_bind_group(1, &self.sprite_bg, &[]);
-                p.set_vertex_buffer(0, self.fx_vb.slice(..));
-                p.draw(0..self.fx_count, 0..1);
+                p.set_vertex_buffer(0, view.fx_vb.slice(..));
+                p.draw(0..view.fx_count, 0..1);
             }
         }
 
-        let cur = self.trail_idx;
+        let cur = view.trail_idx;
         let fullscreen = |enc: &mut wgpu::CommandEncoder,
                           pipeline: &wgpu::RenderPipeline,
                           target: &wgpu::TextureView,
@@ -759,10 +777,10 @@ impl Renderer {
                 fullscreen(&mut enc, &self.up_pipeline, &tg.bloom[i].view, &tg.up_bg[i], false, "bloom up");
             }
         }
-        fullscreen(&mut enc, &self.final_pipeline, view, &tg.final_bg[cur], true, "final");
+        fullscreen(&mut enc, &self.final_pipeline, out, &tg.final_bg[cur], true, "final");
 
         self.queue.submit([enc.finish()]);
-        self.trail_idx = 1 - cur;
-        self.frame += 1;
+        view.trail_idx = 1 - cur;
+        view.frame += 1;
     }
 }

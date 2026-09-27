@@ -1,0 +1,9 @@
+{
+  "uuid": "gits-file-visualizer@iliabaranov.github.io",
+  "name": "gits-file-visualizer",
+  "description": "Live filesystem tower wallpaper (Ghost in the Shell 2: Innocence style). Launches gits-render and shows it as the desktop background on every monitor.",
+  "url": "https://github.com/iliabaranov/gits-file-visualizer",
+  "shell-version": ["42", "43", "44"],
+  "session-modes": ["user", "unlock-dialog"],
+  "version": 1
+}

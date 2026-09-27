@@ -56,6 +56,13 @@ enum Cmd {
         #[arg(long)]
         speed: Option<f64>,
     },
+    /// Wallpaper mode, normally started by the GNOME extension: one borderless
+    /// window per monitor, control lines on stdin, exits when stdin closes.
+    Wallpaper {
+        /// A monitor as INDEX:WIDTHxHEIGHT[:NAME]; repeat for each monitor.
+        #[arg(long = "output", required = true)]
+        outputs: Vec<app::OutputSpec>,
+    },
     /// Render PNG snapshots without a window.
     Snapshot {
         #[arg(long, default_value = "out/snapshot.png")]
@@ -119,13 +126,19 @@ fn main() -> Result<()> {
     let socket = cli.socket.clone().unwrap_or_else(gits_core::protocol::default_socket_path);
     let cmd = cli.cmd.unwrap_or(Cmd::Window { width: 1600, height: 900, warmup: 0.0, speed: None });
     let requested = cli.source.clone().unwrap_or_else(|| match cmd {
-        Cmd::Window { .. } => cfg.data.source.clone(),
+        Cmd::Window { .. } | Cmd::Wallpaper { .. } => cfg.data.source.clone(),
         _ => "synthetic".into(),
     });
     let (collector, fell_back) = resolve_source(&requested, &socket)?;
     match cmd {
         Cmd::Window { width, height, warmup, speed } => {
-            app::run(cfg, app::Options { config_path, width, height, warmup, speed, collector, fell_back })
+            let outputs = vec![app::OutputSpec { index: -1, name: "window".into(), width, height }];
+            let fell_back = fell_back.then(|| socket.clone());
+            app::run(cfg, app::Options { config_path, outputs, wallpaper: false, warmup, speed, collector, fell_back })
+        }
+        Cmd::Wallpaper { outputs } => {
+            let fell_back = fell_back.then(|| socket.clone());
+            app::run(cfg, app::Options { config_path, outputs, wallpaper: true, warmup: 0.0, speed: None, collector, fell_back })
         }
         Cmd::Snapshot { out, width, height, at, frames, every } => {
             snapshot::run(cfg, snapshot::Options { out, width, height, at, frames, every }, collector)

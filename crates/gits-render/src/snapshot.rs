@@ -41,7 +41,8 @@ pub fn run(cfg: Config, opts: Options, collector: Option<std::path::PathBuf>) ->
     let g = pollster::block_on(gpu::init(&instance, None, cfg.performance.prefer_igpu))?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format)?;
-    renderer.resize(opts.width, opts.height, cfg.performance.render_scale, cfg.performance.max_internal_megapixels);
+    let mut view = renderer.new_view();
+    renderer.resize(&mut view, opts.width, opts.height, cfg.performance.render_scale, cfg.performance.max_internal_megapixels);
     let mut world = World::new(cfg, renderer.max_rings(), collector);
     let live = !world.is_synthetic();
     if live {
@@ -58,7 +59,7 @@ pub fn run(cfg: Config, opts: Options, collector: Option<std::path::PathBuf>) ->
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    let view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
     if let Some(dir) = opts.out.parent() {
         std::fs::create_dir_all(dir).ok();
     }
@@ -79,7 +80,7 @@ pub fn run(cfg: Config, opts: Options, collector: Option<std::path::PathBuf>) ->
                 std::thread::sleep(std::time::Duration::from_secs_f64(DT));
             }
             let cam = Camera::wide(aspect, world.y_top(), world.cfg.camera.drift, world.t as f32);
-            renderer.render(&mut world, &cam, &view, DT as f32);
+            renderer.render(&mut view, &mut world, &cam, &out_view, DT as f32);
             let _ = g.device.poll(wgpu::PollType::Poll);
         }
         let path = if opts.frames <= 1 { opts.out.clone() } else { numbered(&opts.out, i) };
@@ -105,7 +106,8 @@ pub fn bench(cfg: Config, width: u32, height: u32, at: f64, frames: u32, collect
     let scale = cfg.performance.render_scale;
     let max_mp = cfg.performance.max_internal_megapixels;
     let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format)?;
-    renderer.resize(width, height, scale, max_mp);
+    let mut view = renderer.new_view();
+    renderer.resize(&mut view, width, height, scale, max_mp);
     let mut world = World::new(cfg, renderer.max_rings(), collector);
     if !world.is_synthetic() {
         wait_for_data(&mut world)?;
@@ -120,7 +122,7 @@ pub fn bench(cfg: Config, width: u32, height: u32, at: f64, frames: u32, collect
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
-    let view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
     while world.is_synthetic() && world.t < at {
         world.step(DT);
     }
@@ -130,7 +132,7 @@ pub fn bench(cfg: Config, width: u32, height: u32, at: f64, frames: u32, collect
         let t0 = std::time::Instant::now();
         world.step(DT);
         let cam = Camera::wide(aspect, world.y_top(), world.cfg.camera.drift, world.t as f32);
-        renderer.render(&mut world, &cam, &view, DT as f32);
+        renderer.render(&mut view, &mut world, &cam, &out_view, DT as f32);
         let t1 = std::time::Instant::now();
         g.device.poll(wgpu::PollType::wait_indefinitely()).context("waiting for GPU")?;
         let t2 = std::time::Instant::now();
@@ -145,7 +147,7 @@ pub fn bench(cfg: Config, width: u32, height: u32, at: f64, frames: u32, collect
     };
     let (cpu_avg, cpu_p95) = stats(&mut cpu);
     let (tot_avg, tot_p95) = stats(&mut total);
-    let (iw, ih) = renderer.internal_size();
+    let (iw, ih) = view.internal_size();
     println!("output {width}x{height}, internal {iw}x{ih} (scale {scale}), {} rings, {} segments", world.rings.len(), world.segs.len());
     println!("cpu   avg {cpu_avg:6.2} ms   p95 {cpu_p95:6.2} ms");
     println!("frame avg {tot_avg:6.2} ms   p95 {tot_p95:6.2} ms   (≈ GPU-bound max {:.0} fps)", 1000.0 / tot_avg);

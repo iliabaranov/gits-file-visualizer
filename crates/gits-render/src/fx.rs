@@ -17,6 +17,8 @@ const MAX_CARDS: usize = 6;
 const CARD_HOLD: f64 = 7.0;
 const CARD_FADE: f64 = 1.6;
 const CARD_MIN_INTERVAL: f64 = 0.8;
+/// A file that already had a card gets a new one only after this long.
+const CARD_REPEAT: f64 = 120.0;
 const PROBE_HOLD: f64 = 25.0;
 const MAX_FLAKES: usize = 1500;
 const FALL_LIFE: f32 = 2.4;
@@ -62,6 +64,9 @@ struct Flake {
 
 pub struct Fx {
     pub cards: Vec<Card>,
+    /// When each file last got a card: files touched constantly (logs, soak
+    /// tests) do not keep a card pinned forever.
+    carded: std::collections::HashMap<FileId, f64>,
     pub probe: Probe,
     falls: Vec<Fall>,
     flakes: Vec<Flake>,
@@ -71,7 +76,15 @@ pub struct Fx {
 
 impl Default for Fx {
     fn default() -> Self {
-        Self { cards: vec![], probe: Probe::default(), falls: vec![], flakes: vec![], last_card_t: -1e9, rng: Rng::new(2501) }
+        Self {
+            cards: vec![],
+            carded: Default::default(),
+            probe: Probe::default(),
+            falls: vec![],
+            flakes: vec![],
+            last_card_t: -1e9,
+            rng: Rng::new(2501),
+        }
     }
 }
 
@@ -82,10 +95,13 @@ impl Fx {
                 self.probe.target = Some(file);
                 self.probe.t_last = t;
                 if let Some(c) = self.cards.iter_mut().find(|c| c.file == file) {
-                    c.t_last = t;
                     c.kind = kind;
-                } else if t - self.last_card_t >= CARD_MIN_INTERVAL {
+                } else if t - self.last_card_t >= CARD_MIN_INTERVAL && self.carded.get(&file).is_none_or(|&t0| t - t0 >= CARD_REPEAT) {
                     self.last_card_t = t;
+                    self.carded.insert(file, t);
+                    if self.carded.len() > 4096 {
+                        self.carded.retain(|_, t0| t - *t0 < CARD_REPEAT);
+                    }
                     self.cards.push(Card { file, kind, t0: t, t_last: t });
                     if self.cards.len() > MAX_CARDS {
                         let oldest = (0..self.cards.len()).min_by(|&a, &b| self.cards[a].t_last.total_cmp(&self.cards[b].t_last)).unwrap();

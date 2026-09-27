@@ -1,6 +1,6 @@
 # gits-file-visualizer — Design (v3)
 
-Status: M0 (look-dev) and M1 (real data) done, next is M2 (GNOME embedding). Decided items are marked ✅.
+Status: M0 (look-dev), M1 (real data) and M2 (GNOME 42 embedding) done; next is M3 (efficiency). Decided items are marked ✅.
 
 ## 1. Goal
 
@@ -401,6 +401,53 @@ Sections: `palette`, `events.{read,write,create,delete}`, `age`, `calm`,
 - Not yet: multiple roots (only the first is used), moved directories are
   handled as delete + create, and there is no process attribution (needs the
   later fanotify helper).
+
+### M2 — done for GNOME 42–44 (2026-09-27)
+
+- `extension/gnome-42` (legacy `imports`, GJS). The approach follows prior
+  art (Hanabi, Ubuntu's DING), but the code is our own:
+  - spawns `gits-render wallpaper --output INDEX:WxH:CONNECTOR …` through
+    `Meta.WaylandClient`, so `owns_window()` identifies our windows reliably and
+    `hide_from_window_list()` keeps them out of the dock and alt-tab;
+  - keeps the renderer's windows sticky, fullscreen on their monitor and
+    minimized (map and minimize animations suppressed with
+    `Main.wm.skipNextEffect`); minimized Wayland windows still receive frame
+    callbacks, as with Hanabi;
+  - wraps `BackgroundManager._createBackgroundActor`: every background actor
+    for a monitor (desktop, overview workspaces, workspace-switch animation)
+    gets a `Clutter.Clone` of that monitor's renderer window, fading in over the
+    normal wallpaper. Lock-screen backgrounds are skipped. On disable the hook
+    is restored and backgrounds are rebuilt;
+  - visibility: a monitor counts as covered when a 16×10 sample grid of its work
+    area is inside normal, opaque, unminimized windows on the active workspace.
+    It is recomputed on restack/move/resize/minimize/workspace/overview/session
+    changes (debounced 150 ms) and polled every 3 s. It sends `visible N 0|1`,
+    `locked 0|1` and `sharing 0|1` (from the remote-access controller) to the
+    renderer's stdin;
+  - respawns a crashed renderer (5 tries per 5 minutes) and restarts it on
+    monitor changes. When the extension goes away, the renderer's stdin closes
+    and it exits.
+- Renderer: `Renderer` (shared) + `View` (per output). Wallpaper mode has one
+  borderless window per monitor with independent frame pacing, pauses covered
+  outputs, and keeps applying data when nothing draws. It probes every 10 s for
+  a collector that starts after login and switches over. The window title
+  `gits-file-visualizer|N` maps windows to monitors.
+- `tools/sandbox-shell.sh`: a headless `gnome-shell --wayland --no-x11` with
+  virtual monitors, an isolated HOME/XDG_RUNTIME_DIR/D-Bus/dconf, and a
+  test-only helper extension enabling unsafe mode for Eval and Screenshot. Used
+  to verify desktop, overview, workspace switch, covering, lock/unlock,
+  renderer crash respawn, and disable/enable cleanup, without touching the
+  real session.
+- Measured in the sandbox with three monitors (3840×2160, 1920×1200,
+  1440×2560) on the real collector stream: all visible, renderer 6.6% + shell
+  compositing 4.9% of one core; all covered, renderer 1.6% + shell 0.2%.
+  Renderer RSS 270 MB (three views).
+- Live data polish found while testing: a file touched constantly (logs, soak
+  tests) gets a new card at most every 2 minutes, and folder activity
+  saturates so such folders do not dominate the layout.
+- Known gaps: per-monitor compositions are still all "wide" (M4). No fanotify.
+  Renderer logs go to gnome-shell's journal. Clicking the desktop goes to DING
+  as before (the clone is not reactive), which is intended.
 
 ### Efficiency backlog for M3
 
