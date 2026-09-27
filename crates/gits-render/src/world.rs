@@ -69,6 +69,9 @@ pub struct Notice {
 
 pub struct World {
     pub cfg: Config,
+    /// Nothing is being drawn: skip work that only matters on screen (layout
+    /// rebuilds are deferred until the next visible frame).
+    pub hidden: bool,
     pub notice: Option<Notice>,
     pub model: Model,
     pub source: Source,
@@ -144,6 +147,7 @@ impl World {
         let initial_model = model.clone();
         let initial_files = initial_model.files.len();
         let mut w = Self {
+            hidden: false,
             initial_model,
             initial_files,
             loop_start: 0.0,
@@ -532,7 +536,7 @@ impl World {
             }
         }
         let min_interval = if self.is_synthetic() { RELAYOUT_MIN_INTERVAL } else { RELAYOUT_LIVE_INTERVAL };
-        if self.needs_relayout && t - self.layout_t >= min_interval {
+        if self.needs_relayout && !self.hidden && t - self.layout_t >= min_interval {
             self.relayout();
         }
 

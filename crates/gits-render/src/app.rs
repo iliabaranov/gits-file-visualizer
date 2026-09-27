@@ -19,6 +19,10 @@ use winit::window::{Window, WindowId};
 
 /// Fixed simulation step, identical to headless snapshots so runs are reproducible.
 const SIM_DT: f64 = 1.0 / 24.0;
+/// While the window cannot draw (hidden, other workspace, later: covered
+/// wallpaper), the simulation still advances this often so collector updates
+/// are applied at their real time instead of piling up.
+const HIDDEN_STEP: Duration = Duration::from_secs(1);
 
 pub const APP_ID: &str = "io.github.iliabaranov.GitsFileVisualizer";
 
@@ -41,7 +45,9 @@ struct State {
     gpu: Gpu,
     renderer: Renderer,
     world: World,
-    last_frame: Instant,
+    /// Last simulation advance and last presented frame.
+    last_step: Instant,
+    last_draw: Instant,
     next_frame: Instant,
     frames: u32,
     stats_since: Instant,
@@ -120,7 +126,8 @@ impl App {
             gpu: g,
             renderer,
             world,
-            last_frame: now,
+            last_step: now,
+            last_draw: now,
             next_frame: now,
             frames: 0,
             stats_since: now,
@@ -168,13 +175,14 @@ impl App {
         }
     }
 
-    fn frame(&mut self) {
-        let Some(s) = &mut self.state else { return };
+    /// Advances the simulation to the current time. Returns the real time elapsed.
+    fn advance(&mut self) -> f64 {
+        let Some(s) = &mut self.state else { return 0.0 };
         // Live data runs in real time; the synthetic session can be sped up.
         let speed = if s.world.is_synthetic() { self.opts.speed.unwrap_or(self.cfg.synthetic.speed as f64) } else { 1.0 };
         let now = Instant::now();
-        let real_dt = now.duration_since(s.last_frame).as_secs_f64();
-        s.last_frame = now;
+        let real_dt = now.duration_since(s.last_step).as_secs_f64();
+        s.last_step = now;
         s.sim_accum += real_dt * speed;
         let mut steps = 0;
         while s.sim_accum >= SIM_DT && steps < 48 {
@@ -182,10 +190,21 @@ impl App {
             s.sim_accum -= SIM_DT;
             steps += 1;
         }
-        if steps == 48 {
-            // Fell far behind (e.g. after suspend): skip ahead instead of catching up.
-            s.sim_accum = 0.0;
+        if steps == 48 && s.sim_accum >= SIM_DT {
+            // Fell far behind (e.g. after suspend): jump ahead in one step.
+            let rest = s.sim_accum - s.sim_accum % SIM_DT;
+            s.world.step(rest);
+            s.sim_accum -= rest;
         }
+        real_dt
+    }
+
+    fn frame(&mut self) {
+        if let Some(s) = &mut self.state {
+            s.world.hidden = false;
+        }
+        let real_dt = self.advance();
+        let Some(s) = &mut self.state else { return };
 
         let tex = match s.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -201,6 +220,7 @@ impl App {
         s.renderer.render(&mut s.world, &cam, &view, real_dt as f32);
         s.window.pre_present_notify();
         s.gpu.queue.present(tex);
+        s.last_draw = Instant::now();
         s.frames += 1;
         let elapsed = s.stats_since.elapsed().as_secs_f64();
         if elapsed >= 5.0 {
@@ -262,12 +282,20 @@ impl ApplicationHandler for App {
         self.check_config();
         let perf = self.cfg.performance.clone();
         let Some(s) = &mut self.state else { return };
+        let now = Instant::now();
+        let hidden = now.duration_since(s.last_draw) > HIDDEN_STEP;
+        s.world.hidden = hidden;
+        if hidden && now.duration_since(s.last_step) >= HIDDEN_STEP {
+            self.advance();
+        }
+        let Some(s) = &mut self.state else { return };
         let busy = s.world.activity > 0.5 || s.world.animating || s.world.fx.alive();
         let fps = if busy { perf.fps_active } else { perf.fps_calm }.max(1);
-        let now = Instant::now();
         if now >= s.next_frame {
+            // Ignored by the compositor while the window cannot be seen.
             s.window.request_redraw();
-            s.next_frame = now + Duration::from_secs_f64(1.0 / fps as f64);
+            let interval = if hidden { HIDDEN_STEP } else { Duration::from_secs_f64(1.0 / fps as f64) };
+            s.next_frame = now + interval;
         }
         el.set_control_flow(ControlFlow::WaitUntil(s.next_frame));
     }

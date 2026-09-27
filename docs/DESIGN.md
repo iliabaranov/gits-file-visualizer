@@ -391,6 +391,13 @@ Sections: `palette`, `events.{read,write,create,delete}`, `age`, `calm`,
   24.7 ms at 4K (vs 8 / 16 ms synthetic, since there are twice the rings).
   RSS: renderer 220 MB (170 MB even on synthetic data), collector ~100 MB.
   Both are over the 150 MB total budget; see the backlog.
+- Hidden windows: GNOME stops frame callbacks while the window cannot be seen
+  (locked screen, other workspace, and later the covered wallpaper). The
+  renderer now keeps applying collector updates once a second without drawing,
+  so nothing piles up and changes have faded by the time the window is visible
+  again. Layout rebuilds wait for the next visible frame. Measured with the
+  screen locked: renderer 0.05% of a core (2% before deferring rebuilds),
+  collector ~0.7% at ~40 ops/s.
 - Not yet: multiple roots (only the first is used), moved directories are
   handled as delete + create, and there is no process attribution (needs the
   later fanotify helper).
@@ -410,7 +417,9 @@ Sections: `palette`, `events.{read,write,create,delete}`, `age`, `calm`,
   cheaper. Keep one point sample for event highlights.
 - Portrait: the tower covers more pixels; consider a composition that pulls
   back further.
-- Memory: intern file names into one arena (both processes), drop the
+- Memory: wgpu enumerates every Vulkan driver, so lavapipe (software
+  Vulkan) is loaded and spawns 16 idle llvmpipe threads; skip it. Intern file
+  names into one arena (both processes), drop the
   collector's per-directory `PathBuf`s (rebuild paths from parents), and find
   what makes up the renderer's 170 MB baseline (Vulkan driver, wgpu, staging).
 - Relayout cost on live trees (25–70 ms on the render thread): move the layout
