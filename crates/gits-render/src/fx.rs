@@ -312,6 +312,17 @@ impl Fx {
             }
         }
 
+        if let Some(n) = w.notice.as_ref().filter(|n| t < n.until) {
+            let col = if n.error { crimson } else { cream };
+            let size = 14.0 * ui;
+            let mut text: String = n.text.chars().take(170).collect();
+            while text.len() > 8 && atlas.mono.measure(&text, size) > width - 48.0 * ui {
+                text.pop();
+            }
+            let fade = if n.until.is_finite() { (((n.until - t) / 0.8) as f32).clamp(0.0, 1.0) } else { 1.0 };
+            text_px(out, &atlas.mono, &text, 24.0 * ui, height - 24.0 * ui, size, [col[0], col[1], col[2], 1.6 * fade], width, height);
+        }
+
         // Gold flakes.
         for fl in &self.flakes {
             let age = (t - fl.t0) as f32;
@@ -326,6 +337,12 @@ impl Fx {
 /// Static chamber sprites, rendered once into the cached background.
 pub fn build_background(cfg: &Config, atlas: &GlyphAtlas, y_top: f32, cam: &Camera, out: &mut Vec<SpriteVertex>) {
     let floor = y_top - cfg.tower.height - 0.1;
+    // The room keeps its proportions around wider towers.
+    let r = cfg.tower.radius;
+    let lattice_r = (r + 1.4).max(4.5);
+    let outer_r = (r + 2.4).max(6.0);
+    let lights_r = (r + 0.6).max(2.3);
+    let floor_ring_r = (r + 1.3).max(3.1);
     let teal = cfg.color("teal");
     let gold = cfg.color(&cfg.age.fresh);
     let bg = &cfg.background;
@@ -355,7 +372,7 @@ pub fn build_background(cfg: &Config, atlas: &GlyphAtlas, y_top: f32, cam: &Came
         let lb = bg.lattice_brightness;
         let tilt = Mat3::from_rotation_x(0.16);
         let center_y = floor + 1.6;
-        let ring_r = 4.5;
+        let ring_r = lattice_r;
         let tube = 0.13;
         let n = 220;
         let point = |i: usize, strand: f32| -> Vec3 {
@@ -380,7 +397,7 @@ pub fn build_background(cfg: &Config, atlas: &GlyphAtlas, y_top: f32, cam: &Came
         // Sparse outer ring of points.
         for i in 0..90 {
             let phi = TAU * i as f32 / 90.0 + 0.02;
-            let p = tilt * Vec3::new(6.0 * phi.cos(), 0.0, 6.0 * phi.sin()) + Vec3::Y * (floor + 0.7);
+            let p = tilt * Vec3::new(outer_r * phi.cos(), 0.0, outer_r * phi.sin()) + Vec3::Y * (floor + 0.7);
             billboard(out, cam, p, 0.025, K::DOT, [teal[0], teal[1], teal[2], lb * 0.8 * hash01(i as u64 + 99)], 0.0);
         }
     }
@@ -389,7 +406,7 @@ pub fn build_background(cfg: &Config, atlas: &GlyphAtlas, y_top: f32, cam: &Came
         let white_teal = [teal[0] * 0.5 + 0.5, teal[1] * 0.5 + 0.5, teal[2] * 0.5 + 0.5];
         for i in 0..7 {
             let phi = TAU * i as f32 / 7.0 + 0.3;
-            let p = Vec3::new(2.3 * phi.cos(), floor, 2.3 * phi.sin());
+            let p = Vec3::new(lights_r * phi.cos(), floor, lights_r * phi.sin());
             billboard(out, cam, p, 0.24, K::DOT, [teal[0], teal[1], teal[2], 1.6], 0.0);
             billboard(out, cam, p, 0.07, K::DOT, [white_teal[0], white_teal[1], white_teal[2], 5.0], 0.0);
         }
@@ -399,8 +416,8 @@ pub fn build_background(cfg: &Config, atlas: &GlyphAtlas, y_top: f32, cam: &Came
             let (a0, a1) = (TAU * k as f32 / n as f32, TAU * (k + 1) as f32 / n as f32);
             line_world(
                 out,
-                Vec3::new(3.1 * a0.cos(), floor, 3.1 * a0.sin()),
-                Vec3::new(3.1 * a1.cos(), floor, 3.1 * a1.sin()),
+                Vec3::new(floor_ring_r * a0.cos(), floor, floor_ring_r * a0.sin()),
+                Vec3::new(floor_ring_r * a1.cos(), floor, floor_ring_r * a1.sin()),
                 0.01,
                 [teal[0], teal[1], teal[2], 0.35],
                 cam.eye,

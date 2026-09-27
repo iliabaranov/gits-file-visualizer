@@ -17,7 +17,12 @@ pub struct SegmentGpu {
     pub t_read: f32,
     pub t_write: f32,
     pub t_delete: f32,
-    pub _pad: f32,
+    /// Start of the shrink-back animation of a file removed at the end of a loop.
+    pub t_retract: f32,
+    /// Previous age, blended toward `age_days` from `t_age` (smooth colour changes).
+    pub age_from: f32,
+    pub t_age: f32,
+    pub _pad: [f32; 2],
 }
 
 #[repr(C)]
@@ -58,7 +63,7 @@ pub struct Globals {
     pub col_bg: [f32; 4],
     /// read fade, write fade, grow, ghost seconds.
     pub times: [f32; 4],
-    /// attack, unwound ribbon fill, _, _.
+    /// attack, unwound ribbon fill, loop fade (0..1 multiplier on event highlights), _.
     pub times2: [f32; 4],
     /// log10 fresh/old/stale days.
     pub age: [f32; 4],

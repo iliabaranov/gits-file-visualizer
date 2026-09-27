@@ -5,8 +5,8 @@ use crate::fx::Fx;
 use crate::gpu_types::{RingGpu, SegmentGpu};
 use gits_core::config::Config;
 use gits_core::layout::{self, Layout, LayoutParams, NONE, SEG_DELETED, SegSource};
-use gits_core::model::{EventKind, NEVER};
-use gits_core::rng::hash01;
+use gits_core::model::{EventKind, Model, NEVER};
+use gits_core::rng::{Rng, hash01};
 use gits_core::synth::{self, Session, SynthHome};
 use std::collections::HashMap;
 
@@ -18,6 +18,29 @@ pub const TILT: f32 = 0.3;
 const RELAYOUT_MIN_INTERVAL: f64 = 0.5;
 const OPEN_TAU: f32 = 2.2;
 const PRESENCE_TAU: f32 = 1.2;
+/// Rings leaving the tower ease out slowly so the drum barely drifts.
+const PRESENCE_OUT_TAU: f32 = 5.0;
+
+// Loop wind-down schedule, in simulated seconds after the wind-down starts.
+// Events stop, highlights fade out and busy directories wind back; then files
+// created during the loop shrink away and deleted ones grow back; then rings
+// that only held created files ease out; finally the model and session reset.
+const WIND_FADE: f64 = 60.0;
+const RESTORE_AT: f64 = 70.0;
+const RESTORE_STAGGER: f64 = 15.0;
+const RETIRE_AT: f64 = 90.0;
+const RESET_AT: f64 = 118.0;
+/// Shortest loop accepted (the wind-down alone takes RESET_AT seconds).
+const MIN_LOOP: f64 = 240.0;
+/// Directory activity decays this fast while winding down.
+const WIND_ACTIVITY_TAU: f32 = 12.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LoopStage {
+    Running,
+    /// Wind-down started at this time.
+    WindDown(f64),
+}
 
 #[derive(Clone, Copy, Debug)]
 struct RingPersist {
@@ -26,8 +49,18 @@ struct RingPersist {
     presence: f32,
 }
 
+/// Short on-screen status line (config reloads and errors).
+#[derive(Clone, Debug)]
+pub struct Notice {
+    pub text: String,
+    pub error: bool,
+    /// Simulation time until which it is shown.
+    pub until: f64,
+}
+
 pub struct World {
     pub cfg: Config,
+    pub notice: Option<Notice>,
     pub home: SynthHome,
     pub session: Session,
     pub t: f64,
@@ -53,6 +86,22 @@ pub struct World {
     /// Number of rings in each directory's band (caps how tall it unwinds).
     dir_rings: Vec<u16>,
 
+    /// Presence each ring eases toward (0 for rings about to be removed).
+    ring_presence_target: Vec<f32>,
+
+    /// Starting state of the synthetic home, restored at the end of every loop.
+    initial_model: Model,
+    initial_files: usize,
+    loop_start: f64,
+    loop_stage: LoopStage,
+    loop_count: u64,
+    restored: bool,
+    retired: bool,
+    /// 0..1 multiplier on event highlights (fades them out during wind-down).
+    pub loop_fade: f32,
+    /// Subtracted from the clock when computing file ages, so ages repeat per loop.
+    age_offset: f64,
+
     pub dirty_segs: Vec<u32>,
     pub dirty_rings: Vec<u32>,
     pub lut_dirty: bool,
@@ -71,8 +120,21 @@ impl World {
         let session = Session::new(cfg.synthetic.seed);
         let max_rings = cfg.collector.max_rings.min(max_rings_limit).max(64);
         log::info!("synthetic home: {} directories, {} files", home.model.dirs.len(), home.model.live_file_count());
+        let initial_model = home.model.clone();
+        let initial_files = initial_model.files.len();
         let mut w = Self {
+            initial_model,
+            initial_files,
+            loop_start: 0.0,
+            loop_stage: LoopStage::Running,
+            loop_count: 0,
+            restored: false,
+            retired: false,
+            loop_fade: 1.0,
+            age_offset: 0.0,
+            ring_presence_target: vec![],
             cfg,
+            notice: None,
             home,
             session,
             t: 0.0,
@@ -120,8 +182,8 @@ impl World {
     /// Applies a new configuration. Returns true if the layout was rebuilt.
     pub fn set_config(&mut self, cfg: Config) -> bool {
         let relayout = cfg.tower != self.cfg.tower || cfg.collector.max_rings != self.cfg.collector.max_rings;
-        if cfg.synthetic != self.cfg.synthetic {
-            log::warn!("[synthetic] changes take effect after a restart");
+        if cfg.synthetic.seed != self.cfg.synthetic.seed || cfg.synthetic.scale != self.cfg.synthetic.scale {
+            log::warn!("[synthetic] seed/scale changes take effect after a restart");
         }
         self.cfg = cfg;
         if relayout {
@@ -130,8 +192,29 @@ impl World {
             }
             self.relayout();
         }
+        self.sync_spin();
         self.lut_dirty = true;
         relayout
+    }
+
+    fn ring_speed(&self, ring: &layout::Ring) -> f32 {
+        let h = ring.hash();
+        let sign = if hash01(h ^ 0xAB) < 0.5 { -1.0 } else { 1.0 };
+        self.cfg.calm.spin_speed / 60.0 * sign * (0.35 + 1.3 * hash01(h))
+    }
+
+    /// Applies the configured spin speed to existing rings without making them jump.
+    fn sync_spin(&mut self) {
+        let t = self.t as f32;
+        for i in 0..self.rings.len() {
+            let new = self.ring_speed(&self.layout.rings[i]);
+            let r = &mut self.rings[i];
+            if (r.speed - new).abs() > 1e-7 {
+                r.phase0 += (r.speed - new) * t;
+                r.speed = new;
+                self.dirty_rings.push(i as u32);
+            }
+        }
     }
 
     fn tf(&self, t: f64) -> f32 {
@@ -153,7 +236,7 @@ impl World {
         let n_rings = self.layout.rings.len();
 
         // Segments.
-        let now_unix = m.epoch_unix as f64 + self.t;
+        let now_unix = m.epoch_unix as f64 + self.t - self.age_offset;
         let prev_layout_t = self.layout_t;
         let mut segs = Vec::with_capacity(self.layout.segments.len());
         for (i, s) in self.layout.segments.iter().enumerate() {
@@ -169,6 +252,8 @@ impl World {
             g.t_read = -1.0e9;
             g.t_write = -1.0e9;
             g.t_delete = -1.0e9;
+            g.t_retract = -1.0e9;
+            g.t_age = -1.0e9;
             match s.source {
                 SegSource::File(f) => {
                     let file = &m.files[f as usize];
@@ -195,12 +280,12 @@ impl World {
                     g.size_f = 0.8;
                 }
             }
+            g.age_from = g.age_days;
             segs.push(g);
         }
         self.segs = segs;
 
         // Rings, carrying animation state over by key.
-        let spin = self.cfg.calm.spin_speed / 60.0;
         self.rings = Vec::with_capacity(n_rings);
         self.ring_open = Vec::with_capacity(n_rings);
         self.ring_presence = Vec::with_capacity(n_rings);
@@ -215,10 +300,9 @@ impl World {
                 self.ring_presence.push(p.presence);
             } else {
                 let dir_hash = hash01(r.dir as u64 * 31 + 7);
-                let sign = if hash01(h ^ 0xAB) < 0.5 { -1.0 } else { 1.0 };
                 self.rings.push(RingGpu {
                     depth,
-                    speed: spin * sign * (0.35 + 1.3 * hash01(h)),
+                    speed: self.ring_speed(r),
                     phase0: hash01(h ^ 0x1234) + dir_hash * 0.3,
                     boost: 0.0,
                     boost_t0: -1.0e9,
@@ -251,6 +335,7 @@ impl World {
             *c = c.saturating_add(1);
         }
 
+        self.ring_presence_target = vec![1.0; n_rings];
         self.layout_t = self.t;
         self.layout_version += 1;
         self.needs_relayout = false;
@@ -258,6 +343,19 @@ impl World {
         self.dirty_rings.clear();
         self.lut_dirty = true;
         self.open_dirty = true;
+        if matches!(self.loop_stage, LoopStage::WindDown(_)) {
+            // Rebuilt mid wind-down (e.g. a config change): keep what was already restored.
+            if self.restored {
+                for (i, seg) in self.layout.segments.iter().enumerate() {
+                    if matches!(seg.source, SegSource::File(f) if (f as usize) >= self.initial_files) {
+                        self.segs[i].t_retract = self.t as f32 - 10.0;
+                    }
+                }
+            }
+            if self.retired {
+                self.loop_retire();
+            }
+        }
         self.update_lut();
         log::debug!("layout v{}: {} rings, {} segments", self.layout_version, n_rings, self.segs.len());
     }
@@ -266,7 +364,9 @@ impl World {
     pub fn step(&mut self, dt: f64) {
         let dt = dt.clamp(0.0, 0.5);
         let t = self.t + dt;
-        self.session.step(&mut self.home, t, dt);
+        if self.loop_stage == LoopStage::Running {
+            self.session.step(&mut self.home, t, dt);
+        }
         self.t = t;
         let tf = t as f32;
 
@@ -307,6 +407,7 @@ impl World {
                         s.t_write = tf;
                     }
                     s.age_days = 0.0;
+                    s.age_from = 0.0;
                     let spin_up = self.cfg.events.write.spin_up;
                     if spin_up > 0.0 && (ring as usize) < self.rings.len() {
                         let r = &mut self.rings[ring as usize];
@@ -318,8 +419,13 @@ impl World {
                     }
                 }
                 EventKind::Delete => {
-                    s.flags |= SEG_DELETED;
-                    s.t_delete = tf;
+                    if matches!(self.layout.segments[seg as usize].source, SegSource::File(_)) {
+                        s.flags |= SEG_DELETED;
+                        s.t_delete = tf;
+                    } else {
+                        // A file inside a collapsed subtree: flash the aggregate instead.
+                        s.t_write = tf;
+                    }
                 }
                 EventKind::Create => unreachable!(),
             }
@@ -335,7 +441,10 @@ impl World {
                 self.dirty_segs.push(mark);
             }
             self.fx.on_event(ev.kind, ev.file, seg, t);
-            if ev.kind == EventKind::Delete && self.cfg.events.delete.fall {
+            if ev.kind == EventKind::Delete
+                && self.cfg.events.delete.fall
+                && matches!(self.layout.segments[seg as usize].source, SegSource::File(_))
+            {
                 falls.push(seg);
             }
         }
@@ -350,8 +459,8 @@ impl World {
         let a = 1.0 - (-dt as f32 / 5.0).exp();
         self.activity += (n_events as f32 / dt.max(1e-3) as f32 - self.activity) * a;
 
-        // Expire deletion ghosts occasionally.
-        if t - self.last_purge_t > 30.0 {
+        // Expire deletion ghosts occasionally (a looping session restores them instead).
+        if !self.looping() && t - self.last_purge_t > 30.0 {
             self.last_purge_t = t;
             let before = t - self.cfg.events.delete.ghost_hours as f64 * 3600.0;
             if self.home.model.purge_deleted(before) > 0 {
@@ -362,6 +471,7 @@ impl World {
             self.relayout();
         }
 
+        self.update_loop();
         self.update_activity(dt as f32);
         self.update_rings(dt as f32);
         if self.lut_dirty {
@@ -382,8 +492,133 @@ impl World {
             .filter(|&s| self.segs[s as usize].flags & layout::SEG_DIR != 0)
     }
 
+    fn looping(&self) -> bool {
+        self.cfg.synthetic.loop_len.0 > 0.0
+    }
+
+    /// Current work-session phase, or "wind-down" at the end of a loop.
+    pub fn phase_name(&self) -> &'static str {
+        match self.loop_stage {
+            LoopStage::Running => self.session.phase_name(),
+            LoopStage::WindDown(_) => "wind-down",
+        }
+    }
+
+    fn update_loop(&mut self) {
+        match self.loop_stage {
+            LoopStage::Running => {
+                let len = (self.cfg.synthetic.loop_len.0 as f64).max(MIN_LOOP);
+                if self.looping() && self.t - self.loop_start >= len - RESET_AT {
+                    log::debug!("loop {}: winding down at t={:.0}s", self.loop_count, self.t);
+                    self.loop_stage = LoopStage::WindDown(self.t);
+                    self.restored = false;
+                    self.retired = false;
+                }
+                self.loop_fade = 1.0;
+            }
+            LoopStage::WindDown(since) => {
+                let e = self.t - since;
+                self.loop_fade = 1.0 - smoothstep(0.0, WIND_FADE as f32, e as f32);
+                if e >= RESTORE_AT && !self.restored {
+                    self.restored = true;
+                    self.loop_restore();
+                }
+                if e >= RETIRE_AT && !self.retired {
+                    self.retired = true;
+                    self.loop_retire();
+                }
+                if e >= RESET_AT {
+                    self.loop_reset();
+                }
+            }
+        }
+    }
+
+    /// Highlights have faded out: shrink away files created during the loop,
+    /// grow deleted files back, and ease changed ages back to their originals.
+    fn loop_restore(&mut self) {
+        let t = self.t as f32;
+        let mut rng = Rng::new(0x100B ^ self.loop_count);
+        let epoch = self.initial_model.epoch_unix;
+        for f in 0..self.initial_files {
+            let orig = &self.initial_model.files[f];
+            let cur = &mut self.home.model.files[f];
+            cur.t_read = NEVER;
+            cur.t_write = NEVER;
+            cur.t_delete = NEVER;
+            cur.mtime = orig.mtime;
+            cur.size = orig.size;
+        }
+        for (i, seg) in self.layout.segments.iter().enumerate() {
+            let g = &mut self.segs[i];
+            g.t_read = -1.0e9;
+            g.t_write = -1.0e9;
+            match seg.source {
+                SegSource::File(f) if (f as usize) < self.initial_files => {
+                    if g.flags & SEG_DELETED != 0 {
+                        g.flags &= !SEG_DELETED;
+                        g.t_delete = -1.0e9;
+                        g.t_create = t + rng.range(0.0, RESTORE_STAGGER) as f32;
+                    }
+                    let orig_age = ((epoch - self.initial_model.files[f as usize].mtime) as f64 / 86400.0).max(0.0) as f32;
+                    if (orig_age - g.age_days).abs() > 1e-4 {
+                        g.age_from = g.age_days;
+                        g.age_days = orig_age;
+                        g.t_age = t + rng.range(0.0, RESTORE_STAGGER) as f32;
+                    }
+                }
+                SegSource::File(_) => g.t_retract = t + rng.range(0.0, RESTORE_STAGGER) as f32,
+                SegSource::Dir(_) | SegSource::Agg(_) => {}
+            }
+        }
+        self.dirty_segs.extend(0..self.segs.len() as u32);
+        self.fx.cards.clear();
+        self.fx.probe.target = None;
+    }
+
+    /// Rings that only held files created during the loop ease out of the tower.
+    fn loop_retire(&mut self) {
+        let mut keep = vec![false; self.layout.rings.len()];
+        for seg in &self.layout.segments {
+            let original = match seg.source {
+                SegSource::File(f) => (f as usize) < self.initial_files,
+                SegSource::Dir(_) | SegSource::Agg(_) => true,
+            };
+            if original {
+                keep[seg.ring as usize] = true;
+            }
+        }
+        for (i, k) in keep.into_iter().enumerate() {
+            if !k {
+                self.ring_presence_target[i] = 0.0;
+            }
+        }
+    }
+
+    /// Everything on screen now matches the starting state: swap the model back
+    /// and restart the session. Nothing visible changes at this moment.
+    fn loop_reset(&mut self) {
+        let mut model = self.initial_model.clone();
+        for (f, file) in model.files.iter_mut().enumerate() {
+            // Keep the arcs currently on screen (they differ if the tower config changed).
+            file.arc = self.home.model.files[f].arc;
+        }
+        self.home.model = model;
+        self.session = Session::new(self.cfg.synthetic.seed);
+        self.dir_act.iter_mut().for_each(|a| *a = 0.0);
+        self.age_offset = self.t;
+        self.loop_start = self.t;
+        self.loop_count += 1;
+        self.loop_stage = LoopStage::Running;
+        self.loop_fade = 1.0;
+        self.fx.cards.clear();
+        self.relayout();
+        log::debug!("loop {}: restarted at t={:.0}s", self.loop_count, self.t);
+    }
+
     fn update_activity(&mut self, dt: f32) {
-        let decay = (-dt / self.cfg.calm.activity_decay.0.max(1.0)).exp();
+        let tau = if self.loop_stage == LoopStage::Running { self.cfg.calm.activity_decay.0.max(1.0) } else { WIND_ACTIVITY_TAU };
+        let decay = (-dt / tau).exp();
         for a in &mut self.dir_act {
             *a *= decay;
         }
@@ -400,6 +635,7 @@ impl World {
     fn update_rings(&mut self, dt: f32) {
         let ko = 1.0 - (-dt / OPEN_TAU).exp();
         let kp = 1.0 - (-dt / PRESENCE_TAU).exp();
+        let kp_out = 1.0 - (-dt / PRESENCE_OUT_TAU).exp();
         let mut changed = false;
         for (i, r) in self.layout.rings.iter().enumerate() {
             let target = self.dir_open_target.get(r.dir as usize).copied().unwrap_or(0.0);
@@ -410,8 +646,11 @@ impl World {
                 changed = true;
             }
             let p = &mut self.ring_presence[i];
-            if *p < 1.0 {
-                *p = if 1.0 - *p < 2e-3 { 1.0 } else { *p + (1.0 - *p) * kp };
+            let pt = self.ring_presence_target.get(i).copied().unwrap_or(1.0);
+            let d = pt - *p;
+            if d.abs() > 1e-4 {
+                let k = if d < 0.0 { kp_out } else { kp };
+                *p = if d.abs() < 2e-3 { pt } else { *p + d * k };
                 changed = true;
             }
         }

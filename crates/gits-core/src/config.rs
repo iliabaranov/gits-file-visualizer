@@ -183,6 +183,9 @@ pub struct Synthetic {
     pub seed: u64,
     pub scale: f32,
     pub speed: f32,
+    /// Loop length in simulated seconds (0 = no loop).
+    #[serde(rename = "loop")]
+    pub loop_len: Dur,
 }
 
 /// A duration in seconds, parsed from a number or a string like "150ms", "4m".

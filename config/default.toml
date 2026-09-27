@@ -27,7 +27,7 @@ smear      = "110ms"        # motion-smear time constant (0 disables)
 color     = "cream"
 decay     = "4m"            # time until the afterglow has (almost) faded
 intensity = 1.6
-probe     = true            # wireframe probe glides to the file being read
+probe     = false           # wireframe probe that glides to the file being touched
 
 [events.write]
 color     = "crimson"
@@ -57,14 +57,14 @@ stale_days = 365.0
 [calm]
 max_flash_hz    = 2.0       # a segment re-flashes at most this often
 attack          = "150ms"   # every brightening fades in over at least this long
-spin_speed      = 0.25      # base ring spin, revolutions per minute
+spin_speed      = 0.5       # base ring spin, revolutions per minute
 activity_decay  = "75s"     # how long a directory stays "unwound" after activity
-max_open_dirs   = 5         # at most this many directories unwound at once
+max_open_dirs   = 50        # at most this many directories unwound at once
 surge_hud       = true      # security-voice HUD lines during surges
 
 [tower]
 height          = 12.0      # world units
-radius          = 1.75
+radius          = 3.75
 depth_step      = 0.075     # radius shrink per directory depth layer
 depth_layers    = 4         # distinct radii (deeper directories share the last)
 min_arc         = 0.035     # turns, smallest file segment
@@ -83,7 +83,7 @@ back_face       = 0.38      # brightness of the far side of the tower
 calligraphy            = true
 calligraphy_brightness = 0.10
 lattice                = true
-lattice_brightness     = 0.55
+lattice_brightness     = 0.15
 floor_lights           = true
 
 [camera]
@@ -112,6 +112,8 @@ excludes  = ["~/.cache", "**/node_modules", "**/target", "**/.git/objects",
 max_rings = 16384
 
 [synthetic]                 # fake filesystem + work session used for look-dev
-seed  = 2501
+seed  = 14                  # early clean-up, download, browsing, editing, build, commit
 scale = 1.0                 # 1.0 ≈ 1.7k directories, 39k files
-speed = 1.0                 # simulated seconds per real second
+speed = 2.0                 # simulated seconds per real second
+loop  = "10m"               # simulated length of one loop; the tower winds down,
+                            # restores its starting state and replays. 0 = no loop

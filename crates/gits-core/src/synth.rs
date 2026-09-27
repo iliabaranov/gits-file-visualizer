@@ -615,6 +615,8 @@ enum Phase {
 pub struct Session {
     rng: Rng,
     phase: Phase,
+    /// Session-local clock, so a restarted session replays exactly the same story.
+    clock: f64,
     phase_start: f64,
     phase_end: f64,
     browse_timer: f64,
@@ -622,7 +624,14 @@ pub struct Session {
 
 impl Session {
     pub fn new(seed: u64) -> Self {
-        Self { rng: Rng::new(seed ^ 0xC0FF_EE00_2501), phase: Phase::Calm, phase_start: 0.0, phase_end: 20.0, browse_timer: 0.0 }
+        Self {
+            rng: Rng::new(seed ^ 0xC0FF_EE00_2501),
+            phase: Phase::Calm,
+            clock: 0.0,
+            phase_start: 0.0,
+            phase_end: 20.0,
+            browse_timer: 0.0,
+        }
     }
 
     /// Short human-readable description of the current phase (for logs/HUD).
@@ -639,8 +648,10 @@ impl Session {
     }
 
     /// Advances the session from `t` by `dt` seconds, mutating the model.
+    /// `t` is the model time used for event timestamps; phases run on the session clock.
     pub fn step(&mut self, home: &mut SynthHome, t: f64, dt: f64) {
-        if t >= self.phase_end {
+        self.clock += dt;
+        if self.clock >= self.phase_end {
             self.next_phase(home, t);
         }
         let SynthHome { model: m, index: ix } = home;
@@ -820,8 +831,8 @@ impl Session {
             _ => (Phase::Calm, 60.0),
         };
         self.phase = phase;
-        self.phase_start = t;
-        self.phase_end = t + dur;
+        self.phase_start = self.clock;
+        self.phase_end = self.clock + dur;
     }
 }
 
@@ -870,6 +881,24 @@ mod tests {
         assert_eq!(a.model.files.len(), b.model.files.len());
         assert!(a.model.dirs.len() > 300);
         assert!(a.model.files.len() > 5_000);
+    }
+
+    #[test]
+    fn restarted_session_replays_identically() {
+        let run = |t0: f64| {
+            let mut home = generate_home(3, 0.3);
+            let mut s = Session::new(3);
+            let dt = 1.0 / 24.0;
+            let mut log = vec![];
+            for i in 1..(24 * 400) {
+                s.step(&mut home, t0 + i as f64 * dt, dt);
+                log.extend(home.model.drain_events().into_iter().map(|e| (e.kind, e.file, ((e.t - t0) * 24.0).round() as i64)));
+            }
+            log
+        };
+        let a = run(0.0);
+        assert!(!a.is_empty());
+        assert_eq!(a, run(12_345.6));
     }
 
     #[test]

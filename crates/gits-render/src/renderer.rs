@@ -592,11 +592,15 @@ impl Renderer {
             }
             w.dirty_segs.clear();
             let ring_size = std::mem::size_of::<RingGpu>();
-            w.dirty_rings.sort_unstable();
-            w.dirty_rings.dedup();
-            for &r in &w.dirty_rings {
-                if let Some(ring) = w.rings.get(r as usize) {
-                    q.write_buffer(&self.ring_buf, (r as usize * ring_size) as u64, bytemuck::bytes_of(ring));
+            if w.dirty_rings.len() > 256 {
+                q.write_buffer(&self.ring_buf, 0, bytemuck::cast_slice(&w.rings));
+            } else {
+                w.dirty_rings.sort_unstable();
+                w.dirty_rings.dedup();
+                for &r in &w.dirty_rings {
+                    if let Some(ring) = w.rings.get(r as usize) {
+                        q.write_buffer(&self.ring_buf, (r as usize * ring_size) as u64, bytemuck::bytes_of(ring));
+                    }
                 }
             }
             w.dirty_rings.clear();
@@ -638,7 +642,7 @@ impl Renderer {
             col_teal: rgb("teal", 1.0),
             col_bg: rgb("background", 1.0),
             times: [c.events.read.decay.0, c.events.write.decay.0, c.events.create.grow.0.max(0.01), c.events.delete.ghost_hours * 3600.0],
-            times2: [c.calm.attack.0, tw.fill_open, 0.0, 0.0],
+            times2: [c.calm.attack.0, tw.fill_open, w.loop_fade, 0.0],
             age: [c.age.fresh_days.max(1e-3).log10(), c.age.old_days.max(1e-3).log10(), c.age.stale_days.max(1e-3).log10(), 0.0],
             screen: [iw as f32, ih as f32, 1.0 / iw.max(1) as f32, 1.0 / ih.max(1) as f32],
             post: [c.palette.exposure, c.palette.bloom, c.palette.grain, c.palette.vignette],

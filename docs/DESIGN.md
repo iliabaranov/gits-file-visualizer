@@ -332,6 +332,27 @@ Sections: `palette`, `events.{read,write,create,delete}`, `age`, `calm`,
   CPU is about 1 ms/frame. The window holds 24 fps. Before the sample-count
   and resolution-cap fixes, 4K took 40 ms.
 
+### After first hands-on session (2026-09-27)
+
+- Defaults now follow Ilia's tuning: tower radius 3.75, ring spin 0.5 rev/min,
+  up to 50 directories unwound, lattice brightness 0.15, synthetic seed 14 at 2×
+  speed. The chamber (lattice, floor lights, floor ring) now scales with the tower
+  radius.
+- The wireframe probe is off by default (`events.read.probe`): too distracting.
+- Synthetic mode loops seamlessly (`[synthetic] loop`, default 10 simulated
+  minutes). Near the end of each loop:
+  1. New events stop and all highlights fade out (60 s).
+  2. Busy directories wind back.
+  3. Files created during the loop shrink back along their arcs, deleted files
+     grow back into their slots, and changed ages blend back (staggered over 15 s).
+  4. Rings that only held created files ease out.
+  5. The model and session reset while nothing on screen changes.
+  The session runs on its own clock, so every loop replays the same story.
+  Verified with frame-to-frame differences across the restart: no spikes at
+  restore or reset. There is a brief drum shimmer while retiring rings ease out
+  (see backlog).
+- The window simulates in fixed 1/24 s steps, identical to headless snapshots.
+
 ### Efficiency backlog for M3
 
 - Tower fragment shader is ~65% of GPU time: cheaper samples in the dense drum,
@@ -341,6 +362,10 @@ Sections: `palette`, `events.{read,write,create,delete}`, `age`, `calm`,
 - Calm policy: after a few idle minutes, slow the ring spin and drop to 2–4 fps.
   The motion smear hides the low rate.
 - Per-pass GPU timestamps in `bench` (the `GITS_SKIP` env var is a stopgap).
+- Stable drum filtering: where many rings share a pixel, box-filter per-ring
+  average colours via a prefix-sum buffer instead of 2–3 point samples. This
+  removes the sparkle when ring spacing animates (unwinding, loop retire), and is
+  cheaper. Keep one point sample for event highlights.
 - Portrait: the tower covers more pixels; consider a composition that pulls
   back further.
 

@@ -5,7 +5,8 @@
 struct Segment {
     a0: f32, a1: f32, ring: u32, flags: u32,
     age_days: f32, size_f: f32, hash: f32, t_create: f32,
-    t_read: f32, t_write: f32, t_delete: f32, pad: f32,
+    t_read: f32, t_write: f32, t_delete: f32, t_retract: f32,
+    age_from: f32, t_age: f32, pad0: f32, pad1: f32,
 };
 
 struct Ring {
@@ -26,6 +27,10 @@ const SEG_HIDDEN: u32 = 8u;
 const SEG_DELETED: u32 = 16u;
 // Max tilt of an unwound ring, in ring pitches (mirrored in world.rs).
 const TILT: f32 = 0.3;
+// Seconds for a segment to shrink back along its arc when removed at loop end.
+const RETRACT: f32 = 2.0;
+// Seconds over which a changed age (colour) blends to its new value.
+const AGE_BLEND: f32 = 20.0;
 
 struct TowerOut {
     @builtin(position) clip: vec4<f32>,
@@ -59,6 +64,15 @@ fn age_color(age_days: f32) -> vec3<f32> {
     return mix(mix(G.col_fresh.rgb, G.col_old.rgb, a), G.col_stale.rgb, b);
 }
 
+fn seg_age(s: Segment, t: f32) -> f32 {
+    if (s.t_age < -1.0e8) {
+        return s.age_days;
+    }
+    let k = clamp((t - s.t_age) / AGE_BLEND, 0.0, 1.0);
+    let ks = k * k * (3.0 - 2.0 * k);
+    return exp2(mix(log2(max(s.age_from, 1e-3)), log2(max(s.age_days, 1e-3)), ks));
+}
+
 fn ring_phase(r: Ring, t: f32) -> f32 {
     let bt = max(t - r.boost_t0, 0.0);
     return r.phase0 + r.speed * t + r.boost * (1.0 - exp(-bt / G.lut.w));
@@ -67,12 +81,14 @@ fn ring_phase(r: Ring, t: f32) -> f32 {
 // Colour of a segment at position `u` (0..1) along its arc; alpha = visibility.
 fn seg_color(s: Segment, u: f32, open: f32, t: f32) -> vec4<f32> {
     var vis = 1.0;
+    // Fades every event highlight out while a loop winds down.
+    let lf = G.times2.z;
     let idle = mix(G.idle.x, G.idle.y, open) * (0.55 + 0.45 * s.hash);
     var col: vec3<f32>;
     if ((s.flags & SEG_DIR) != 0u) {
         col = G.col_fresh.rgb * G.idle.z;
     } else {
-        col = age_color(s.age_days) * idle;
+        col = age_color(seg_age(s, t)) * idle;
     }
     // Unwound rings are "being scanned": brighter, with some arcs gone cream-white.
     let scanned = open * step(0.7, fract(s.hash * 7.31));
@@ -83,22 +99,26 @@ fn seg_color(s: Segment, u: f32, open: f32, t: f32) -> vec4<f32> {
 
     // Creation: grow along the arc with a bright leading tip.
     let tc = t - s.t_create;
+    if (tc < 0.0 && s.t_create > -1.0e8) {
+        // Growth scheduled for later (restored at loop end, staggered): not there yet.
+        vis = 0.0;
+    }
     if (tc >= 0.0 && tc < G.times.z) {
         let g = tc / G.times.z;
         let gs = g * g * (3.0 - 2.0 * g);
         if (u > gs) {
             vis = 0.0;
         }
-        col += G.col_create.rgb * G.col_create.w * exp(-abs(u - gs) * 30.0) * (1.0 - g) * 1.5;
+        col += G.col_create.rgb * G.col_create.w * exp(-abs(u - gs) * 30.0) * (1.0 - g) * 1.5 * lf;
     }
 
     // Write: turns the segment crimson, fading back to its idle colour.
-    let kw = env(t - s.t_write, G.times.y);
+    let kw = env(t - s.t_write, G.times.y) * lf;
     col = mix(col, G.col_write.rgb * G.col_write.w * max(idle, 0.45), clamp(kw, 0.0, 1.0));
-    col += G.col_write.rgb * G.col_write.w * env(t - s.t_write, 1.5) * 0.6;
+    col += G.col_write.rgb * G.col_write.w * env(t - s.t_write, 1.5) * 0.6 * lf;
 
     // Read: cream flash plus a long, faint afterglow.
-    let kr = env(t - s.t_read, 1.6) * 0.8 + env(t - s.t_read, G.times.x) * 0.25;
+    let kr = (env(t - s.t_read, 1.6) * 0.8 + env(t - s.t_read, G.times.x) * 0.25) * lf;
     col += G.col_read.rgb * G.col_read.w * kr;
 
     // Delete: brief flash, then a faint ghost in the gap.
@@ -106,8 +126,17 @@ fn seg_color(s: Segment, u: f32, open: f32, t: f32) -> vec4<f32> {
         let td = max(t - s.t_delete, 0.0);
         let flash = exp(-td / 0.35) * G.col_delete.w;
         let ghost = G.idle.w * exp(-3.0 * td / max(G.times.w, 1.0));
-        col = G.col_delete.rgb * (flash + ghost);
+        col = G.col_delete.rgb * (flash + ghost) * lf;
         vis = 1.0;
+    }
+
+    // Removed at the end of a loop: shrink back toward the start of the arc.
+    let tr = t - s.t_retract;
+    if (s.t_retract > -1.0e8 && tr >= 0.0) {
+        let g = clamp(tr / RETRACT, 0.0, 1.0);
+        if (u > 1.0 - g * g * (3.0 - 2.0 * g)) {
+            vis = 0.0;
+        }
     }
     return vec4<f32>(col, vis);
 }

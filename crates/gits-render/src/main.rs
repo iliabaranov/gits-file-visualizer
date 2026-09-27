@@ -82,6 +82,9 @@ enum Cmd {
         /// Simulated minutes of session to summarise.
         #[arg(long, default_value_t = 10.0)]
         minutes: f64,
+        /// Print every phase change of the work session.
+        #[arg(long)]
+        timeline: bool,
     },
     /// Print the built-in default configuration.
     DefaultConfig,
@@ -111,8 +114,8 @@ fn main() -> Result<()> {
             snapshot::run(cfg, snapshot::Options { out, width, height, at, frames, every })
         }
         Cmd::Bench { width, height, at, frames } => snapshot::bench(cfg, width, height, at, frames),
-        Cmd::Stats { minutes } => {
-            stats(cfg, minutes);
+        Cmd::Stats { minutes, timeline } => {
+            stats(cfg, minutes, timeline);
             Ok(())
         }
         Cmd::DefaultConfig => {
@@ -122,7 +125,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn stats(cfg: Config, minutes: f64) {
+fn stats(cfg: Config, minutes: f64, timeline: bool) {
     let mut w = world::World::new(cfg, 16384);
     println!("directories: {}", w.home.model.dirs.len());
     println!("files:       {}", w.home.model.live_file_count());
@@ -132,9 +135,15 @@ fn stats(cfg: Config, minutes: f64) {
     let dt = 1.0 / 24.0;
     let steps = (minutes * 60.0 / dt) as usize;
     let mut peak = 0.0f32;
+    let mut last = "";
     for _ in 0..steps {
         w.step(dt);
-        *phases.entry(w.session.phase_name()).or_default() += dt;
+        let phase = w.phase_name();
+        if timeline && phase != last {
+            println!("  t={:>6.1}s  {phase}", w.t);
+            last = phase;
+        }
+        *phases.entry(phase).or_default() += dt;
         peak = peak.max(w.activity);
     }
     println!(

@@ -4,7 +4,7 @@
 use crate::camera::Camera;
 use crate::gpu::{self, Gpu};
 use crate::renderer::Renderer;
-use crate::world::World;
+use crate::world::{Notice, World};
 use anyhow::{Context, Result};
 use gits_core::config::Config;
 use std::path::PathBuf;
@@ -16,6 +16,9 @@ use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
+
+/// Fixed simulation step, identical to headless snapshots so runs are reproducible.
+const SIM_DT: f64 = 1.0 / 24.0;
 
 pub const APP_ID: &str = "io.github.iliabaranov.GitsFileVisualizer";
 
@@ -38,6 +41,7 @@ struct State {
     next_frame: Instant,
     frames: u32,
     stats_since: Instant,
+    sim_accum: f64,
 }
 
 struct App {
@@ -109,6 +113,7 @@ impl App {
             next_frame: now,
             frames: 0,
             stats_since: now,
+            sim_accum: 0.0,
         });
         Ok(())
     }
@@ -130,6 +135,8 @@ impl App {
                 self.cfg = cfg.clone();
                 if let Some(s) = &mut self.state {
                     s.world.set_config(cfg);
+                    s.world.notice =
+                        Some(Notice { text: format!("config reloaded: {}", path.display()), error: false, until: s.world.t + 3.0 });
                     s.renderer.invalidate_background();
                     s.renderer.resize(
                         s.surface_cfg.width,
@@ -139,7 +146,14 @@ impl App {
                     );
                 }
             }
-            Err(e) => log::error!("config not reloaded: {e:#}"),
+            Err(e) => {
+                log::error!("config not reloaded: {e:#}");
+                if let Some(s) = &mut self.state {
+                    let msg = format!("config error (keeping previous settings): {e:#}");
+                    let text = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+                    s.world.notice = Some(Notice { text, error: true, until: f64::INFINITY });
+                }
+            }
         }
     }
 
@@ -149,7 +163,17 @@ impl App {
         let now = Instant::now();
         let real_dt = now.duration_since(s.last_frame).as_secs_f64();
         s.last_frame = now;
-        s.world.step(real_dt * speed);
+        s.sim_accum += real_dt * speed;
+        let mut steps = 0;
+        while s.sim_accum >= SIM_DT && steps < 48 {
+            s.world.step(SIM_DT);
+            s.sim_accum -= SIM_DT;
+            steps += 1;
+        }
+        if steps == 48 {
+            // Fell far behind (e.g. after suspend): skip ahead instead of catching up.
+            s.sim_accum = 0.0;
+        }
 
         let tex = match s.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -172,7 +196,7 @@ impl App {
                 "{:.1} fps, sim t={:.0}s phase={} activity={:.1}/s rings={}",
                 s.frames as f64 / elapsed,
                 s.world.t,
-                s.world.session.phase_name(),
+                s.world.phase_name(),
                 s.world.activity,
                 s.world.rings.len()
             );

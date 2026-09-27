@@ -61,7 +61,7 @@ pub fn run(cfg: Config, opts: Options) -> Result<()> {
         log::info!(
             "t={:.1}s phase={} activity={:.1}/s rings={} → {}",
             world.t,
-            world.session.phase_name(),
+            world.phase_name(),
             world.activity,
             world.rings.len(),
             path.display()
