@@ -8,10 +8,9 @@
 #   tools/install-user.sh              build (release), install, start the collector
 #   tools/install-user.sh uninstall    stop, disable, remove everything above
 #
-# The wallpaper itself is the GNOME extension. After installing, turn it on with
-#   gnome-extensions enable gits-file-visualizer@iliabaranov.github.io
-# (on Wayland, GNOME only discovers a newly installed extension after you log
-# out and back in; the script tells you when that is needed).
+# The wallpaper itself is the GNOME extension; the script enables it. On
+# Wayland, GNOME only discovers a newly installed extension when you log in, so
+# the first time it appears after the next login.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -49,9 +48,23 @@ systemctl --user daemon-reload
 systemctl --user enable --now "$UNIT"
 systemctl --user restart "$UNIT"
 
+enable_extension() {
+  # Adds the extension to org.gnome.shell enabled-extensions (keeping the others).
+  # GNOME loads it at the next login even if the running shell has not seen it yet.
+  local cur
+  cur=$(gsettings get org.gnome.shell enabled-extensions)
+  [[ "$cur" == *"'$UUID'"* ]] && return 0
+  if [[ "$cur" == "@as []" || "$cur" == "[]" ]]; then
+    gsettings set org.gnome.shell enabled-extensions "['$UUID']"
+  else
+    gsettings set org.gnome.shell enabled-extensions "${cur%]}, '$UUID']"
+  fi
+}
+
 if [[ -n "$major" ]]; then
   mkdir -p "$EXT_DIR"
   install -m 644 extension/gnome-42/metadata.json extension/gnome-42/extension.js "$EXT_DIR/"
+  enable_extension
 fi
 
 echo
@@ -60,12 +73,12 @@ echo
 echo "installed. Collector logs: journalctl --user -u $UNIT -f"
 if [[ -n "$major" ]]; then
   if gnome-extensions info "$UUID" >/dev/null 2>&1; then
-    echo "wallpaper on:   gnome-extensions enable $UUID"
-    echo "wallpaper off:  gnome-extensions disable $UUID"
-    echo "(if it is already enabled, disable + enable picks up the new version)"
+    echo "the wallpaper extension is enabled. To pick up a new version: disable, then enable:"
+    echo "  gnome-extensions disable $UUID; gnome-extensions enable $UUID"
   else
-    echo "GNOME has not seen the new extension yet: log out and back in once, then run"
-    echo "  gnome-extensions enable $UUID"
+    echo "the wallpaper extension is enabled and starts at your next login"
+    echo "(GNOME on Wayland only discovers new extensions when you log in)."
   fi
+  echo "wallpaper off:  gnome-extensions disable $UUID"
   echo "extension/renderer logs: journalctl --user -f -o cat /usr/bin/gnome-shell | grep -E 'gits'"
 fi

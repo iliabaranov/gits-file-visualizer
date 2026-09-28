@@ -33,8 +33,13 @@ start)
   shift
   mons=("$@"); [[ ${#mons[@]} -eq 0 ]] && mons=(1920x1200 3840x2160 1440x2560)
   "$0" stop >/dev/null 2>&1 || true
-  rm -rf "$SB"; mkdir -p "$SB/home/.local/share/gnome-shell/extensions" "$SB/run"; chmod 700 "$SB/run"
-  ln -s "$REPO/$(ext_dir)" "$SB/home/.local/share/gnome-shell/extensions/$UUID"
+  rm -rf "$SB"; mkdir -p "$SB/home/.local/share/gnome-shell/extensions" "$SB/home/Desktop" "$SB/run"; chmod 700 "$SB/run"
+  touch "$SB/home/Desktop/notes.txt"   # so desktop icons (DING) create their windows, as in a real session
+  if [[ -n "${GITS_EXT_DIR:-}" ]]; then   # test an installed copy instead of the repo
+    cp -r "$GITS_EXT_DIR" "$SB/home/.local/share/gnome-shell/extensions/$UUID"
+  else
+    ln -s "$REPO/$(ext_dir)" "$SB/home/.local/share/gnome-shell/extensions/$UUID"
+  fi
   ln -s "$REPO/tools/sandbox/$HELPER" "$SB/home/.local/share/gnome-shell/extensions/$HELPER"
   # Like a real install: the extension finds the renderer in ~/.local/bin.
   mkdir -p "$SB/home/.local/bin"; ln -s "$REPO/target/release/gits-render" "$SB/home/.local/bin/gits-render"

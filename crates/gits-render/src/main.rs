@@ -116,6 +116,8 @@ fn main() -> Result<()> {
     if let Some(p) = &config_path {
         log::info!("config: {} (merged over defaults)", p.display());
     }
+    // Before any thread exists (it sets an environment variable).
+    gpu::select_vulkan_drivers(cfg.performance.prefer_igpu);
     if let Some(seed) = cli.seed {
         cfg.synthetic.seed = seed;
     }

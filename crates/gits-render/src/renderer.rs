@@ -13,7 +13,6 @@ use crate::world::{ATLAS_W, BOOST_TAU, LUT_BINS, World};
 use anyhow::Result;
 use wgpu::util::DeviceExt;
 
-const HDR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const BLOOM_LEVELS: usize = 6;
 const TOWER_SLICES: u32 = 256;
 
@@ -75,6 +74,8 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pub out_format: wgpu::TextureFormat,
+    /// Internal HDR format: RG11B10 where renderable (half the bytes), else RGBA16F.
+    hdr: wgpu::TextureFormat,
     max_atlas_rows: u32,
 
     globals_buf: wgpu::Buffer,
@@ -204,6 +205,12 @@ fn vertex_buffer(device: &wgpu::Device, label: &str, count: usize) -> wgpu::Buff
 impl Renderer {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue, out_format: wgpu::TextureFormat) -> Result<Self> {
         let atlas = GlyphAtlas::build()?;
+        let hdr = if device.features().contains(wgpu::Features::RG11B10UFLOAT_RENDERABLE) && std::env::var_os("GITS_HDR16").is_none() {
+            wgpu::TextureFormat::Rg11b10Ufloat
+        } else {
+            wgpu::TextureFormat::Rgba16Float
+        };
+        log::debug!("internal HDR format {hdr:?}");
         let max_atlas_rows = device.limits().max_texture_dimension_2d;
 
         let module = |label: &str, src: &str| {
@@ -291,7 +298,7 @@ impl Renderer {
                 module: &tower_mod,
                 entry_point: Some("fs_tower"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState { format: HDR, blend: Some(ADDITIVE), write_mask: wgpu::ColorWrites::ALL })],
+                targets: &[Some(wgpu::ColorTargetState { format: hdr, blend: Some(ADDITIVE), write_mask: wgpu::ColorWrites::ALL })],
             }),
             multiview_mask: None,
             cache: None,
@@ -319,7 +326,7 @@ impl Renderer {
                 module: &sprite_mod,
                 entry_point: Some("fs_sprite"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState { format: HDR, blend: Some(ADDITIVE), write_mask: wgpu::ColorWrites::ALL })],
+                targets: &[Some(wgpu::ColorTargetState { format: hdr, blend: Some(ADDITIVE), write_mask: wgpu::ColorWrites::ALL })],
             }),
             multiview_mask: None,
             cache: None,
@@ -349,10 +356,10 @@ impl Renderer {
                     cache: None,
                 })
             };
-        let bg_pipeline = fullscreen("background", &bg_layout, "fs_bg", HDR, None);
-        let combine_pipeline = fullscreen("combine", &post_layout, "fs_combine", HDR, None);
-        let down_pipeline = fullscreen("bloom down", &post_layout, "fs_down", HDR, None);
-        let up_pipeline = fullscreen("bloom up", &post_layout, "fs_up", HDR, Some(ADDITIVE));
+        let bg_pipeline = fullscreen("background", &bg_layout, "fs_bg", hdr, None);
+        let combine_pipeline = fullscreen("combine", &post_layout, "fs_combine", hdr, None);
+        let down_pipeline = fullscreen("bloom down", &post_layout, "fs_down", hdr, None);
+        let up_pipeline = fullscreen("bloom up", &post_layout, "fs_up", hdr, Some(ADDITIVE));
         let final_pipeline = fullscreen("final", &post_layout, "fs_final", out_format, None);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -427,7 +434,7 @@ impl Renderer {
         let seg_cap = 1024;
         let ring_cap = 256;
         let (atlas_tex, atlas_view) = atlas_texture(&device, 256);
-        let dummy = Target::new(&device, 1, 1, HDR, "dummy");
+        let dummy = Target::new(&device, 1, 1, hdr, "dummy");
 
         Ok(Self {
             seg_buf: storage_buffer(&device, "segments", (seg_cap * std::mem::size_of::<SegmentGpu>()) as u64),
@@ -447,6 +454,7 @@ impl Renderer {
             device,
             queue,
             out_format,
+            hdr,
             globals_buf,
             globals_bg,
             tower_pipeline,
@@ -511,12 +519,12 @@ impl Renderer {
         if view.targets.as_ref().is_some_and(|t| t.w == w && t.h == h) {
             return;
         }
-        let d = &self.device;
-        let bg = Target::new(d, w, h, HDR, "background");
-        let scene = Target::new(d, w, h, HDR, "scene");
-        let trail = [Target::new(d, w, h, HDR, "trail a"), Target::new(d, w, h, HDR, "trail b")];
+        let (d, f) = (&self.device, self.hdr);
+        let bg = Target::new(d, w, h, f, "background");
+        let scene = Target::new(d, w, h, f, "scene");
+        let trail = [Target::new(d, w, h, f, "trail a"), Target::new(d, w, h, f, "trail b")];
         let bloom: Vec<Target> =
-            (0..BLOOM_LEVELS).map(|i| Target::new(d, (w >> (i + 1)).max(1), (h >> (i + 1)).max(1), HDR, "bloom")).collect();
+            (0..BLOOM_LEVELS).map(|i| Target::new(d, (w >> (i + 1)).max(1), (h >> (i + 1)).max(1), f, "bloom")).collect();
         let dm = &self.dummy.view;
         let combine_bg = [
             self.post_group("combine a", &bg.view, &scene.view, &trail[1].view),

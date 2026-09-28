@@ -37,8 +37,7 @@ fn wait_for_data(world: &mut World) -> Result<()> {
 /// With live data `--at` is ignored: captures start once the snapshot arrives
 /// and are spaced `every` real seconds apart.
 pub fn run(cfg: Config, opts: Options, collector: Option<std::path::PathBuf>) -> Result<()> {
-    let instance = gpu::instance();
-    let g = pollster::block_on(gpu::init(&instance, None, cfg.performance.prefer_igpu))?;
+    let (_instance, g) = gpu::init_headless(cfg.performance.prefer_igpu)?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format)?;
     let mut view = renderer.new_view();
@@ -100,8 +99,7 @@ pub fn run(cfg: Config, opts: Options, collector: Option<std::path::PathBuf>) ->
 /// Renders `frames` frames at 24 fps simulated time, waiting for the GPU after
 /// each one, and reports CPU (simulation + encoding) and total frame times.
 pub fn bench(cfg: Config, width: u32, height: u32, at: f64, frames: u32, collector: Option<std::path::PathBuf>) -> Result<()> {
-    let instance = gpu::instance();
-    let g = pollster::block_on(gpu::init(&instance, None, cfg.performance.prefer_igpu))?;
+    let (_instance, g) = gpu::init_headless(cfg.performance.prefer_igpu)?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let scale = cfg.performance.render_scale;
     let max_mp = cfg.performance.max_internal_megapixels;

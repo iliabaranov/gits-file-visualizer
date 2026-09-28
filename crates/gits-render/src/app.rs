@@ -194,7 +194,6 @@ impl App {
     }
 
     fn init(&mut self, el: &ActiveEventLoop) -> Result<()> {
-        let instance = gpu::instance();
         let mut windows = Vec::new();
         for spec in &self.opts.outputs {
             let mut attrs = Window::default_attributes();
@@ -211,11 +210,24 @@ impl App {
                 use winit::platform::wayland::WindowAttributesExtWayland;
                 attrs = attrs.with_name(APP_ID, "gits-file-visualizer");
             }
-            let window = Arc::new(el.create_window(attrs)?);
-            let surface = instance.create_surface(window.clone())?;
-            windows.push((spec.clone(), window, surface));
+            windows.push((spec.clone(), Arc::new(el.create_window(attrs)?)));
         }
-        let g = pollster::block_on(gpu::init(&instance, Some(&windows[0].2), self.cfg.performance.prefer_igpu))?;
+        // Vulkan first; OpenGL only if Vulkan finds nothing usable.
+        let mut chosen = None;
+        for fallback in [false, true] {
+            let instance = gpu::instance(fallback);
+            let surfaces: Result<Vec<_>, _> = windows.iter().map(|(_, w)| instance.create_surface(w.clone())).collect();
+            let Ok(surfaces) = surfaces else { continue };
+            match pollster::block_on(gpu::init(&instance, Some(&surfaces[0]), self.cfg.performance.prefer_igpu)) {
+                Ok(g) => {
+                    chosen = Some((g, surfaces));
+                    break;
+                }
+                Err(e) => log::warn!("{}: {e:#}", if fallback { "OpenGL" } else { "Vulkan" }),
+            }
+        }
+        let (g, surfaces) = chosen.context("no usable GPU (Vulkan or OpenGL)")?;
+        let windows: Vec<_> = windows.into_iter().zip(surfaces).map(|((spec, w), s)| (spec, w, s)).collect();
         let caps = windows[0].2.get_capabilities(&g.adapter);
         let format =
             caps.formats.iter().copied().find(|f| f.is_srgb()).or(caps.formats.first().copied()).context("surface has no formats")?;

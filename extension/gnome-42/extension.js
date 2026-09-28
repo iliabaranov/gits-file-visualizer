@@ -448,6 +448,10 @@ class Extension {
         this._timers.add(this._visTimer);
     }
 
+    /* Windows that hide the wallpaper. Excludes our own windows, desktop-icon
+     * windows (DING titles them "@!x,y;…" and hides them from window lists; they
+     * are transparent), anything hidden from window lists, and translucent or
+     * minimized windows. */
     _occluders() {
         const ws = global.workspace_manager.get_active_workspace();
         const types = [Meta.WindowType.NORMAL, Meta.WindowType.DIALOG, Meta.WindowType.MODAL_DIALOG];
@@ -455,6 +459,7 @@ class Extension {
             .map(a => a.meta_window)
             .filter(w => w && !w.minimized && w.showing_on_its_workspace() && !w.skip_taskbar &&
                 types.includes(w.get_window_type()) &&
+                !(w.get_title() ?? '').startsWith('@!') &&
                 (w.is_on_all_workspaces() || w.get_workspace() === ws) &&
                 !this._windows.has(w) && !this._renderer?.owns(w) &&
                 w.get_compositor_private()?.opacity === 255)
@@ -492,7 +497,11 @@ class Extension {
         const rects = overview ? [] : this._occluders();
         for (const m of Main.layoutManager.monitors) {
             const visible = overview || !this._covered(m.index, rects);
-            this._send(`visible ${m.index}`, `visible ${m.index} ${visible ? 1 : 0}`);
+            const key = `visible ${m.index}`;
+            const line = `${key} ${visible ? 1 : 0}`;
+            if (this._sent.has(key) && this._sent.get(key) !== line)
+                info(`monitor ${m.index} ${visible ? 'visible' : 'covered'} (${rects.length} windows)`);
+            this._send(key, line);
         }
     }
 
