@@ -45,14 +45,29 @@ and back in once; the script says when that is needed. The extension:
   wallpaper;
 - keeps the renderer's windows out of the dock, alt-tab and the overview;
 - pauses a monitor while windows cover it, and everything while the screen is
-  locked (with every monitor covered the renderer uses ~1.6% of one core, from
-  applying live file changes);
+  locked;
+- picks a view per monitor (`[monitors]`, default `auto`): the portrait screen
+  gets the drum close-up, the largest landscape screen the wide tower, others the
+  top-down dial;
 - switches file names to obfuscated glyphs while a screencast or screen share is
   running (`[privacy] obfuscate_when_sharing`);
 - restarts the renderer if it crashes (at most 5 times in 5 minutes) and when
   monitors change; if the renderer is missing, the normal wallpaper stays.
 
 Logs: `journalctl --user -f -o cat /usr/bin/gnome-shell | grep gits`.
+
+Measured cost on the development laptop (Intel UHD 630, three monitors
+1920×1200 + 3840×2160 + 1440×2560, live data at ~35 file events/s):
+
+| | Renderer | GNOME Shell (compositing it) | Integrated GPU busy |
+|---|---|---|---|
+| Desktop visible on all monitors | 5.4% of one core | 2.8% | ~19% |
+| All monitors covered by windows | 0.5% | 0.4% | ~1% |
+| Collector (always) | 0.3% | | |
+
+It renders at 6 fps (12 while a deleted file's segment falls, 4 on battery),
+at about 0.8 megapixels per monitor; GNOME scales that up. `gits-render
+loadtest` measures this headlessly on your machine.
 
 ### With your real files, in a window
 
@@ -81,7 +96,8 @@ collector|synthetic` forces one.
 cargo run --release -p gits-render -- window --warmup 150   # window; Esc or q quits
 cargo run --release -p gits-render -- snapshot --out out/shot.png --at 160
 cargo run --release -p gits-render -- snapshot --out out/seq/s.png --at 60 --frames 12 --every 25
-cargo run --release -p gits-render -- bench --width 3840 --height 2160
+cargo run --release -p gits-render -- bench --width 3840 --height 2160   # renders flat out: GPU at 100%
+cargo run --release -p gits-render -- loadtest --source collector       # real wallpaper pacing, CPU/GPU cost
 cargo run --release -p gits-render -- stats --minutes 15
 cargo run --release -p gits-render -- default-config > my-config.toml
 ```

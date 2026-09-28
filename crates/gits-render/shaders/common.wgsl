@@ -23,6 +23,7 @@ struct Globals {
     screen: vec4<f32>,      // w, h, 1/w, 1/h (internal)
     post: vec4<f32>,        // exposure, bloom, grain, vignette
     post2: vec4<f32>,       // smear decay, seed, manual gamma, 1/bloom levels
+    rct: vec4<f32>,         // ring colour texture rows, bins, atlas texels per bin, _
 };
 
 @group(0) @binding(0) var<uniform> G: Globals;

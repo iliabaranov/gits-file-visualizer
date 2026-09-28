@@ -40,7 +40,8 @@ elif (( major >= 45 )); then
   exit 1
 fi
 
-cargo build --release --locked -p gits-collector -p gits-render
+# Lowest CPU priority, so the desktop stays responsive while it compiles.
+nice -n 19 cargo build --release --locked -p gits-collector -p gits-render
 mkdir -p "$BIN" "$UNIT_DIR"
 install -m 755 target/release/gits-collector target/release/gits-render "$BIN/"
 install -m 644 "packaging/systemd/$UNIT" "$UNIT_DIR/$UNIT"

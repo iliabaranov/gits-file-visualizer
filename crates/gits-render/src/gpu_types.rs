@@ -75,6 +75,8 @@ pub struct Globals {
     pub post: [f32; 4],
     /// smear decay per frame, frame seed, needs manual gamma, 1/bloom levels.
     pub post2: [f32; 4],
+    /// Ring colour texture rows, bins, atlas texels per bin, _.
+    pub rct: [f32; 4],
 }
 
 #[repr(C)]

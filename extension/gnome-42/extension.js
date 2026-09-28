@@ -287,11 +287,8 @@ class Extension {
         const container = manager._container;
         if (container instanceof St.Widget && container.has_style_class_name('screen-shield-background'))
             return; // lock screen: keep the normal wallpaper
-        const holder = new Clutter.Actor({
-            layout_manager: new Clutter.BinLayout(),
-            reactive: false,
-            opacity: 0,
-        });
+        // No layout manager: children keep the position/size their constraints give them.
+        const holder = new Clutter.Actor({ reactive: false, opacity: 0 });
         holder.add_constraint(new Clutter.BindConstraint({ source: bgActor, coordinate: Clutter.BindCoordinate.SIZE }));
         holder._gitsMonitor = bgActor.monitor;
         bgActor.add_child(holder);
@@ -311,7 +308,10 @@ class Extension {
             holder.opacity = 0;
             return;
         }
-        holder.add_child(new Clutter.Clone({ source, x_expand: true, y_expand: true }));
+        // A Clone paints its source scaled to its own allocation: the holder's size.
+        const scaled = new Clutter.Clone({ source, x: 0, y: 0 });
+        scaled.add_constraint(new Clutter.BindConstraint({ source: holder, coordinate: Clutter.BindCoordinate.SIZE }));
+        holder.add_child(scaled);
         holder.ease({ opacity: 255, duration: FADE_MS, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
     }
 
@@ -356,7 +356,8 @@ class Extension {
         this._renderer.hideFromWindowList(window);
         window.stick();
         window.move_to_monitor(monitor);
-        window.make_fullscreen();
+        // The window is smaller than the monitor (the renderer's internal
+        // resolution); the clones below scale it up.
         Main.wm.skipNextEffect(actor);
         window.minimize();
         const ids = [

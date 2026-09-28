@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn defaults_parse() {
         let c = Config::default();
-        assert_eq!(c.performance.fps_active, 24);
+        assert_eq!(c.performance.fps_active, 12);
         assert!((c.events.write.decay.0 - 900.0).abs() < 1e-3);
     }
 

@@ -9,7 +9,7 @@ use crate::camera::Camera;
 use crate::fx;
 use crate::gpu_types::{Globals, RingGpu, SegmentGpu, SpriteVertex};
 use crate::text::GlyphAtlas;
-use crate::world::{ATLAS_W, BOOST_TAU, LUT_BINS, World};
+use crate::world::{ATLAS_W, BOOST_TAU, LUT_BINS, RCT_BINS, World};
 use anyhow::Result;
 use wgpu::util::DeviceExt;
 
@@ -17,7 +17,11 @@ const BLOOM_LEVELS: usize = 6;
 const TOWER_SLICES: u32 = 256;
 
 const COMMON_WGSL: &str = include_str!("../shaders/common.wgsl");
+const TOWER_COMMON_WGSL: &str = include_str!("../shaders/tower_common.wgsl");
 const TOWER_WGSL: &str = include_str!("../shaders/tower.wgsl");
+const RINGCOLOR_WGSL: &str = include_str!("../shaders/ringcolor.wgsl");
+/// The whole ring colour texture is refreshed over this many (simulated) seconds.
+const RCT_REFRESH_S: f64 = 2.0;
 const SPRITE_WGSL: &str = include_str!("../shaders/sprite.wgsl");
 const POST_WGSL: &str = include_str!("../shaders/post.wgsl");
 
@@ -93,9 +97,28 @@ pub struct Renderer {
     open_buf: wgpu::Buffer,
     ring_cap: usize,
     lut_buf: wgpu::Buffer,
+    bands_buf: wgpu::Buffer,
+    bands_cap: usize,
+    n_bands: u32,
     atlas_tex: wgpu::Texture,
     atlas_view: wgpu::TextureView,
     atlas_rows: u32,
+
+    // Ring colour texture (tower dense path), RCT_BINS x atlas_rows.
+    rct_view: wgpu::TextureView,
+    _rct_tex: wgpu::Texture,
+    rct_bgl: wgpu::BindGroupLayout,
+    rct_bg: wgpu::BindGroup,
+    rct_sampler: wgpu::Sampler,
+    ring_pipeline: wgpu::RenderPipeline,
+    ranges_bgl: wgpu::BindGroupLayout,
+    ranges_buf: wgpu::Buffer,
+    ranges_cap: usize,
+    ranges_bg: wgpu::BindGroup,
+    /// Rows to redraw in the next encoded frame, and bookkeeping.
+    ranges: Vec<[u32; 2]>,
+    rct_t: f64,
+    rct_cursor: u32,
 
     sprite_pipeline: wgpu::RenderPipeline,
     sprite_bg: wgpu::BindGroup,
@@ -193,6 +216,43 @@ fn atlas_texture(device: &wgpu::Device, rows: u32) -> (wgpu::Texture, wgpu::Text
     (tex, view)
 }
 
+fn rct_texture(device: &wgpu::Device, rows: u32, format: wgpu::TextureFormat) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ring colours"),
+        size: wgpu::Extent3d { width: RCT_BINS, height: rows.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
+}
+
+fn ranges_buffer(device: &wgpu::Device, cap: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ring colour ranges"),
+        size: (cap.max(16) * 8) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Sorted rows → half-open ranges of consecutive rows.
+fn coalesce(rows: &mut [u32]) -> Vec<[u32; 2]> {
+    rows.sort_unstable();
+    let mut out: Vec<[u32; 2]> = vec![];
+    for &r in rows.iter() {
+        match out.last_mut() {
+            Some(last) if r <= last[1] => last[1] = last[1].max(r + 1),
+            _ => out.push([r, r + 1]),
+        }
+    }
+    out
+}
+
 fn vertex_buffer(device: &wgpu::Device, label: &str, count: usize) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
@@ -219,7 +279,8 @@ impl Renderer {
                 source: wgpu::ShaderSource::Wgsl(format!("{COMMON_WGSL}\n{src}").into()),
             })
         };
-        let tower_mod = module("tower.wgsl", TOWER_WGSL);
+        let tower_mod = module("tower.wgsl", &format!("{TOWER_COMMON_WGSL}\n{TOWER_WGSL}"));
+        let ring_mod = module("ringcolor.wgsl", &format!("{TOWER_COMMON_WGSL}\n{RINGCOLOR_WGSL}"));
         let sprite_mod = module("sprite.wgsl", SPRITE_WGSL);
         let post_mod = module("post.wgsl", POST_WGSL);
 
@@ -252,6 +313,16 @@ impl Renderer {
                 storage_entry(2),
                 storage_entry(3),
                 texture_entry(4, wgpu::TextureSampleType::Uint),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let sprite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -272,7 +343,46 @@ impl Renderer {
                 immediate_size: 0,
             })
         };
-        let tower_layout = layout("tower", &[&globals_bgl, &tower_bgl]);
+        let rct_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ring colours"),
+            entries: &[texture_entry(0, wgpu::TextureSampleType::Float { filterable: true }), sampler_entry(1)],
+        });
+        let ranges_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ring colour ranges"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let tower_layout = layout("tower", &[&globals_bgl, &tower_bgl, &rct_bgl]);
+        let ring_layout = layout("ring colours", &[&globals_bgl, &tower_bgl, &ranges_bgl]);
+        let ring_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ring colours"),
+            layout: Some(&ring_layout),
+            vertex: wgpu::VertexState {
+                module: &ring_mod,
+                entry_point: Some("vs_rows"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &ring_mod,
+                entry_point: Some("fs_rows"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: hdr, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let sprite_layout = layout("sprite", &[&globals_bgl, &sprite_bgl]);
         let post_layout = layout("post", &[&globals_bgl, &post_bgl]);
         let bg_layout = layout("background", &[&globals_bgl]);
@@ -434,6 +544,30 @@ impl Renderer {
         let seg_cap = 1024;
         let ring_cap = 256;
         let (atlas_tex, atlas_view) = atlas_texture(&device, 256);
+        let (rct_tex, rct_view) = rct_texture(&device, 256, hdr);
+        let rct_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("ring colours"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let rct_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ring colours"),
+            layout: &rct_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&rct_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&rct_sampler) },
+            ],
+        });
+        let ranges_cap = 1024;
+        let ranges_buf = ranges_buffer(&device, ranges_cap);
+        let ranges_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ring colour ranges"),
+            layout: &ranges_bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: ranges_buf.as_entire_binding() }],
+        });
         let dummy = Target::new(&device, 1, 1, hdr, "dummy");
 
         Ok(Self {
@@ -441,11 +575,27 @@ impl Renderer {
             ring_buf: storage_buffer(&device, "rings", (ring_cap * std::mem::size_of::<RingGpu>()) as u64),
             open_buf: storage_buffer(&device, "ring open", (ring_cap * 4) as u64),
             lut_buf: storage_buffer(&device, "lut", ((LUT_BINS + 1) * 4) as u64),
+            bands_buf: storage_buffer(&device, "layer bands", 16 * 16),
+            bands_cap: 16,
+            n_bands: 0,
             seg_cap,
             ring_cap,
             atlas_tex,
             atlas_view,
             atlas_rows: 256,
+            rct_view,
+            _rct_tex: rct_tex,
+            rct_bgl,
+            rct_bg,
+            rct_sampler,
+            ring_pipeline,
+            ranges_bgl,
+            ranges_buf,
+            ranges_cap,
+            ranges_bg,
+            ranges: vec![],
+            rct_t: f64::NEG_INFINITY,
+            rct_cursor: 0,
             max_atlas_rows,
             tower_bg: None,
             tower_vb,
@@ -562,6 +712,17 @@ impl Renderer {
                 let rows = ((n_rings as u32 * 5 / 4).div_ceil(256) * 256).min(self.max_atlas_rows);
                 (self.atlas_tex, self.atlas_view) = atlas_texture(&self.device, rows);
                 self.atlas_rows = rows;
+                let (tex, view) = rct_texture(&self.device, rows, self.hdr);
+                self.rct_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("ring colours"),
+                    layout: &self.rct_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.rct_sampler) },
+                    ],
+                });
+                (self._rct_tex, self.rct_view) = (tex, view);
+                w.rct_full = true;
                 rebind = true;
             }
             if !w.segs.is_empty() {
@@ -584,17 +745,7 @@ impl Renderer {
                 );
             }
             if rebind {
-                self.tower_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("tower"),
-                    layout: &self.tower_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: self.seg_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: self.ring_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: self.open_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: self.lut_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.atlas_view) },
-                    ],
-                }));
+                self.tower_bg = None;
             }
             self.layout_version = w.layout_version;
             w.dirty_segs.clear();
@@ -634,8 +785,72 @@ impl Renderer {
             }
         }
         if w.lut_dirty {
-            q.write_buffer(&self.lut_buf, 0, bytemuck::cast_slice(&w.lut));
+            self.queue.write_buffer(&self.lut_buf, 0, bytemuck::cast_slice(&w.lut));
+            let bands = &w.layer_bands;
+            if bands.len() > self.bands_cap {
+                self.bands_cap = bands.len() * 2;
+                self.bands_buf = storage_buffer(&self.device, "layer bands", (self.bands_cap * 16) as u64);
+                self.tower_bg = None;
+            }
+            if !bands.is_empty() {
+                self.queue.write_buffer(&self.bands_buf, 0, bytemuck::cast_slice(bands));
+            }
+            self.n_bands = bands.len() as u32;
             w.lut_dirty = false;
+        }
+        if self.tower_bg.is_none() {
+            self.tower_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("tower"),
+                layout: &self.tower_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.seg_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.ring_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: self.open_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: self.lut_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.atlas_view) },
+                    wgpu::BindGroupEntry { binding: 5, resource: self.bands_buf.as_entire_binding() },
+                ],
+            }));
+        }
+        self.plan_ring_colours(w);
+    }
+
+    /// Chooses the ring colour texture rows to redraw for world time `w.t`
+    /// (once per world time, however many views render it).
+    fn plan_ring_colours(&mut self, w: &mut World) {
+        if w.t == self.rct_t && !w.rct_full {
+            return;
+        }
+        let n = (w.rings.len() as u32).min(self.atlas_rows);
+        let dt = (w.t - self.rct_t).clamp(0.0, RCT_REFRESH_S);
+        self.rct_t = w.t;
+        self.ranges.clear();
+        if n == 0 {
+            return;
+        }
+        if w.rct_full {
+            w.rct_full = false;
+            w.take_hot_rows();
+            self.ranges.push([0, n]);
+            return;
+        }
+        // Periodic refresh (slow fades), plus every row that changed recently.
+        let slice = ((n as f64 * dt / RCT_REFRESH_S).ceil() as u32).clamp(1, n);
+        let start = self.rct_cursor % n;
+        let end = (start + slice).min(n);
+        self.rct_cursor = if end >= n { 0 } else { end };
+        let mut rows: Vec<u32> = w.take_hot_rows().into_iter().filter(|&r| r < n).collect();
+        let mut ranges = coalesce(&mut rows);
+        ranges.push([start, end]);
+        self.ranges = ranges;
+        if self.ranges.len() > self.ranges_cap {
+            self.ranges_cap = self.ranges.len() * 2;
+            self.ranges_buf = ranges_buffer(&self.device, self.ranges_cap);
+            self.ranges_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ring colour ranges"),
+                layout: &self.ranges_bgl,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: self.ranges_buf.as_entire_binding() }],
+            });
         }
     }
 
@@ -653,7 +868,7 @@ impl Renderer {
             view_proj: cam.view_proj().to_cols_array_2d(),
             cam_pos: [cam.eye.x, cam.eye.y, cam.eye.z, w.t as f32],
             tower: [tw.height, tw.radius, tw.depth_step, w.y_top()],
-            tower2: [tw.depth_layers.max(1) as f32, tw.ribbon, tw.fill, tw.back_face],
+            tower2: [tw.depth_layers.max(1) as f32, tw.ribbon, tw.fill, if cam.inside { 1.0 } else { tw.back_face }],
             lut: [LUT_BINS as f32, w.rings.len() as f32, ATLAS_W as f32, BOOST_TAU],
             idle: [tw.idle_wound, tw.idle_open, 0.75, 0.22],
             col_fresh: rgb(&c.age.fresh, 1.0),
@@ -671,6 +886,7 @@ impl Renderer {
             screen: [iw as f32, ih as f32, 1.0 / iw.max(1) as f32, 1.0 / ih.max(1) as f32],
             post: [c.palette.exposure, c.palette.bloom, c.palette.grain, c.palette.vignette],
             post2: [smear_decay, (view.frame % 997) as f32, if self.out_format.is_srgb() { 0.0 } else { 1.0 }, 1.0 / BLOOM_LEVELS as f32],
+            rct: [self.atlas_rows as f32, RCT_BINS as f32, (ATLAS_W / RCT_BINS) as f32, self.n_bands as f32],
         }
     }
 
@@ -742,6 +958,21 @@ impl Renderer {
             view.bg_dirty = false;
         }
 
+        if !self.ranges.is_empty()
+            && let Some(tbg) = &self.tower_bg
+        {
+            let data: Vec<u32> = self.ranges.iter().flatten().copied().collect();
+            self.queue.write_buffer(&self.ranges_buf, 0, bytemuck::cast_slice(&data));
+            let mut p = pass(&mut enc, &self.rct_view, false, "ring colours");
+            p.set_pipeline(&self.ring_pipeline);
+            p.set_bind_group(0, &self.globals_bg, &[]);
+            p.set_bind_group(1, tbg, &[]);
+            p.set_bind_group(2, &self.ranges_bg, &[]);
+            p.draw(0..4, 0..self.ranges.len() as u32);
+            drop(p);
+            self.ranges.clear();
+        }
+
         // Profiling aid: GITS_SKIP=tower,sprites,bloom skips passes.
         let skip = std::env::var("GITS_SKIP").unwrap_or_default();
         {
@@ -750,9 +981,10 @@ impl Renderer {
             if let Some(tbg) = self.tower_bg.as_ref().filter(|_| !skip.contains("tower")) {
                 p.set_pipeline(&self.tower_pipeline);
                 p.set_bind_group(1, tbg, &[]);
+                p.set_bind_group(2, &self.rct_bg, &[]);
                 p.set_vertex_buffer(0, self.tower_vb.slice(..));
                 p.set_index_buffer(self.tower_ib.slice(..), wgpu::IndexFormat::Uint32);
-                p.draw_indexed(0..self.tower_index_count, 0, 0..w.cfg.tower.depth_layers.max(1));
+                p.draw_indexed(0..self.tower_index_count, 0, 0..self.n_bands);
             }
             if view.fx_count > 0 && !skip.contains("sprites") {
                 p.set_pipeline(&self.sprite_pipeline);

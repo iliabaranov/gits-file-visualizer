@@ -91,14 +91,17 @@ drift               = 0.0   # 0 = perfectly still; 1 = maximum gentle drift
 rotate_compositions = "off" # or a duration such as "3h"
 
 [monitors."*"]
-composition = "wide"        # wide | drum | dial | band (M0 implements wide)
+composition = "auto"        # wide | drum | dial | auto. auto: portrait screens get the drum
+                            # close-up, the largest landscape screen the wide shot, others the dial
 
 [performance]
-fps_active   = 24
-fps_calm     = 8
-fps_battery  = 6
-render_scale = 0.66         # internal resolution relative to the output
-max_internal_megapixels = 1.6   # cap, so 4K costs about the same as 1080p
+# The desktop itself already keeps an integrated GPU busy, so the wallpaper
+# stays at a low, steady rate; the motion smear hides the steps.
+fps_active   = 12           # while a deleted file's segment falls
+fps_calm     = 6            # everything else
+fps_battery  = 4            # cap for both while running on battery
+render_scale = 0.5          # internal resolution relative to the output
+max_internal_megapixels = 0.8   # cap per monitor, so 4K costs about the same as 1080p
 prefer_igpu  = true
 
 [privacy]

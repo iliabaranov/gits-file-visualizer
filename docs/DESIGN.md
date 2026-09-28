@@ -1,6 +1,6 @@
 # gits-file-visualizer — Design (v3)
 
-Status: M0 (look-dev), M1 (real data) and M2 (GNOME 42 embedding) done; next is M3 (efficiency). Decided items are marked ✅.
+Status: M0–M3 done, M4 (compositions) mostly done; installed on the development machine. Decided items are marked ✅.
 
 ## 1. Goal
 
@@ -449,7 +449,49 @@ Sections: `palette`, `events.{read,write,create,delete}`, `age`, `calm`,
   Renderer logs go to gnome-shell's journal. Clicking the desktop goes to DING
   as before (the clone is not reactive), which is intended.
 
-### Efficiency backlog for M3
+### M3 — efficiency (2026-09-27)
+
+Measured with `gits-render loadtest` and `tools/measure.sh` (system CPU,
+per-process CPU, and iGPU busy time from `rc6_residency_ms`):
+
+- GPU selection: Vulkan backend only (GL is a fallback), and the Vulkan driver
+  list is narrowed before loading (no lavapipe; no NVIDIA driver when an
+  iGPU exists and `prefer_igpu`). Renderer RSS 171 → 112 MB, no llvmpipe
+  threads, and the dGPU stays asleep.
+- Tower shader: split into an exact per-pixel path for sparse (unwound) rings
+  and a dense path that samples a per-ring colour texture (`ringcolor.wgsl`,
+  256 angle bins per ring, rows redrawn only when their ring changed plus a
+  rolling 2 s refresh). Each depth layer's cylinder is drawn only over the height
+  bands holding its rings. Live portrait frame 55 → 24 ms at the old
+  resolution; the drum shimmer is gone (frame-to-frame RMSE while retiring
+  rings 0.0067 → 0.0056).
+- Resolution: 0.5 scale, capped at 0.8 MP per monitor. Wallpaper windows are
+  created at that size and GNOME scales the clone up, so neither we nor the
+  compositor touch 4K pixels.
+- Frame rate follows *fast motion* only (a deleted segment falling, the loop
+  fade): 12 fps then, 6 fps otherwise, 4 on battery (`/sys/class/power_supply`).
+  Unwinding, flashes, labels and flakes all look fine at 6 fps with the smear.
+  Folder open/close uses hysteresis so steady activity does not keep rings
+  easing forever. Live data steps once per frame instead of 24×/s.
+- Result, three monitors, live data (~35 events/s): renderer 5.4% of one core +
+  gnome-shell 2.8%, iGPU ~19% busy with all visible; 0.5% + 0.4%, iGPU ~1% with
+  all covered. At the M2 settings (24 fps, 1.6 MP) the same test gave 12% CPU and
+  a ~40% busy iGPU, which is too much on a laptop whose iGPU also runs the
+  desktop.
+- Lesson: `bench` and the sandbox shell saturate the shared iGPU and made the
+  real desktop sluggish while testing. Builds now run under `nice -n 19`,
+  `sandbox-shell.sh stop` kills everything started in the sandbox, and cost is
+  measured with `loadtest` (real pacing) rather than `bench`.
+
+### M4 — compositions (2026-09-27)
+
+- `wide` (establishing shot), `drum` (beside the tower, the striations filling a
+  tall frame), `dial` (down the axis; back faces at full weight). `auto`
+  (default): portrait → drum, largest landscape → wide, others → dial. Per
+  connector via `[monitors."DP-1"]`. Not done: `band`, security-voice HUD
+  lines during surges, optional composition rotation.
+
+### Efficiency backlog
 
 - Tower fragment shader is ~65% of GPU time: cheaper samples in the dense drum,
   scissor to the tower's screen rectangle, fewer layers for back faces.

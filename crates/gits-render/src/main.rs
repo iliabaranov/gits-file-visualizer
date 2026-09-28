@@ -12,7 +12,7 @@ mod source;
 mod text;
 mod world;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use gits_core::config::Config;
 use std::path::PathBuf;
@@ -80,6 +80,9 @@ enum Cmd {
         /// Simulated seconds between captures.
         #[arg(long, default_value_t = 2.0)]
         every: f64,
+        /// wide | drum | dial | auto [default: [monitors."*"].composition].
+        #[arg(long)]
+        composition: Option<String>,
     },
     /// Measure frame cost headlessly.
     Bench {
@@ -91,6 +94,17 @@ enum Cmd {
         at: f64,
         #[arg(long, default_value_t = 120)]
         frames: u32,
+        /// wide | drum | dial | auto [default: [monitors."*"].composition].
+        #[arg(long)]
+        composition: Option<String>,
+    },
+    /// Measure the wallpaper's real CPU/GPU cost headlessly (real-time pacing).
+    Loadtest {
+        /// Monitor size WIDTHxHEIGHT; repeat for each monitor.
+        #[arg(long = "output", default_values_t = ["1920x1200".to_string(), "3840x2160".to_string(), "1440x2560".to_string()])]
+        outputs: Vec<String>,
+        #[arg(long, default_value_t = 30.0)]
+        seconds: f64,
     },
     /// Print statistics about the synthetic dataset and session.
     Stats {
@@ -142,10 +156,19 @@ fn main() -> Result<()> {
             let fell_back = fell_back.then(|| socket.clone());
             app::run(cfg, app::Options { config_path, outputs, wallpaper: true, warmup: 0.0, speed: None, collector, fell_back })
         }
-        Cmd::Snapshot { out, width, height, at, frames, every } => {
-            snapshot::run(cfg, snapshot::Options { out, width, height, at, frames, every }, collector)
+        Cmd::Snapshot { out, width, height, at, frames, every, composition } => {
+            snapshot::run(cfg, snapshot::Options { out, width, height, at, frames, every, composition }, collector)
         }
-        Cmd::Bench { width, height, at, frames } => snapshot::bench(cfg, width, height, at, frames, collector),
+        Cmd::Bench { width, height, at, frames, composition } => snapshot::bench(cfg, width, height, at, frames, collector, composition),
+        Cmd::Loadtest { outputs, seconds } => {
+            let sizes = outputs
+                .iter()
+                .map(|o| {
+                    o.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))).context("bad --output, expected WxH")
+                })
+                .collect::<Result<Vec<(u32, u32)>>>()?;
+            snapshot::loadtest(cfg, sizes, seconds, collector)
+        }
         Cmd::Stats { minutes, timeline } => {
             stats(cfg, minutes, timeline, collector);
             Ok(())

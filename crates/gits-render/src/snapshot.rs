@@ -1,6 +1,6 @@
 //! Headless rendering to PNG, for look-dev and regression snapshots.
 
-use crate::camera::Camera;
+use crate::camera::{Camera, Composition};
 use crate::gpu;
 use crate::renderer::Renderer;
 use crate::world::World;
@@ -15,6 +15,13 @@ pub struct Options {
     pub at: f64,
     pub frames: u32,
     pub every: f64,
+    /// None = as configured for "*" ("auto" picks by aspect ratio).
+    pub composition: Option<String>,
+}
+
+fn composition_for(cfg: &Config, requested: Option<&str>, width: u32, height: u32) -> Composition {
+    let name = requested.map(str::to_string).unwrap_or_else(|| cfg.monitor("*").composition);
+    Composition::parse(&name).unwrap_or(if height > width { Composition::Drum } else { Composition::Wide })
 }
 
 const DT: f64 = 1.0 / 24.0;
@@ -64,6 +71,7 @@ pub fn run(cfg: Config, opts: Options, collector: Option<std::path::PathBuf>) ->
     }
 
     let aspect = opts.width as f32 / opts.height as f32;
+    let composition = composition_for(&world.cfg, opts.composition.as_deref(), opts.width, opts.height);
     let start_t = world.t;
     for i in 0..opts.frames.max(1) {
         let capture_t = if live { start_t + WARM_SECONDS + i as f64 * opts.every } else { opts.at + i as f64 * opts.every };
@@ -78,7 +86,7 @@ pub fn run(cfg: Config, opts: Options, collector: Option<std::path::PathBuf>) ->
             if live {
                 std::thread::sleep(std::time::Duration::from_secs_f64(DT));
             }
-            let cam = Camera::wide(aspect, world.y_top(), world.cfg.camera.drift, world.t as f32);
+            let cam = Camera::new(composition, aspect, &world.cfg.tower, world.y_top(), world.cfg.camera.drift, world.t as f32);
             renderer.render(&mut view, &mut world, &cam, &out_view, DT as f32);
             let _ = g.device.poll(wgpu::PollType::Poll);
         }
@@ -98,7 +106,15 @@ pub fn run(cfg: Config, opts: Options, collector: Option<std::path::PathBuf>) ->
 
 /// Renders `frames` frames at 24 fps simulated time, waiting for the GPU after
 /// each one, and reports CPU (simulation + encoding) and total frame times.
-pub fn bench(cfg: Config, width: u32, height: u32, at: f64, frames: u32, collector: Option<std::path::PathBuf>) -> Result<()> {
+pub fn bench(
+    cfg: Config,
+    width: u32,
+    height: u32,
+    at: f64,
+    frames: u32,
+    collector: Option<std::path::PathBuf>,
+    composition: Option<String>,
+) -> Result<()> {
     let (_instance, g) = gpu::init_headless(cfg.performance.prefer_igpu)?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let scale = cfg.performance.render_scale;
@@ -125,11 +141,12 @@ pub fn bench(cfg: Config, width: u32, height: u32, at: f64, frames: u32, collect
         world.step(DT);
     }
     let aspect = width as f32 / height as f32;
+    let composition = composition_for(&world.cfg, composition.as_deref(), width, height);
     let (mut cpu, mut total) = (Vec::new(), Vec::new());
     for i in 0..frames + 10 {
         let t0 = std::time::Instant::now();
         world.step(DT);
-        let cam = Camera::wide(aspect, world.y_top(), world.cfg.camera.drift, world.t as f32);
+        let cam = Camera::new(composition, aspect, &world.cfg.tower, world.y_top(), world.cfg.camera.drift, world.t as f32);
         renderer.render(&mut view, &mut world, &cam, &out_view, DT as f32);
         let t1 = std::time::Instant::now();
         g.device.poll(wgpu::PollType::wait_indefinitely()).context("waiting for GPU")?;
@@ -200,5 +217,143 @@ fn save_png(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, w: 
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header()?;
     writer.write_image_data(&rgba)?;
+    Ok(())
+}
+
+fn process_cpu_seconds() -> f64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let after = stat.rsplit_once(')').map(|(_, r)| r).unwrap_or("");
+    let f: Vec<&str> = after.split_whitespace().collect();
+    let ticks: f64 = f.get(11).and_then(|v| v.parse().ok()).unwrap_or(0.0) + f.get(12).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    ticks / 100.0
+}
+
+fn gpu_idle_ms() -> Option<f64> {
+    let rd = std::fs::read_dir("/sys/class/drm").ok()?;
+    for e in rd.flatten() {
+        let p = e.path().join("gt/gt0/rc6_residency_ms");
+        if let Ok(v) = std::fs::read_to_string(&p) {
+            return v.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Integrated-GPU busy fraction over `secs` (not in RC6 idle), if measurable.
+fn gpu_busy_over(secs: f64) -> Option<f64> {
+    let (g0, t0) = (gpu_idle_ms()?, std::time::Instant::now());
+    std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+    let (g1, dt) = (gpu_idle_ms()?, t0.elapsed().as_secs_f64() * 1e3);
+    Some(1.0 - (g1 - g0) / dt)
+}
+
+/// Renders the wallpaper workload headlessly (one view per output at the
+/// wallpaper window size, real-time pacing with the configured frame-rate
+/// policy) and reports its CPU and GPU cost against a baseline measured first.
+pub fn loadtest(cfg: Config, outputs: Vec<(u32, u32)>, seconds: f64, collector: Option<std::path::PathBuf>) -> Result<()> {
+    use crate::camera::Composition;
+    let baseline = gpu_busy_over(5.0);
+    let (_instance, g) = gpu::init_headless(cfg.performance.prefer_igpu)?;
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format)?;
+    let comps = Composition::auto(&outputs);
+    struct Out {
+        view: crate::renderer::View,
+        tex: wgpu::TextureView,
+        size: (u32, u32),
+        comp: Composition,
+        next: std::time::Instant,
+        frames: u32,
+    }
+    let mut outs = vec![];
+    for (&(w, h), comp) in outputs.iter().zip(comps) {
+        let size = crate::app::wallpaper_size(&cfg, w, h);
+        let mut view = renderer.new_view();
+        renderer.resize(&mut view, size.0, size.1, 1.0, f32::MAX);
+        let tex = g
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("loadtest"),
+                size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        println!("output {w}x{h}: window {}x{} ({comp:?})", size.0, size.1);
+        outs.push(Out { view, tex, size, comp, next: std::time::Instant::now(), frames: 0 });
+    }
+    let mut world = World::new(cfg, renderer.max_rings(), collector);
+    if !world.is_synthetic() {
+        wait_for_data(&mut world)?;
+    }
+    let perf = world.cfg.performance.clone();
+    let battery = crate::app::on_battery();
+    let (cpu0, gpu0, t0) = (process_cpu_seconds(), gpu_idle_ms(), std::time::Instant::now());
+    let mut last = t0;
+    let mut accum = 0.0;
+    let mut fast_time = 0.0;
+    while t0.elapsed().as_secs_f64() < seconds {
+        let now = std::time::Instant::now();
+        let real_dt = now.duration_since(last).as_secs_f64();
+        last = now;
+        accum += real_dt;
+        if world.is_synthetic() {
+            while accum >= DT {
+                world.step(DT);
+                accum -= DT;
+            }
+        }
+        let fast = world.wants_fast_frames();
+        if fast {
+            fast_time += real_dt;
+        }
+        let mut fps = if fast { perf.fps_active } else { perf.fps_calm };
+        if battery {
+            fps = fps.min(perf.fps_battery);
+        }
+        let interval = std::time::Duration::from_secs_f64(1.0 / fps.max(1) as f64);
+        let mut wake = now + interval;
+        if !world.is_synthetic() && outs.iter().any(|o| now >= o.next) {
+            world.step(accum.min(0.5));
+            accum = 0.0;
+        }
+        for o in &mut outs {
+            if now >= o.next {
+                let cam = Camera::new(o.comp, o.size.0 as f32 / o.size.1 as f32, &world.cfg.tower, world.y_top(), 0.0, world.t as f32);
+                renderer.render(&mut o.view, &mut world, &cam, &o.tex, interval.as_secs_f32());
+                o.frames += 1;
+                o.next = now + interval;
+            }
+            wake = wake.min(o.next);
+        }
+        let _ = g.device.poll(wgpu::PollType::Poll);
+        std::thread::sleep(wake.saturating_duration_since(std::time::Instant::now()));
+    }
+    let _ = g.device.poll(wgpu::PollType::wait_indefinitely());
+    let secs = t0.elapsed().as_secs_f64();
+    let cpu = (process_cpu_seconds() - cpu0) / secs * 100.0;
+    let gpu = match (gpu0, gpu_idle_ms()) {
+        (Some(a), Some(b)) => Some((1.0 - (b - a) / (secs * 1e3)) * 100.0),
+        _ => None,
+    };
+    println!(
+        "{secs:.0} s, {:.0}% of the time at the active frame rate{}",
+        fast_time / secs * 100.0,
+        if battery { " (battery)" } else { "" }
+    );
+    for o in &outs {
+        println!("  {}x{} {:?}: {:.1} fps", o.size.0, o.size.1, o.comp, o.frames as f64 / secs);
+    }
+    println!("renderer CPU: {cpu:.1}% of one core");
+    match (baseline, gpu) {
+        (Some(b), Some(g)) => {
+            println!("iGPU busy: {g:.1}% (baseline without the renderer {:.1}%, so +{:.1} points)", b * 100.0, g - b * 100.0)
+        }
+        _ => println!("iGPU busy: not measurable on this GPU"),
+    }
     Ok(())
 }

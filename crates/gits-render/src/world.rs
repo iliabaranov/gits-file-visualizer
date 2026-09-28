@@ -13,6 +13,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 pub const ATLAS_W: u32 = 1024;
+/// Angle bins per ring in the ring colour texture (the tower's dense path).
+pub const RCT_BINS: u32 = 256;
+/// How long a ring's row keeps being redrawn every frame after it changed.
+const HOT_SECONDS: f32 = 3.0;
+/// Each depth layer's cylinder is drawn only over the height bands holding its
+/// rings. Bands closer than this are merged (each is padded by half of it).
+const BAND_MERGE: f32 = 0.04;
+/// At most this many bands per layer (the merge distance grows until it fits).
+const MAX_BANDS_PER_LAYER: usize = 128;
 pub const LUT_BINS: usize = 16384;
 pub const BOOST_TAU: f32 = 6.0;
 /// Max tilt of an unwound ring, in ring pitches (mirrors TILT in tower.wgsl).
@@ -27,6 +36,9 @@ const UNFOLD_ACT: f32 = 1.5;
 const UNFOLD_INTERVAL: f64 = 5.0;
 /// Ceiling for a folder's activity score.
 const DIR_ACT_MAX: f32 = 6.0;
+/// A folder unwinds when its activity rises above OPEN_ON and winds back below OPEN_OFF.
+const OPEN_ON: f32 = 1.5;
+const OPEN_OFF: f32 = 0.6;
 const OPEN_TAU: f32 = 2.2;
 const PRESENCE_TAU: f32 = 1.2;
 /// Rings leaving the tower ease out slowly so the drum barely drifts.
@@ -97,6 +109,9 @@ pub struct World {
     /// Centre height (distance from the tower top) and pitch of each ring.
     pub ring_s: Vec<f32>,
     pub ring_pitch: Vec<f32>,
+    /// Per depth layer, the height intervals (distance from the tower top)
+    /// holding its rings: `[s0, s1, layer, 0]`.
+    pub layer_bands: Vec<[f32; 4]>,
 
     pub dir_act: Vec<f32>,
     dir_open_target: Vec<f32>,
@@ -118,6 +133,12 @@ pub struct World {
     pub loop_fade: f32,
     /// Subtracted from the clock when computing file ages, so ages repeat per loop.
     age_offset: f64,
+
+    /// Ring colour texture: rebuild every row next frame.
+    pub rct_full: bool,
+    /// Per ring: redraw its row every frame until this time (see `take_hot_rows`).
+    hot_until: Vec<f32>,
+    hot: Vec<u32>,
 
     pub dirty_segs: Vec<u32>,
     pub dirty_rings: Vec<u32>,
@@ -182,9 +203,13 @@ impl World {
             lut: vec![0.0; LUT_BINS + 1],
             ring_s: vec![],
             ring_pitch: vec![],
+            layer_bands: vec![],
             dir_act: vec![],
             dir_open_target: vec![],
             dir_rings: vec![],
+            rct_full: true,
+            hot_until: vec![],
+            hot: vec![],
             dirty_segs: vec![],
             dirty_rings: vec![],
             lut_dirty: true,
@@ -225,6 +250,7 @@ impl World {
         }
         self.sync_spin();
         self.lut_dirty = true;
+        self.rct_full = true;
         relayout
     }
 
@@ -382,6 +408,10 @@ impl World {
         }
 
         self.ring_presence_target = vec![1.0; n_rings];
+        self.hot_until = vec![f32::MIN; n_rings];
+        self.hot.clear();
+        self.rct_full = true;
+        self.mark_animated_rows();
         self.layout_t = self.t;
         self.layout_version += 1;
         self.needs_relayout = false;
@@ -461,7 +491,9 @@ impl World {
                 {
                     // New file inside a collapsed subtree: its aggregate flashes.
                     g.t_write = tf;
+                    let ring = g.ring;
                     self.dirty_segs.push(a);
+                    self.mark_hot(ring, tf + HOT_SECONDS);
                 }
                 touched.push(dir as u32);
                 continue;
@@ -506,6 +538,7 @@ impl World {
                 EventKind::Create => unreachable!(),
             }
             self.dirty_segs.push(seg);
+            self.mark_hot(ring, tf + HOT_SECONDS);
             // Directory tick flashes with any activity inside it.
             if let Some(&first) = self.layout.dir_first_ring.get(dir)
                 && first != NONE
@@ -515,6 +548,7 @@ impl World {
             {
                 self.segs[mark as usize].t_read = tf;
                 self.dirty_segs.push(mark);
+                self.mark_hot(first, tf + HOT_SECONDS);
             }
             self.fx.on_event(ev.kind, ev.file, seg, t);
             if ev.kind == EventKind::Delete
@@ -569,6 +603,54 @@ impl World {
         // The directory tick is the first segment placed on the band's first ring.
         let s = self.rings.get(first_ring as usize)?.first_seg;
         self.segs.get(s as usize).filter(|g| g.flags & layout::SEG_DIR != 0).map(|_| s)
+    }
+
+    /// Keeps ring `ring`'s colour-texture row updated every frame until `until`.
+    fn mark_hot(&mut self, ring: u32, until: f32) {
+        let Some(h) = self.hot_until.get_mut(ring as usize) else { return };
+        if *h < self.t as f32 {
+            self.hot.push(ring);
+        }
+        *h = h.max(until);
+    }
+
+    /// Rows with growth/retract animations still to play (after a relayout or restore).
+    fn mark_animated_rows(&mut self) {
+        let t = self.t as f32;
+        let grow = self.cfg.events.create.grow.0;
+        for i in 0..self.segs.len() {
+            let (s, ring) = (&self.segs[i], self.segs[i].ring);
+            let until = (s.t_create + grow).max(s.t_retract + 2.5);
+            if until > t {
+                self.mark_hot(ring, until + 0.5);
+            }
+        }
+    }
+
+    /// Rows of the ring colour texture that must be redrawn this frame.
+    pub fn take_hot_rows(&mut self) -> Vec<u32> {
+        let t = self.t as f32;
+        let hot_until = &self.hot_until;
+        self.hot.retain(|&r| hot_until.get(r as usize).is_some_and(|&u| u >= t));
+        self.hot.clone()
+    }
+
+    /// True while something on screen moves fast enough to need the active
+    /// frame rate: a deleted file's segment falling, the loop wind-down fade.
+    /// Colour changes, labels, flakes, new files growing, the slow ring spin and
+    /// folders unwinding (a ~10 s ease) look fine at the calm rate.
+    pub fn wants_fast_frames(&self) -> bool {
+        self.motion_reason().is_some()
+    }
+
+    pub fn motion_reason(&self) -> Option<&'static str> {
+        if self.fx.in_motion() {
+            Some("falling")
+        } else if self.loop_fade > 0.0 && self.loop_fade < 1.0 {
+            Some("loop fade")
+        } else {
+            None
+        }
     }
 
     fn looping(&self) -> bool {
@@ -736,6 +818,8 @@ impl World {
             }
         }
         self.dirty_segs.extend(0..self.segs.len() as u32);
+        self.rct_full = true;
+        self.mark_animated_rows();
         self.fx.cards.clear();
         self.fx.probe.target = None;
     }
@@ -788,13 +872,24 @@ impl World {
         for a in &mut self.dir_act {
             *a *= decay;
         }
+        // Open/closed with hysteresis: a folder opens above OPEN_ON and closes
+        // below OPEN_OFF, so a steadily busy folder settles instead of easing
+        // forever. Already-open folders are preferred when more than
+        // `max_open_dirs` qualify.
         let max_open = self.cfg.calm.max_open_dirs;
-        let mut top: Vec<(f32, usize)> = self.dir_act.iter().enumerate().filter(|(_, a)| **a > 0.9).map(|(i, a)| (*a, i)).collect();
-        top.sort_by(|a, b| b.0.total_cmp(&a.0));
-        top.truncate(max_open);
+        let targets = &self.dir_open_target;
+        let mut cand: Vec<(f32, usize)> = self
+            .dir_act
+            .iter()
+            .enumerate()
+            .filter(|&(d, &a)| a >= OPEN_ON || (a >= OPEN_OFF && targets.get(d).is_some_and(|&t| t > 0.5)))
+            .map(|(d, &a)| (a + if targets.get(d).is_some_and(|&t| t > 0.5) { OPEN_ON } else { 0.0 }, d))
+            .collect();
+        cand.sort_by(|a, b| b.0.total_cmp(&a.0));
+        cand.truncate(max_open);
         self.dir_open_target.iter_mut().for_each(|x| *x = 0.0);
-        for (a, d) in top {
-            self.dir_open_target[d] = smoothstep(0.9, 3.0, a);
+        for (_, d) in cand {
+            self.dir_open_target[d] = 1.0;
         }
     }
 
@@ -803,6 +898,7 @@ impl World {
         let kp = 1.0 - (-dt / PRESENCE_TAU).exp();
         let kp_out = 1.0 - (-dt / PRESENCE_OUT_TAU).exp();
         let mut changed = false;
+        let mut opened = vec![];
         for (i, r) in self.layout.rings.iter().enumerate() {
             let target = self.dir_open_target.get(r.dir as usize).copied().unwrap_or(0.0);
             let o = &mut self.ring_open[i];
@@ -810,6 +906,7 @@ impl World {
             if d.abs() > 1e-4 {
                 *o += if d.abs() < 2e-3 { d } else { d * ko };
                 changed = true;
+                opened.push(i as u32);
             }
             let p = &mut self.ring_presence[i];
             let pt = self.ring_presence_target.get(i).copied().unwrap_or(1.0);
@@ -821,6 +918,11 @@ impl World {
             }
         }
         self.animating = changed;
+        // Opening changes a ring's colours ("scanned" arcs, wider gaps).
+        let until = self.t as f32 + 0.5;
+        for r in opened {
+            self.mark_hot(r, until);
+        }
         if changed {
             self.open_dirty = true;
             self.lut_dirty = true;
@@ -877,7 +979,37 @@ impl World {
                 if p <= 1e-9 { ri as f32 } else { ri as f32 + ((s - ys[ri]) / p).clamp(0.0, 0.9999) }
             };
         }
+        self.update_layer_bands();
         self.lut_dirty = true;
+    }
+
+    fn update_layer_bands(&mut self) {
+        let layers = self.cfg.tower.depth_layers.max(1) as usize;
+        let h = self.cfg.tower.height;
+        let mut all = vec![];
+        for layer in 0..layers {
+            let mut merge = BAND_MERGE;
+            let bands = loop {
+                let mut bands: Vec<[f32; 2]> = vec![];
+                for (i, r) in self.layout.rings.iter().enumerate() {
+                    let p = self.ring_pitch.get(i).copied().unwrap_or(0.0);
+                    if (r.depth as usize).min(layers - 1) != layer || p <= 0.0 {
+                        continue;
+                    }
+                    let (s0, s1) = (self.ring_s[i] - p * 0.5 - merge * 0.5, self.ring_s[i] + p * 0.5 + merge * 0.5);
+                    match bands.last_mut() {
+                        Some(last) if s0 <= last[1] => last[1] = last[1].max(s1),
+                        _ => bands.push([s0, s1]),
+                    }
+                }
+                if bands.len() <= MAX_BANDS_PER_LAYER {
+                    break bands;
+                }
+                merge *= 2.0;
+            };
+            all.extend(bands.into_iter().map(|b| [b[0].clamp(0.0, h), b[1].clamp(0.0, h), layer as f32, 0.0]));
+        }
+        self.layer_bands = all;
     }
 
     /// Ring rotation (turns) at time `t`; mirrors `ring_phase` in tower.wgsl.

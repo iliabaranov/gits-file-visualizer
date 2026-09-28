@@ -72,6 +72,10 @@ start)
 stop)
   if [[ -f "$SB/pid" ]]; then kill -- -"$(cat "$SB/pid")" 2>/dev/null || kill "$(cat "$SB/pid")" 2>/dev/null || true; fi
   pkill -f "gnome-shell --headless --wayland --no-x11" 2>/dev/null || true
+  # Anything else started inside the sandbox (renderer, DING, ibus, portals...).
+  for p in $(pgrep -u "$USER"); do
+    grep -qs "XDG_RUNTIME_DIR=$SB/run" "/proc/$p/environ" && kill "$p" 2>/dev/null
+  done
   rm -f "$SB/pid"; echo stopped ;;
 eval)
   call --dest org.gnome.Shell --object-path /org/gnome/Shell --method org.gnome.Shell.Eval "$2" ;;

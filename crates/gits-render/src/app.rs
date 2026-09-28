@@ -6,7 +6,7 @@
 //!   extension sends control lines on stdin (see [`Control`]); stdin closing
 //!   means the extension is gone, and the renderer exits.
 
-use crate::camera::Camera;
+use crate::camera::{Camera, Composition};
 use crate::gpu::{self, Gpu};
 use crate::renderer::{Renderer, View};
 use crate::world::{Notice, World};
@@ -31,6 +31,24 @@ const SIM_DT: f64 = 1.0 / 24.0;
 const HIDDEN_STEP: Duration = Duration::from_secs(1);
 /// How often wallpaper mode looks for a collector that was not running at start.
 const COLLECTOR_PROBE: Duration = Duration::from_secs(10);
+/// How often the power source is checked (battery caps the frame rate).
+const POWER_CHECK: Duration = Duration::from_secs(30);
+
+/// True when running on battery: a battery exists and no mains/USB supply is online.
+pub fn on_battery() -> bool {
+    let Ok(rd) = std::fs::read_dir("/sys/class/power_supply") else { return false };
+    let mut battery = false;
+    for e in rd.flatten() {
+        let p = e.path();
+        let kind = std::fs::read_to_string(p.join("type")).unwrap_or_default();
+        match kind.trim() {
+            "Battery" => battery = true,
+            "Mains" | "USB" if std::fs::read_to_string(p.join("online")).is_ok_and(|v| v.trim() == "1") => return false,
+            _ => {}
+        }
+    }
+    battery
+}
 
 pub const APP_ID: &str = "io.github.iliabaranov.GitsFileVisualizer";
 /// Window title prefix the GNOME extension uses to map windows to monitors.
@@ -74,6 +92,16 @@ pub struct Options {
     /// "auto" found no collector and fell back to synthetic data; this socket
     /// is probed periodically in wallpaper mode.
     pub fell_back: Option<PathBuf>,
+}
+
+/// Wallpaper windows are only as large as the internal resolution; GNOME
+/// scales them up to the monitor (it is soft glow, and this saves both our
+/// final pass and the compositor's work at 4K).
+pub fn wallpaper_size(cfg: &Config, width: u32, height: u32) -> (u32, u32) {
+    let perf = &cfg.performance;
+    let area = width as f64 * height as f64;
+    let s = (perf.render_scale as f64).clamp(0.2, 1.0).min((perf.max_internal_megapixels.max(0.1) as f64 * 1.0e6 / area).sqrt());
+    (((width as f64 * s).round() as u32).max(16), ((height as f64 * s).round() as u32).max(16))
 }
 
 /// Control lines from the GNOME extension (wallpaper mode, stdin).
@@ -123,6 +151,7 @@ fn spawn_stdin_reader(proxy: EventLoopProxy<Control>) {
 
 struct Output {
     spec: OutputSpec,
+    composition: Composition,
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     surface_cfg: wgpu::SurfaceConfiguration,
@@ -156,6 +185,8 @@ struct App {
     cfg_mtime: Option<SystemTime>,
     last_cfg_check: Instant,
     next_probe: Instant,
+    next_power_check: Instant,
+    battery: bool,
     locked: bool,
     state: Option<State>,
     error: Option<anyhow::Error>,
@@ -174,6 +205,8 @@ pub fn run(cfg: Config, opts: Options) -> Result<()> {
         cfg_mtime,
         last_cfg_check: Instant::now(),
         next_probe: Instant::now() + COLLECTOR_PROBE,
+        next_power_check: Instant::now(),
+        battery: false,
         locked: false,
         state: None,
         error: None,
@@ -186,10 +219,25 @@ pub fn run(cfg: Config, opts: Options) -> Result<()> {
 }
 
 impl App {
-    fn composition_warned(&self, spec: &OutputSpec) {
-        let c = self.cfg.monitor(&spec.name).composition;
-        if c != "wide" {
-            log::warn!("{}: composition '{c}' is not implemented yet; using 'wide'", spec.name);
+    /// Composition per output: `[monitors."<connector>"]`, then `[monitors."*"]`;
+    /// "auto" picks by shape (see `Composition::auto`).
+    fn compositions(&self) -> Vec<Composition> {
+        let sizes: Vec<(u32, u32)> = self.opts.outputs.iter().map(|o| (o.width, o.height)).collect();
+        let auto = Composition::auto(&sizes);
+        self.opts.outputs.iter().zip(auto).map(|(o, a)| Composition::parse(&self.cfg.monitor(&o.name).composition).unwrap_or(a)).collect()
+    }
+
+    fn wallpaper_size(&self, spec: &OutputSpec) -> (u32, u32) {
+        wallpaper_size(&self.cfg, spec.width, spec.height)
+    }
+
+    /// Internal render scale for an output: wallpaper windows are already at
+    /// the internal resolution.
+    fn render_scale(&self) -> (f32, f32) {
+        if self.opts.wallpaper {
+            (1.0, f32::MAX)
+        } else {
+            (self.cfg.performance.render_scale, self.cfg.performance.max_internal_megapixels)
         }
     }
 
@@ -198,10 +246,12 @@ impl App {
         for spec in &self.opts.outputs {
             let mut attrs = Window::default_attributes();
             if self.opts.wallpaper {
+                let (w, h) = self.wallpaper_size(spec);
                 attrs = attrs
                     .with_title(format!("{WALLPAPER_TITLE}{}", spec.index))
                     .with_decorations(false)
-                    .with_inner_size(LogicalSize::new(spec.width, spec.height));
+                    .with_resizable(false)
+                    .with_inner_size(LogicalSize::new(w, h));
             } else {
                 attrs = attrs.with_title("gits-file-visualizer").with_inner_size(PhysicalSize::new(spec.width, spec.height));
             }
@@ -234,8 +284,10 @@ impl App {
         let renderer = Renderer::new(g.device.clone(), g.queue.clone(), format)?;
         let now = Instant::now();
         let mut outputs = Vec::new();
-        for (spec, window, surface) in windows {
-            self.composition_warned(&spec);
+        let compositions = self.compositions();
+        let (scale, max_mp) = self.render_scale();
+        for ((spec, window, surface), composition) in windows.into_iter().zip(compositions) {
+            log::info!("{}: composition {composition:?}", spec.name);
             let size = window.inner_size();
             let mut surface_cfg = surface
                 .get_default_config(&g.adapter, size.width.max(1), size.height.max(1))
@@ -245,14 +297,9 @@ impl App {
             surface_cfg.desired_maximum_frame_latency = 2;
             surface.configure(&g.device, &surface_cfg);
             let mut view = renderer.new_view();
-            renderer.resize(
-                &mut view,
-                surface_cfg.width,
-                surface_cfg.height,
-                self.cfg.performance.render_scale,
-                self.cfg.performance.max_internal_megapixels,
-            );
+            renderer.resize(&mut view, surface_cfg.width, surface_cfg.height, scale, max_mp);
             outputs.push(Output {
+                composition,
                 spec,
                 window,
                 surface,
@@ -307,15 +354,10 @@ impl App {
                 s.world.notice =
                     Some(Notice { text: format!("config reloaded: {}", path.display()), error: false, until: s.world.t + 3.0 });
                 let perf = &self.cfg.performance;
+                let (scale, max_mp) = if self.opts.wallpaper { (1.0, f32::MAX) } else { (perf.render_scale, perf.max_internal_megapixels) };
                 for o in &mut s.outputs {
                     o.view.invalidate_background();
-                    s.renderer.resize(
-                        &mut o.view,
-                        o.surface_cfg.width,
-                        o.surface_cfg.height,
-                        perf.render_scale,
-                        perf.max_internal_megapixels,
-                    );
+                    s.renderer.resize(&mut o.view, o.surface_cfg.width, o.surface_cfg.height, scale, max_mp);
                 }
             }
             Err(e) => {
@@ -354,6 +396,16 @@ impl App {
         let real_dt = now.duration_since(s.last_step).as_secs_f64();
         s.last_step = now;
         s.sim_accum += real_dt * speed;
+        if !s.world.is_synthetic() {
+            // Live data: one step per frame (fixed steps only matter for the
+            // synthetic session's reproducibility), in chunks of at most 0.5 s.
+            while s.sim_accum > 1e-4 {
+                let dt = s.sim_accum.min(0.5);
+                s.world.step(dt);
+                s.sim_accum -= dt;
+            }
+            return real_dt;
+        }
         let mut steps = 0;
         while s.sim_accum >= SIM_DT && steps < 48 {
             s.world.step(SIM_DT);
@@ -391,7 +443,7 @@ impl App {
         };
         let out = tex.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let aspect = o.surface_cfg.width as f32 / o.surface_cfg.height.max(1) as f32;
-        let cam = Camera::wide(aspect, s.world.y_top(), s.world.cfg.camera.drift, s.world.t as f32);
+        let cam = Camera::new(o.composition, aspect, &s.world.cfg.tower, s.world.y_top(), s.world.cfg.camera.drift, s.world.t as f32);
         s.renderer.render(&mut o.view, &mut s.world, &cam, &out, real_dt as f32);
         o.window.pre_present_notify();
         s.gpu.queue.present(tex);
@@ -400,13 +452,14 @@ impl App {
         let elapsed = o.stats_since.elapsed().as_secs_f64();
         if elapsed >= 5.0 {
             log::debug!(
-                "{}: {:.1} fps, sim t={:.0}s phase={} activity={:.1}/s rings={}",
+                "{}: {:.1} fps, sim t={:.0}s phase={} activity={:.1}/s rings={} motion={}",
                 o.spec.name,
                 o.frames as f64 / elapsed,
                 s.world.t,
                 s.world.phase_name(),
                 s.world.activity,
-                s.world.rings.len()
+                s.world.rings.len(),
+                s.world.motion_reason().unwrap_or("none")
             );
             o.frames = 0;
             o.stats_since = Instant::now();
@@ -467,7 +520,9 @@ impl ApplicationHandler<Control> for App {
                     o.surface_cfg.width = size.width;
                     o.surface_cfg.height = size.height;
                     o.surface.configure(&s.gpu.device, &o.surface_cfg);
-                    s.renderer.resize(&mut o.view, size.width, size.height, perf.render_scale, perf.max_internal_megapixels);
+                    let (scale, max_mp) =
+                        if self.opts.wallpaper { (1.0, f32::MAX) } else { (perf.render_scale, perf.max_internal_megapixels) };
+                    s.renderer.resize(&mut o.view, size.width, size.height, scale, max_mp);
                     o.view.invalidate_background();
                     o.window.request_redraw();
                 }
@@ -480,6 +535,14 @@ impl ApplicationHandler<Control> for App {
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.check_config();
         self.probe_collector();
+        if Instant::now() >= self.next_power_check {
+            self.next_power_check = Instant::now() + POWER_CHECK;
+            let b = on_battery();
+            if b != self.battery {
+                log::info!("power: {}", if b { "battery (frame rate capped)" } else { "mains" });
+                self.battery = b;
+            }
+        }
         let perf = self.cfg.performance.clone();
         let locked = self.locked;
         let Some(s) = &mut self.state else { return };
@@ -491,8 +554,12 @@ impl ApplicationHandler<Control> for App {
             self.advance();
         }
         let Some(s) = &mut self.state else { return };
-        let busy = s.world.activity > 0.5 || s.world.animating || s.world.fx.alive();
-        let fps = if busy { perf.fps_active } else { perf.fps_calm }.max(1);
+        let busy = s.world.wants_fast_frames();
+        let mut fps = if busy { perf.fps_active } else { perf.fps_calm };
+        if self.battery {
+            fps = fps.min(perf.fps_battery);
+        }
+        let fps = fps.max(1);
         let mut wake = now + HIDDEN_STEP;
         for o in &mut s.outputs {
             if o.paused(locked) {
