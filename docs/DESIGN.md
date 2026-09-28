@@ -559,6 +559,38 @@ agrees (and also lists flicker and rotation).
 - `tools/stress.py` drives real file activity in `~/gits-stress`.
 - One copy of the verse on the wall is the English translation.
 
+### Upscaling, whole-tower framing, system monitor (2026-09-28)
+
+- Wide shot: the camera distance and height are fitted so the whole tower and
+  the floor lights fill the frame, centred, for any screen shape (was: the top
+  left the frame). The calligraphy was rearranged around the smaller tower.
+- Upscaling. Temporal upscalers (TAA-U, FSR 2, DLSS) were ruled out: they need
+  motion vectors for the spinning rings and ghost where those are wrong, which
+  is the blur/trail problem from the comfort pass (and DLSS is NVIDIA-only).
+  Used instead, the spatial approach plus HUD-at-native: on the discrete GPU
+  the wallpaper window stays at native size, the scene (tower, chamber, flakes)
+  is drawn at `render_scale` (0.58) and the final pass upscales it with
+  Catmull-Rom from 5 bilinear taps, a little unsharp masking
+  (`upscale_sharpness`), clamped to the 2x2 nearest texels (no ringing on
+  bright thin lines). Callout text, leader lines, notices and the system
+  monitor are then drawn at native resolution onto the finished frame
+  (`fs_hud`: same tonemap, additive). The integrated GPU keeps the small
+  window that GNOME scales up (least memory bandwidth), text included.
+- Tower mesh 256 → 96 slices per band (silhouette within 0.2 px of a circle at
+  4K): the vertex/raster work did not scale with resolution.
+- Measured (NVIDIA board power, 3 monitors, 60 fps; the live wallpaper paused
+  so it does not share the GPU): native 63 W; 0.67 ~54 W; 0.58 ~36 W; 0.5 ~35 W;
+  without the tower pass ~14 W, so the tower's fragment shader is still
+  nearly all of it. The driver keeps top clocks until the load falls under a
+  threshold, hence the jump between 0.67 and 0.58.
+- System monitor (`sysmon.rs`): CPU (/proc/stat), memory (/proc/meminfo), GPU
+  busy (NVML via dlopen on NVIDIA; RC6 residency on Intel; gpu_busy_percent on
+  AMD), power (battery discharge watts; on mains the GPU's watts from NVML/AMD
+  hwmon; RAPL needs root), network (/proc/net/dev, virtual interfaces skipped).
+  Sampled once a second on a thread, only while visible; drawn in the lower
+  right of the main monitor with one-minute sparklines scrolling smoothly
+  (~2 px/s), callout rows avoid it.
+
 ### Efficiency backlog
 
 - Tower fragment shader is ~65% of GPU time: cheaper samples in the dense drum,

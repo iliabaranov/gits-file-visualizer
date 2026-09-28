@@ -50,6 +50,11 @@ pub fn run(cfg: Config, opts: Options, collector: Option<std::path::PathBuf>) ->
     let mut view = renderer.new_view();
     let (sc, mp) = cfg.performance.resolution(g.is_integrated());
     renderer.resize(&mut view, opts.width, opts.height, sc, mp);
+    let composition = composition_for(&cfg, opts.composition.as_deref(), opts.width, opts.height);
+    if cfg.system_monitor.show == "all" || (cfg.system_monitor.show == "main" && composition == crate::camera::Composition::Wide) {
+        renderer.sysmon = Some(crate::sysmon::SysMon::start(g.adapter.get_info().vendor));
+        view.system_monitor = true;
+    }
     let mut world = World::new(cfg, renderer.max_rings(), collector);
     let live = !world.is_synthetic();
     if live {
@@ -72,7 +77,6 @@ pub fn run(cfg: Config, opts: Options, collector: Option<std::path::PathBuf>) ->
     }
 
     let aspect = opts.width as f32 / opts.height as f32;
-    let composition = composition_for(&world.cfg, opts.composition.as_deref(), opts.width, opts.height);
     let start_t = world.t;
     for i in 0..opts.frames.max(1) {
         let capture_t = if live { start_t + WARM_SECONDS + i as f64 * opts.every } else { opts.at + i as f64 * opts.every };
@@ -257,6 +261,10 @@ pub fn loadtest(cfg: Config, outputs: Vec<(u32, u32)>, seconds: f64, collector: 
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format, crate::renderer::Quality::for_gpu(g.is_integrated()))?;
     let comps = Composition::auto(&outputs);
+    let main = crate::app::main_output(&outputs, &comps);
+    if cfg.system_monitor.show != "off" {
+        renderer.sysmon = Some(crate::sysmon::SysMon::start(g.adapter.get_info().vendor));
+    }
     struct Out {
         view: crate::renderer::View,
         tex: wgpu::TextureView,
@@ -266,11 +274,16 @@ pub fn loadtest(cfg: Config, outputs: Vec<(u32, u32)>, seconds: f64, collector: 
         frames: u32,
     }
     let mut outs = vec![];
-    for (&(w, h), comp) in outputs.iter().zip(comps) {
-        let (sc, mp) = cfg.performance.resolution(g.is_integrated());
-        let size = crate::app::wallpaper_size(w, h, sc, mp);
+    for (i, (&(w, h), comp)) in outputs.iter().zip(comps).enumerate() {
+        let size = crate::app::wallpaper_size(w, h, &cfg.performance, g.is_integrated());
+        let (sc, mp) = crate::app::scene_scale(&cfg.performance, true, g.is_integrated());
         let mut view = renderer.new_view();
-        renderer.resize(&mut view, size.0, size.1, 1.0, f32::MAX);
+        renderer.resize(&mut view, size.0, size.1, sc, mp);
+        view.system_monitor = match cfg.system_monitor.show.as_str() {
+            "all" => true,
+            "off" => false,
+            _ => i == main,
+        };
         let tex = g
             .device
             .create_texture(&wgpu::TextureDescriptor {
@@ -284,7 +297,8 @@ pub fn loadtest(cfg: Config, outputs: Vec<(u32, u32)>, seconds: f64, collector: 
                 view_formats: &[],
             })
             .create_view(&wgpu::TextureViewDescriptor::default());
-        println!("output {w}x{h}: window {}x{} ({comp:?})", size.0, size.1);
+        let (iw, ih) = view.internal_size();
+        println!("output {w}x{h}: window {}x{}, scene {iw}x{ih} ({comp:?})", size.0, size.1);
         outs.push(Out { view, tex, size, comp, next: std::time::Instant::now(), frames: 0 });
     }
     let mut world = World::new(cfg, renderer.max_rings(), collector);

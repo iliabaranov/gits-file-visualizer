@@ -23,7 +23,7 @@ struct Globals {
     screen: vec4<f32>,      // w, h, 1/w, 1/h (internal)
     post: vec4<f32>,        // exposure, bloom, grain, vignette
     post2: vec4<f32>,       // smear decay, seed, manual gamma, 1/bloom levels
-    rct: vec4<f32>,         // ring colour texture rows, bins, atlas texels per bin, _
+    rct: vec4<f32>,         // ring colour texture rows, bins, atlas texels per bin, upscale sharpness
 };
 
 @group(0) @binding(0) var<uniform> G: Globals;
@@ -43,6 +43,24 @@ fn vs_full(@builtin(vertex_index) i: u32) -> FullOut {
     o.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
     o.uv = vec2<f32>(x, y);
     return o;
+}
+
+// Tonemap on the brightest channel so saturated gold and crimson keep their
+// hue, then let only the very brightest highlights drift toward white.
+fn tonemap(hdr: vec3<f32>) -> vec3<f32> {
+    let m = max(max(hdr.r, hdr.g), max(hdr.b, 1e-5));
+    let mapped = 1.0 - exp(-m);
+    let col = hdr * (mapped / m);
+    return mix(col, vec3<f32>(mapped), smoothstep(0.75, 1.0, mapped) * 0.3);
+}
+
+// Display encoding (sRGB outputs encode in hardware).
+fn encode_out(c: vec3<f32>) -> vec3<f32> {
+    let col = max(c, vec3<f32>(0.0));
+    if (G.post2.z > 0.5) {
+        return pow(col, vec3<f32>(1.0 / 2.2));
+    }
+    return col;
 }
 
 fn hash12(p: vec2<f32>) -> f32 {

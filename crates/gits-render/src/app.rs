@@ -11,7 +11,7 @@ use crate::gpu::{self, Gpu};
 use crate::renderer::{Renderer, View};
 use crate::world::{Notice, World};
 use anyhow::{Context, Result};
-use gits_core::config::Config;
+use gits_core::config::{Config, Performance};
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -101,13 +101,32 @@ pub struct Options {
     pub fell_back: Option<PathBuf>,
 }
 
-/// Wallpaper windows are only as large as the internal resolution; GNOME
-/// scales them up to the monitor (it is soft glow, and this saves both our
-/// final pass and the compositor's work at 4K).
-pub fn wallpaper_size(width: u32, height: u32, scale: f32, max_megapixels: f32) -> (u32, u32) {
+/// Size of a monitor's wallpaper window. On the discrete GPU it is the
+/// monitor's size: the scene is drawn smaller and upscaled by the renderer,
+/// with text at full resolution. On an integrated GPU the window itself is
+/// small and GNOME scales it up, which saves the most memory bandwidth.
+pub fn wallpaper_size(width: u32, height: u32, perf: &Performance, integrated: bool) -> (u32, u32) {
+    if !integrated {
+        return (width, height);
+    }
+    let (scale, max_megapixels) = perf.resolution(true);
     let area = width as f64 * height as f64;
     let s = (scale as f64).clamp(0.2, 1.0).min((max_megapixels.max(0.1) as f64 * 1.0e6 / area).sqrt());
     (((width as f64 * s).round() as u32).max(16), ((height as f64 * s).round() as u32).max(16))
+}
+
+/// Scene resolution (scale, megapixel cap) relative to a view's window.
+pub fn scene_scale(perf: &Performance, wallpaper: bool, integrated: bool) -> (f32, f32) {
+    // Integrated wallpaper windows are already small (see wallpaper_size).
+    if wallpaper && integrated { (1.0, f32::INFINITY) } else { perf.resolution(integrated) }
+}
+
+/// The monitor that gets the system readout with `show = "main"`: the largest
+/// one showing the wide shot, else the largest.
+pub fn main_output(sizes: &[(u32, u32)], compositions: &[Composition]) -> usize {
+    let area = |i: usize| sizes[i].0 as u64 * sizes[i].1 as u64;
+    let wide = (0..sizes.len()).filter(|&i| compositions.get(i) == Some(&Composition::Wide)).max_by_key(|&i| area(i));
+    wide.or_else(|| (0..sizes.len()).max_by_key(|&i| area(i))).unwrap_or(0)
 }
 
 /// Control lines from the GNOME extension (wallpaper mode, stdin).
@@ -240,16 +259,13 @@ impl App {
         self.opts.outputs.iter().zip(auto).map(|(o, a)| Composition::parse(&self.cfg.monitor(&o.name).composition).unwrap_or(a)).collect()
     }
 
-    /// Wallpaper windows are created at the internal resolution (GNOME scales
-    /// the clone up); the look-dev window renders internally at that scale.
     fn wallpaper_size(&self, spec: &OutputSpec, integrated: bool) -> (u32, u32) {
-        let (s, mp) = self.cfg.performance.resolution(integrated);
-        wallpaper_size(spec.width, spec.height, s, mp)
+        wallpaper_size(spec.width, spec.height, &self.cfg.performance, integrated)
     }
 
-    /// Internal render scale for a view.
+    /// Scene render scale for a view.
     fn render_scale(&self, integrated: bool) -> (f32, f32) {
-        if self.opts.wallpaper { (1.0, f32::INFINITY) } else { self.cfg.performance.resolution(integrated) }
+        scene_scale(&self.cfg.performance, self.opts.wallpaper, integrated)
     }
 
     fn target_fps(&self) -> u32 {
@@ -302,7 +318,10 @@ impl App {
         let caps = windows[0].2.get_capabilities(&g.adapter);
         let format =
             caps.formats.iter().copied().find(|f| f.is_srgb()).or(caps.formats.first().copied()).context("surface has no formats")?;
-        let renderer = Renderer::new(g.device.clone(), g.queue.clone(), format, crate::renderer::Quality::for_gpu(g.is_integrated()))?;
+        let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format, crate::renderer::Quality::for_gpu(g.is_integrated()))?;
+        if self.cfg.system_monitor.show != "off" {
+            renderer.sysmon = Some(crate::sysmon::SysMon::start(g.adapter.get_info().vendor));
+        }
         let now = Instant::now();
         let mut outputs = Vec::new();
         let compositions = self.compositions();
@@ -345,6 +364,7 @@ impl App {
             });
         }
 
+        set_system_monitor(&mut outputs, &self.cfg);
         let mut world = World::new(self.cfg.clone(), renderer.max_rings(), self.opts.collector.clone());
         if self.opts.fell_back.is_some() && !self.opts.wallpaper {
             world.notice = Some(Notice {
@@ -385,8 +405,11 @@ impl App {
                 s.world.set_config(cfg);
                 s.world.notice =
                     Some(Notice { text: format!("config reloaded: {}", path.display()), error: false, until: s.world.t + 3.0 });
-                let (scale, max_mp) =
-                    if self.opts.wallpaper { (1.0, f32::INFINITY) } else { self.cfg.performance.resolution(s.integrated) };
+                let (scale, max_mp) = scene_scale(&self.cfg.performance, self.opts.wallpaper, s.integrated);
+                set_system_monitor(&mut s.outputs, &self.cfg);
+                if self.cfg.system_monitor.show != "off" && s.renderer.sysmon.is_none() {
+                    s.renderer.sysmon = Some(crate::sysmon::SysMon::start(s.gpu.adapter.get_info().vendor));
+                }
                 for o in &mut s.outputs {
                     o.view.invalidate_background();
                     s.renderer.resize(&mut o.view, o.surface_cfg.width, o.surface_cfg.height, scale, max_mp);
@@ -492,6 +515,20 @@ impl App {
     }
 }
 
+/// Which views draw the system readout (`[system_monitor] show`).
+fn set_system_monitor(outputs: &mut [Output], cfg: &Config) {
+    let sizes: Vec<(u32, u32)> = outputs.iter().map(|o| (o.spec.width, o.spec.height)).collect();
+    let comps: Vec<Composition> = outputs.iter().map(|o| o.composition).collect();
+    let main = main_output(&sizes, &comps);
+    for (i, o) in outputs.iter_mut().enumerate() {
+        o.view.system_monitor = match cfg.system_monitor.show.as_str() {
+            "all" => true,
+            "off" => false,
+            _ => i == main,
+        };
+    }
+}
+
 impl ApplicationHandler<Control> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.state.is_none()
@@ -546,7 +583,7 @@ impl ApplicationHandler<Control> for App {
                     o.surface_cfg.width = size.width;
                     o.surface_cfg.height = size.height;
                     o.surface.configure(&s.gpu.device, &o.surface_cfg);
-                    let (scale, max_mp) = if wallpaper { (1.0, f32::INFINITY) } else { perf.resolution(s.integrated) };
+                    let (scale, max_mp) = scene_scale(&perf, wallpaper, s.integrated);
                     s.renderer.resize(&mut o.view, size.width, size.height, scale, max_mp);
                     o.view.invalidate_background();
                     o.window.request_redraw();
@@ -590,6 +627,9 @@ impl ApplicationHandler<Control> for App {
             self.advance();
         }
         let Some(s) = &mut self.state else { return };
+        if let Some(sm) = &s.renderer.sysmon {
+            sm.set_active(s.outputs.iter().any(|o| o.view.system_monitor && !o.paused(locked)));
+        }
         let mut wake = now + HIDDEN_STEP;
         for o in &mut s.outputs {
             if o.paused(locked) {

@@ -132,7 +132,9 @@ impl Callouts {
         }
     }
 
-    /// Callout sprites for one monitor.
+    /// Callout sprites for one monitor of `size` pixels: the card on the tower
+    /// goes to `scene`, text and leader lines to `hud`. No label is placed in
+    /// the `reserve` rectangle (x0, y0, x1, y1).
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         &self,
@@ -140,11 +142,13 @@ impl Callouts {
         cam: &Camera,
         atlas: &GlyphAtlas,
         slots: &mut Slots,
-        width: f32,
-        height: f32,
+        reserve: Option<[f32; 4]>,
+        size: (f32, f32),
         dt: f32,
-        out: &mut Vec<SpriteVertex>,
+        scene: &mut Vec<SpriteVertex>,
+        hud: &mut Vec<SpriteVertex>,
     ) {
+        let (width, height) = size;
         let cfg = &w.cfg;
         let t = w.t;
         let hold = cfg.labels.hold.0 as f64;
@@ -168,6 +172,15 @@ impl Callouts {
         let left_x = (tl - gap).clamp(margin + min_w, (width * 0.5 - gap).max(margin + min_w));
         let right_x = (tr + gap).clamp((width * 0.5 + gap).min(width - margin - min_w), width - margin - min_w);
         let max_w = [(left_x - margin).min(300.0 * ui), (width - margin - right_x).min(300.0 * ui)];
+        // Rows of each column that would overlap `reserve`.
+        let blocked: [Vec<bool>; 2] = [(left_x - max_w[0], left_x), (right_x, right_x + max_w[1])].map(|(x0, x1)| {
+            (0..rows)
+                .map(|r| {
+                    let y = top + (r as f32 + 0.5) * pitch;
+                    reserve.is_some_and(|q| x1 > q[0] && x0 < q[2] && y + pitch * 0.5 > q[1] && y - pitch * 0.5 < q[3])
+                })
+                .collect()
+        });
 
         // Place new callouts: the free row nearest their file, on its side of the axis.
         for c in &self.cards {
@@ -182,8 +195,10 @@ impl Callouts {
             let axis_x = cam.project(Vec3::new(0.0, p.y, 0.0), width, height).map_or(width * 0.5, |a| a.0);
             let side = usize::from(sx >= axis_x);
             let want = (((sy - top) / pitch - 0.5).round().max(0.0) as usize).min(rows - 1);
-            if let Some(row) =
-                slots.free_row(side, want).map(|r| (side, r)).or_else(|| slots.free_row(1 - side, want).map(|r| (1 - side, r)))
+            if let Some(row) = slots
+                .free_row(side, want, &blocked[side])
+                .map(|r| (side, r))
+                .or_else(|| slots.free_row(1 - side, want, &blocked[1 - side]).map(|r| (1 - side, r)))
             {
                 slots.take(c.id, row.0, row.1, t, [sx, sy]);
             }
@@ -217,7 +232,7 @@ impl Callouts {
                 let center = p + normal * 0.03;
                 let (hw, hh) = (0.035, 0.13);
                 quad_world(
-                    out,
+                    scene,
                     [
                         center - tangent * hw - Vec3::Y * hh,
                         center + tangent * hw - Vec3::Y * hh,
@@ -259,12 +274,12 @@ impl Callouts {
             let a = alpha * vis;
             let line_y = name_y - name_px * 0.3;
             let line_col = [gold[0], gold[1], gold[2], 0.55 * a];
-            line_px(out, pl.anchor, [knee, line_y], 1.0 * ui, line_col, width, height);
-            line_px(out, [knee, line_y], [edge, line_y], 1.0 * ui, line_col, width, height);
-            text_px(out, face, &name, lx_name, name_y, name_px, [gold[0], gold[1], gold[2], 1.5 * a], width, height);
-            text_px(out, face, tag, lx_sub, sub_y, sub_px, [tag_col[0], tag_col[1], tag_col[2], 1.4 * a], width, height);
+            line_px(hud, pl.anchor, [knee, line_y], 1.0 * ui, line_col, width, height);
+            line_px(hud, [knee, line_y], [edge, line_y], 1.0 * ui, line_col, width, height);
+            text_px(hud, face, &name, lx_name, name_y, name_px, [gold[0], gold[1], gold[2], 1.5 * a], width, height);
+            text_px(hud, face, tag, lx_sub, sub_y, sub_px, [tag_col[0], tag_col[1], tag_col[2], 1.4 * a], width, height);
             let tag_w = face.measure(tag, sub_px);
-            text_px(out, face, &rest, lx_sub + tag_w, sub_y, sub_px, [gold[0], gold[1], gold[2], 0.75 * a], width, height);
+            text_px(hud, face, &rest, lx_sub + tag_w, sub_y, sub_px, [gold[0], gold[1], gold[2], 0.75 * a], width, height);
         }
     }
 }
@@ -349,9 +364,12 @@ impl Slots {
         }
     }
 
-    fn free_row(&self, side: usize, want: usize) -> Option<usize> {
+    fn free_row(&self, side: usize, want: usize, blocked: &[bool]) -> Option<usize> {
         let rows = &self.rows[side];
-        (0..rows.len()).flat_map(|d| [want.checked_sub(d), Some(want + d)]).flatten().find(|&r| r < rows.len() && rows[r].is_none())
+        (0..rows.len())
+            .flat_map(|d| [want.checked_sub(d), Some(want + d)])
+            .flatten()
+            .find(|&r| r < rows.len() && rows[r].is_none() && !blocked.get(r).copied().unwrap_or(false))
     }
 
     fn take(&mut self, id: u64, side: usize, row: usize, t: f64, anchor: [f32; 2]) {
@@ -377,9 +395,10 @@ mod tests {
         s.reset_if(100.0, 100.0, 5);
         s.take(1, 0, 2, 0.0, [0.0; 2]);
         s.take(2, 0, 1, 0.0, [0.0; 2]);
-        assert_eq!(s.free_row(0, 2), Some(3));
-        assert_eq!(s.free_row(0, 1), Some(0));
-        assert_eq!(s.free_row(1, 2), Some(2));
+        assert_eq!(s.free_row(0, 2, &[]), Some(3));
+        assert_eq!(s.free_row(0, 1, &[]), Some(0));
+        assert_eq!(s.free_row(1, 2, &[]), Some(2));
+        assert_eq!(s.free_row(1, 2, &[false, false, true, true, false]), Some(1));
     }
 
     #[test]

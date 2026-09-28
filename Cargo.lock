@@ -741,6 +741,7 @@ dependencies = [
  "fontdue",
  "gits-core",
  "glam",
+ "libloading",
  "log",
  "png",
  "pollster",

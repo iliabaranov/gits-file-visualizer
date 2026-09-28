@@ -65,9 +65,17 @@ Rendering (see `[performance]` in `config/default.toml`):
 - 60 fps, timed to the display refresh (each frame is released by the
   compositor's frame callback), with every animation advancing by the real
   time elapsed. No motion trails and no film grain by default.
-- On the discrete GPU (NVIDIA) at native resolution when on mains power
-  (`gpu = "auto"`). On battery it switches to the integrated GPU at reduced
-  resolution and 30 fps, restarting itself when the power source changes.
+- On the discrete GPU (NVIDIA) when on mains power (`gpu = "auto"`). The tower
+  is drawn at 58% of each monitor's resolution and upscaled the way games do
+  (bicubic, clamped against ringing, lightly sharpened, like FSR 1), while
+  text, labels and the system monitor are drawn afterwards at full resolution.
+  `render_scale` sets the trade-off. On battery it switches to the integrated
+  GPU at reduced resolution and 30 fps, restarting itself when the power
+  source changes.
+- The main monitor (the wide shot) shows a small system readout in the lower
+  right: CPU, memory, GPU, power and network with one-minute sparklines
+  (`[system_monitor] show = "main" | "all" | "off"`). It reads /proc and /sys
+  (and NVIDIA's NVML library if present) once a second, only while visible.
 - Where many rings share a pixel, all of them are averaged (up to 16), so the
   drum reads as fine striations instead of crawling noise.
 - Layouts are rebuilt on a worker thread (at most every 5 s, which is when new
@@ -76,9 +84,10 @@ Rendering (see `[performance]` in `config/default.toml`):
 
 Measured headlessly on the development laptop (RTX 2060 Max-Q, three monitors
 1920×1200 + 1080×1920 + 3840×2160, live data, 2026-09-28): 60 fps with the
-longest frame 17–19 ms; NVIDIA ~83% busy at ~64 W; renderer ~30% of one CPU
+longest frame ~17 ms; NVIDIA board power ~36 W at the default `render_scale`
+(0.58), ~54 W at 0.67, ~63 W at native resolution; renderer ~25% of one CPU
 core (~40% during the stress test below). Nothing is drawn while windows cover
-the monitors. `render_scale` lowers the GPU load.
+the monitors.
 `gits-render loadtest` measures this on your machine; `gits-render gpu-check`
 lists which GPUs can present to a window.
 

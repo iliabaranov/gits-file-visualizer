@@ -1,5 +1,10 @@
 //! GPU resources and the per-frame pass sequence:
-//! cached background → scene (tower + sprites) → smear → bloom → tonemap.
+//! cached background → scene (tower + sprites) → smear → bloom → upscale +
+//! tonemap → overlay (labels, system monitor) at the output resolution.
+//!
+//! The scene may be drawn below the output resolution (`render_scale`): the
+//! final pass upscales it (see `upscale` in post.wgsl), and text is drawn
+//! afterwards at full resolution, as games render their HUD.
 //!
 //! [`Renderer`] holds everything shared by all outputs (pipelines, the world's
 //! GPU buffers, the glyph atlas). Each output (monitor or window) has a [`View`]
@@ -14,7 +19,7 @@ use anyhow::Result;
 use wgpu::util::DeviceExt;
 
 const BLOOM_LEVELS: usize = 6;
-const TOWER_SLICES: u32 = 256;
+const TOWER_SLICES: u32 = 96;
 
 const COMMON_WGSL: &str = include_str!("../shaders/common.wgsl");
 const TOWER_COMMON_WGSL: &str = include_str!("../shaders/tower_common.wgsl");
@@ -61,8 +66,12 @@ impl Target {
 }
 
 struct Targets {
+    /// Scene (internal) size.
     w: u32,
     h: u32,
+    /// Output size.
+    out_w: u32,
+    out_h: u32,
     bg: Target,
     scene: Target,
     trail: [Target; 2],
@@ -151,13 +160,18 @@ pub struct Renderer {
     down_pipeline: wgpu::RenderPipeline,
     up_pipeline: wgpu::RenderPipeline,
     final_pipeline: wgpu::RenderPipeline,
+    final_up_pipeline: wgpu::RenderPipeline,
+    hud_pipeline: wgpu::RenderPipeline,
     post_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     dummy: Target,
 
     layout_version: u64,
     scratch: Vec<SpriteVertex>,
+    scratch_hud: Vec<SpriteVertex>,
     pub atlas: GlyphAtlas,
+    /// System readout drawn on views with `system_monitor` set.
+    pub sysmon: Option<crate::sysmon::SysMon>,
 }
 
 /// Per-output state: render targets, cached background, sprite buffers.
@@ -171,12 +185,21 @@ pub struct View {
     fx_count: u32,
     bg_vb: wgpu::Buffer,
     bg_count: u32,
+    hud_vb: wgpu::Buffer,
+    hud_cap: usize,
+    hud_count: u32,
     callouts: crate::callouts::Slots,
+    /// Draw the system monitor in the lower right of this view.
+    pub system_monitor: bool,
 }
 
 impl View {
     pub fn internal_size(&self) -> (u32, u32) {
         self.targets.as_ref().map(|t| (t.w, t.h)).unwrap_or((0, 0))
+    }
+
+    pub fn output_size(&self) -> (u32, u32) {
+        self.targets.as_ref().map(|t| (t.out_w, t.out_h)).unwrap_or((0, 0))
     }
 
     /// Re-renders the cached chamber background on the next frame.
@@ -498,6 +521,36 @@ impl Renderer {
         let down_pipeline = fullscreen("bloom down", &post_layout, "fs_down", hdr, None);
         let up_pipeline = fullscreen("bloom up", &post_layout, "fs_up", hdr, Some(ADDITIVE));
         let final_pipeline = fullscreen("final", &post_layout, "fs_final", out_format, None);
+        let final_up_pipeline = fullscreen("final (upscale)", &post_layout, "fs_final_up", out_format, None);
+        let hud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("overlay"),
+            layout: Some(&sprite_layout),
+            vertex: wgpu::VertexState {
+                module: &sprite_mod,
+                entry_point: Some("vs_sprite"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<SpriteVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &sprite_attrs,
+                })],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &sprite_mod,
+                entry_point: Some("fs_hud"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: out_format,
+                    blend: Some(ADDITIVE),
+                    write_mask: wgpu::ColorWrites::COLOR,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("linear clamp"),
@@ -649,12 +702,16 @@ impl Renderer {
             down_pipeline,
             up_pipeline,
             final_pipeline,
+            final_up_pipeline,
+            hud_pipeline,
             post_bgl,
             sampler,
             dummy,
             layout_version: 0,
             scratch: Vec::new(),
+            scratch_hud: Vec::new(),
             atlas,
+            sysmon: None,
         })
     }
 
@@ -674,7 +731,11 @@ impl Renderer {
             fx_count: 0,
             bg_vb: vertex_buffer(&self.device, "background sprites", 64),
             bg_count: 0,
+            hud_vb: vertex_buffer(&self.device, "overlay sprites", 4096),
+            hud_cap: 4096,
+            hud_count: 0,
             callouts: Default::default(),
+            system_monitor: false,
         }
     }
 
@@ -691,7 +752,8 @@ impl Renderer {
         })
     }
 
-    /// (Re)creates the internal render targets for an output of `out_w`×`out_h`.
+    /// (Re)creates the internal render targets for an output of `out_w`×`out_h`,
+    /// with the scene drawn at `render_scale` of that (capped at `max_megapixels`).
     pub fn resize(&self, view: &mut View, out_w: u32, out_h: u32, render_scale: f32, max_megapixels: f32) {
         let mut s = render_scale.clamp(0.2, 1.0);
         // 0 or less: no cap.
@@ -701,7 +763,7 @@ impl Renderer {
             s *= (max_px / px).sqrt() as f32;
         }
         let (w, h) = (((out_w as f32 * s) as u32).max(16), ((out_h as f32 * s) as u32).max(16));
-        if view.targets.as_ref().is_some_and(|t| t.w == w && t.h == h) {
+        if view.targets.as_ref().is_some_and(|t| t.w == w && t.h == h && t.out_w == out_w && t.out_h == out_h) {
             return;
         }
         let (d, f) = (&self.device, self.hdr);
@@ -722,7 +784,8 @@ impl Renderer {
             self.post_group("final a", &trail[0].view, &bloom[0].view, dm),
             self.post_group("final b", &trail[1].view, &bloom[0].view, dm),
         ];
-        view.targets = Some(Targets { w, h, bg, scene, trail, bloom, combine_bg, down0_bg, down_bg, up_bg, final_bg });
+        log::debug!("output {out_w}x{out_h}: scene {w}x{h}");
+        view.targets = Some(Targets { w, h, out_w, out_h, bg, scene, trail, bloom, combine_bg, down0_bg, down_bg, up_bg, final_bg });
         view.bg_dirty = true;
     }
 
@@ -969,7 +1032,12 @@ impl Renderer {
             screen: [iw as f32, ih as f32, 1.0 / iw.max(1) as f32, 1.0 / ih.max(1) as f32],
             post: [c.palette.exposure, c.palette.bloom, c.palette.grain, c.palette.vignette],
             post2: [smear_decay, (view.frame % 997) as f32, if self.out_format.is_srgb() { 0.0 } else { 1.0 }, 1.0 / BLOOM_LEVELS as f32],
-            rct: [self.atlas_rows as f32, self.quality.ring_bins as f32, (ATLAS_W / self.quality.ring_bins) as f32, self.n_bands as f32],
+            rct: [
+                self.atlas_rows as f32,
+                self.quality.ring_bins as f32,
+                (ATLAS_W / self.quality.ring_bins) as f32,
+                c.performance.upscale_sharpness.clamp(0.0, 1.0),
+            ],
         }
     }
 
@@ -984,7 +1052,6 @@ impl Renderer {
         // One globals buffer for all views: writes are ordered with submissions.
         let globals = self.globals(view, w, cam, frame_dt);
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
-        let (iw, ih) = view.internal_size();
 
         let mut scratch = std::mem::take(&mut self.scratch);
         if view.bg_dirty {
@@ -995,7 +1062,24 @@ impl Renderer {
             view.bg_count = scratch.len() as u32;
         }
         scratch.clear();
-        w.fx.build(w, cam, &self.atlas, &mut view.callouts, iw as f32, ih as f32, frame_dt, &mut scratch);
+        let mut hud = std::mem::take(&mut self.scratch_hud);
+        hud.clear();
+        let (ow, oh) = (view.output_size().0 as f32, view.output_size().1 as f32);
+        let sysmon = self.sysmon.as_ref().filter(|_| view.system_monitor);
+        let reserve = sysmon.map(|_| crate::sysmon::rect(ow, oh));
+        w.fx.build(w, cam, &self.atlas, &mut view.callouts, reserve, (ow, oh), frame_dt, &mut scratch, &mut hud);
+        if let Some(sm) = sysmon {
+            sm.build(&w.cfg, &self.atlas, ow, oh, &mut hud);
+        }
+        if hud.len() > view.hud_cap {
+            view.hud_cap = hud.len() * 3 / 2;
+            view.hud_vb = vertex_buffer(&self.device, "overlay sprites", view.hud_cap);
+        }
+        if !hud.is_empty() {
+            self.queue.write_buffer(&view.hud_vb, 0, bytemuck::cast_slice(&hud));
+        }
+        view.hud_count = hud.len() as u32;
+        self.scratch_hud = hud;
         if scratch.len() > view.fx_cap {
             view.fx_cap = scratch.len() * 3 / 2;
             view.fx_vb = vertex_buffer(&self.device, "fx sprites", view.fx_cap);
@@ -1100,7 +1184,17 @@ impl Renderer {
                 fullscreen(&mut enc, &self.up_pipeline, &tg.bloom[i].view, &tg.up_bg[i], false, "bloom up");
             }
         }
-        fullscreen(&mut enc, &self.final_pipeline, out, &tg.final_bg[cur], true, "final");
+        let upscaling = (tg.w, tg.h) != (tg.out_w, tg.out_h);
+        let final_pipeline = if upscaling { &self.final_up_pipeline } else { &self.final_pipeline };
+        fullscreen(&mut enc, final_pipeline, out, &tg.final_bg[cur], true, "final");
+        if view.hud_count > 0 {
+            let mut p = pass(&mut enc, out, false, "overlay");
+            p.set_pipeline(&self.hud_pipeline);
+            p.set_bind_group(0, &self.globals_bg, &[]);
+            p.set_bind_group(1, &self.sprite_bg, &[]);
+            p.set_vertex_buffer(0, view.hud_vb.slice(..));
+            p.draw(0..view.hud_count, 0..1);
+        }
 
         self.queue.submit([enc.finish()]);
         view.trail_idx = 1 - cur;

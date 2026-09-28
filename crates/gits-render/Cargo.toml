@@ -13,6 +13,7 @@ clap.workspace = true
 env_logger.workspace = true
 fontdue.workspace = true
 glam.workspace = true
+libloading.workspace = true
 log.workspace = true
 png.workspace = true
 pollster.workspace = true

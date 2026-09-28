@@ -52,6 +52,85 @@ impl Composition {
     }
 }
 
+const WIDE_FOV: f32 = 43.0;
+/// From the target toward the wide camera: 23° above the horizontal.
+const WIDE_DIR: Vec3 = Vec3::new(0.0, 0.3907, 0.9205);
+/// Largest |NDC| the tower may reach in the wide shot (the rest is margin).
+const WIDE_FILL: [f32; 2] = [0.9, 0.92];
+
+/// Distance and target height at which the whole tower (and the floor lights
+/// around its foot) fills the wide shot, centred. Cached: it depends only on
+/// the screen shape and the tower's size.
+fn wide_fit(aspect: f32, tower: &Tower, y_top: f32) -> (f32, f32) {
+    type Key = [u32; 4];
+    thread_local! {
+        static CACHE: std::cell::RefCell<Vec<(Key, (f32, f32))>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let key = [aspect.to_bits(), tower.radius.to_bits(), tower.height.to_bits(), y_top.to_bits()];
+    if let Some(v) = CACHE.with(|c| c.borrow().iter().find(|(k, _)| *k == key).map(|e| e.1)) {
+        return v;
+    }
+    let (top, bottom) = (y_top + 0.1, y_top - tower.height - 0.1);
+    let r = tower.radius + 0.1;
+    let mut points = Vec::with_capacity(144);
+    for i in 0..48 {
+        let a = std::f32::consts::TAU * i as f32 / 48.0;
+        let (c, s) = (a.cos(), a.sin());
+        points.push(Vec3::new(r * c, top, r * s));
+        points.push(Vec3::new(r * c, bottom, r * s));
+        // The floor lights (fx::build_background).
+        let lr = (tower.radius + 0.6).max(2.3);
+        points.push(Vec3::new(lr * c, bottom, lr * s));
+    }
+    let cam = |dist: f32, target_y: f32| Camera {
+        eye: Vec3::Y * target_y + WIDE_DIR * dist,
+        target: Vec3::new(0.0, target_y, 0.0),
+        up: Vec3::Y,
+        fov_y: WIDE_FOV.to_radians(),
+        aspect,
+        inside: false,
+    };
+    // Vertical NDC extent, or None if a point leaves the frame sideways or is behind.
+    let extent = |c: &Camera| -> Option<(f32, f32)> {
+        let vp = c.view_proj();
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for p in &points {
+            let q = vp * p.extend(1.0);
+            if q.w <= 1e-3 || (q.x / q.w).abs() > WIDE_FILL[0] {
+                return None;
+            }
+            lo = lo.min(q.y / q.w);
+            hi = hi.max(q.y / q.w);
+        }
+        Some((lo, hi))
+    };
+    let mut target_y = (top + bottom) * 0.5;
+    let mut dist = 20.0;
+    for _ in 0..4 {
+        // Nearest distance at which everything fits...
+        let (mut near, mut far) = (r + 1.0, 400.0);
+        for _ in 0..28 {
+            let mid = 0.5 * (near + far);
+            match extent(&cam(mid, target_y)) {
+                Some((lo, hi)) if lo >= -WIDE_FILL[1] && hi <= WIDE_FILL[1] => far = mid,
+                _ => near = mid,
+            }
+        }
+        dist = far;
+        // ...then centre it vertically.
+        let Some((lo, hi)) = extent(&cam(dist, target_y)) else { break };
+        target_y += 0.5 * (lo + hi) * dist * (WIDE_FOV.to_radians() * 0.5).tan();
+    }
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= 8 {
+            c.remove(0);
+        }
+        c.push((key, (dist, target_y)));
+    });
+    (dist, target_y)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Camera {
     pub eye: Vec3,
@@ -77,17 +156,14 @@ impl Camera {
         drift.clamp(0.0, 1.0) * 0.07 * (t * 0.0021).sin()
     }
 
-    /// The "wide tower" composition from the film's establishing shot.
+    /// The "wide tower" composition from the film's establishing shot: the
+    /// whole tower, top to floor lights, looking down on it (~23°) so the rings
+    /// read as ellipses. The distance is fitted to the screen's shape.
     pub fn wide(aspect: f32, tower: &Tower, y_top: f32, drift: f32, t: f32) -> Self {
-        // Frame the bottom of the tower, the floor lights and the lattice, with the
-        // top of the tower leaving the frame. Portrait screens pull back a little.
-        // Looking down on the coil (~23°) so rings read as ellipses, as in the film.
-        let pull = if aspect < 1.0 { 1.0 + (1.0 - aspect) * 0.9 } else { 1.0 };
-        let dist = (11.6 + (tower.radius - 3.75).max(0.0) * 1.5) * pull;
-        let target_y = 0.2 + (y_top - 8.8) * 0.3 + if aspect < 1.0 { 1.0 } else { 0.0 };
+        let (dist, target_y) = wide_fit(aspect, tower, y_top);
         let a = Self::drift_angle(drift, t);
-        let eye = Vec3::new(dist * a.sin(), target_y + 5.0 * pull, dist * a.cos());
-        Self { eye, target: Vec3::new(0.0, target_y, 0.0), up: Vec3::Y, fov_y: 43f32.to_radians(), aspect, inside: false }
+        let eye = Vec3::new(a.sin(), 0.0, a.cos()) * (dist * WIDE_DIR.z) + Vec3::Y * (target_y + dist * WIDE_DIR.y);
+        Self { eye, target: Vec3::new(0.0, target_y, 0.0), up: Vec3::Y, fov_y: WIDE_FOV.to_radians(), aspect, inside: false }
     }
 
     /// Close to the side of the tower, looking slightly up along the packed
@@ -155,5 +231,28 @@ mod tests {
         let c = Composition::auto(&[(1920, 1200), (3840, 2160), (1440, 2560)]);
         assert_eq!(c, vec![Composition::Dial, Composition::Wide, Composition::Drum]);
         assert_eq!(Composition::auto(&[(1920, 1080)]), vec![Composition::Wide]);
+    }
+
+    #[test]
+    fn wide_shows_the_whole_tower() {
+        let cfg = gits_core::config::Config::default();
+        let tower = &cfg.tower;
+        let y_top = tower.height - 3.2;
+        for (w, h) in [(3840.0, 2160.0), (1920.0, 1200.0), (1080.0, 1920.0), (5120.0, 1440.0)] {
+            let cam = Camera::wide(w / h, tower, y_top, 0.0, 0.0);
+            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+            for i in 0..64 {
+                let a = std::f32::consts::TAU * i as f32 / 64.0;
+                for y in [y_top, y_top - tower.height] {
+                    let (sx, sy) = cam.project(Vec3::new(tower.radius * a.cos(), y, tower.radius * a.sin()), w, h).unwrap();
+                    assert!((0.0..w).contains(&sx) && (0.0..h).contains(&sy), "{w}x{h}: ({sx}, {sy}) off screen");
+                    lo = lo.min(sy);
+                    hi = hi.max(sy);
+                }
+            }
+            // Fills most of the height (or width), roughly centred.
+            assert!(hi - lo > 0.6 * h || w < h, "{w}x{h}: tower only {:.0}..{:.0}", lo, hi);
+            assert!((lo - (h - hi)).abs() < 0.15 * h, "{w}x{h}: not centred ({lo:.0}, {hi:.0})");
+        }
     }
 }

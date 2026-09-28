@@ -1,5 +1,7 @@
 // Additive sprites: lines, glyphs, dots, flakes and cards, in world space or
-// directly in normalised device coordinates.
+// directly in normalised device coordinates. fs_sprite draws into the HDR
+// scene; fs_hud draws the full-resolution overlay (labels, system monitor)
+// onto the finished frame, tonemapped the same way.
 
 @group(1) @binding(0) var glyphs: texture_2d<f32>;
 @group(1) @binding(1) var glyph_sampler: sampler;
@@ -34,8 +36,7 @@ fn vs_sprite(v: SpriteIn) -> SpriteOut {
     return o;
 }
 
-@fragment
-fn fs_sprite(in: SpriteOut) -> @location(0) vec4<f32> {
+fn sprite_color(in: SpriteOut) -> vec3<f32> {
     let kind = u32(in.kind_lod.x + 0.5);
     var a = 0.0;
     if (kind == 0u) {
@@ -53,5 +54,15 @@ fn fs_sprite(in: SpriteOut) -> @location(0) vec4<f32> {
         let m = max(abs(in.uv.x), abs(in.uv.y));
         a = 1.0 - smoothstep(0.75, 1.0, m);
     }
-    return vec4<f32>(in.color.rgb * in.color.a * a, 1.0);
+    return in.color.rgb * in.color.a * a;
+}
+
+@fragment
+fn fs_sprite(in: SpriteOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(sprite_color(in), 1.0);
+}
+
+@fragment
+fn fs_hud(in: SpriteOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(encode_out(tonemap(sprite_color(in) * G.post.x)), 1.0);
 }

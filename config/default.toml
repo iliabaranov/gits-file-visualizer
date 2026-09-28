@@ -89,6 +89,9 @@ repeat     = "30s"          # a file gets a new callout at most this often
 per_second = 6.0            # new callouts per second at most
 reads      = true           # also for reads (creates, edits and deletes always)
 
+[system_monitor]            # small readout in the lower right: CPU, memory, GPU, power, network
+show = "main"               # main (the monitor with the wide shot) | all | off
+
 [background]
 calligraphy            = true
 calligraphy_brightness = 0.10
@@ -111,9 +114,18 @@ fps          = 60
 fps_battery  = 30           # cap while running on battery
 gpu          = "auto"       # auto | discrete | integrated. auto: the discrete GPU
                             # (e.g. NVIDIA) when on mains power, otherwise integrated
-render_scale = 1.0          # internal resolution relative to the output (1.0 = native)
-max_internal_megapixels = 0 # per-monitor cap, 0 = none
-# Used instead when rendering on an integrated GPU, which also draws the desktop:
+# The tower and chamber are drawn at `render_scale` of each monitor's resolution
+# (per axis) and upscaled to full resolution, as games do (like FSR 1: bicubic,
+# clamped against ringing, lightly sharpened). Text, labels and the system
+# monitor are drawn afterwards at full resolution, so they stay crisp.
+# 1.0 = native; 0.58 draws a third of the pixels; 0.5 a quarter. Measured on an
+# RTX 2060 (3 monitors incl. 4K, 60 fps): 1.0 ~63 W, 0.67 ~54 W, 0.58 ~36 W.
+render_scale = 0.58
+max_internal_megapixels = 0 # per-monitor cap on the scene, 0 = none
+upscale_sharpness = 0.3     # 0 = plain bicubic, 1 = strong
+# Used instead on an integrated GPU, which also draws the desktop: the whole
+# wallpaper (text included) is drawn at this size and GNOME scales it up,
+# which saves the most memory bandwidth.
 integrated_render_scale = 0.6
 integrated_max_megapixels = 1.2
 

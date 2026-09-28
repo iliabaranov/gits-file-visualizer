@@ -163,7 +163,9 @@ impl Fx {
         self
     }
 
-    /// Per-frame sprites (world + screen space) for one monitor.
+    /// Per-frame sprites for one monitor: the scene's (`out`, drawn into the HDR
+    /// scene) and the overlay's (`hud`: text and leader lines, drawn at the
+    /// output resolution `size`). `reserve` is screen space kept free of labels.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         &self,
@@ -171,18 +173,20 @@ impl Fx {
         cam: &Camera,
         atlas: &GlyphAtlas,
         slots: &mut Slots,
-        width: f32,
-        height: f32,
+        reserve: Option<[f32; 4]>,
+        size: (f32, f32),
         dt: f32,
         out: &mut Vec<SpriteVertex>,
+        hud: &mut Vec<SpriteVertex>,
     ) {
         let cfg = &w.cfg;
         let t = w.t;
         let cream = cfg.color(&cfg.events.read.color);
         let gold = cfg.color(&cfg.age.fresh);
         let crimson = cfg.color(&cfg.events.delete.color);
+        let (width, height) = size;
         let ui = height / 1080.0;
-        self.cards.build(w, cam, atlas, slots, width, height, dt, out);
+        self.cards.build(w, cam, atlas, slots, reserve, size, dt, out, hud);
 
         // Probe: three nested wire circles and a bright core.
         if self.probe.alpha > 0.01 {
@@ -236,7 +240,7 @@ impl Fx {
                 text.pop();
             }
             let fade = if n.until.is_finite() { (((n.until - t) / 0.8) as f32).clamp(0.0, 1.0) } else { 1.0 };
-            text_px(out, &atlas.mono, &text, 24.0 * ui, height - 24.0 * ui, size, [col[0], col[1], col[2], 1.6 * fade], width, height);
+            text_px(hud, &atlas.mono, &text, 24.0 * ui, height - 24.0 * ui, size, [col[0], col[1], col[2], 1.6 * fade], width, height);
         }
 
         // Gold flakes.
@@ -268,13 +272,15 @@ pub fn build_background(cfg: &Config, atlas: &GlyphAtlas, y_top: f32, cam: &Came
         let size = 0.95;
         let step = size * 1.3;
         let b = bg.calligraphy_brightness * 0.3;
-        for (group, (tc, top)) in
-            [(-PI * 0.5 + 0.34, 7.4f32), (-PI * 0.5 - 0.42, 5.6), (-PI * 0.5 + 0.95, 4.2), (-PI * 0.5 - 1.35, 6.8)].iter().enumerate()
+        // (angle, top, brightness): in the wide view the Japanese right of the
+        // tower, the English translation left of it, fainter copies further out.
+        for (group, (tc, top, fade)) in
+            [(-PI * 0.5 + 0.95, 4.8f32, 1.0f32), (-PI * 0.5 - 0.42, 5.6, 1.0), (-PI * 0.5 + 1.38, 7.2, 0.6), (-PI * 0.5 - 1.38, 7.2, 0.6)]
+                .iter()
+                .enumerate()
         {
-            let fade = if group < 2 { 1.0 } else { 0.6 };
             if group == 1 {
-                // The English translation, in horizontal lines, left of the tower
-                // in the wide view (the Japanese stays on the right).
+                // The English translation, in horizontal lines.
                 let size = 0.42;
                 for (k, line) in ZEAMI_ENGLISH.iter().enumerate() {
                     let baseline = top - 2.2 - k as f32 * size * 1.5;
@@ -489,6 +495,11 @@ fn line_world(out: &mut Vec<SpriteVertex>, a: Vec3, b: Vec3, width: f32, color: 
 
 fn px_to_ndc(x: f32, y: f32, w: f32, h: f32) -> [f32; 3] {
     [x / w * 2.0 - 1.0, 1.0 - y / h * 2.0, 0.0]
+}
+
+/// A flat quad with corners `p` in pixels.
+pub(crate) fn quad_px(out: &mut Vec<SpriteVertex>, p: [[f32; 2]; 4], color: [f32; 4], w: f32, h: f32) {
+    push_quad(out, p.map(|q| px_to_ndc(q[0], q[1], w, h)), [[0.0; 2]; 4], 1.0, K::CARD, 0.0, color);
 }
 
 pub(crate) fn line_px(out: &mut Vec<SpriteVertex>, a: [f32; 2], b: [f32; 2], width: f32, color: [f32; 4], w: f32, h: f32) {

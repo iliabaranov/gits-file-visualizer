@@ -10,6 +10,7 @@ mod gpu_types;
 mod renderer;
 mod snapshot;
 mod source;
+mod sysmon;
 mod text;
 mod world;
 

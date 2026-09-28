@@ -1,4 +1,4 @@
-// Background gradient, motion smear, bloom and final tonemapping.
+// Background gradient, motion smear, bloom, upscaling and final tonemapping.
 
 @group(1) @binding(0) var t0: texture_2d<f32>;
 @group(1) @binding(1) var t1: texture_2d<f32>;
@@ -63,27 +63,61 @@ fn fs_up(in: FullOut) -> @location(0) vec4<f32> {
     return vec4<f32>(o / 16.0, 1.0);
 }
 
-@fragment
-fn fs_final(in: FullOut) -> @location(0) vec4<f32> {
-    let base = textureSampleLevel(t0, samp, in.uv, 0.0).rgb;
+// Upscales the scene from its internal resolution (the spatial part of
+// FSR 1-style upscalers): bicubic Catmull-Rom from 5 bilinear taps, a little
+// sharpening against the bilinear value, all clamped to the 2x2 nearest
+// texels so bright thin lines neither ring nor grow halos.
+fn upscale(uv: vec2<f32>) -> vec3<f32> {
+    let size = vec2<f32>(textureDimensions(t0));
+    let sp = uv * size;
+    let p1 = floor(sp - 0.5) + 0.5;
+    let f = sp - p1;
+    let w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    let w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    let w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    let w3 = f * f * (-0.5 + 0.5 * f);
+    let w12 = w1 + w2;
+    let q0 = (p1 - 1.0) / size;
+    let q3 = (p1 + 2.0) / size;
+    let q12 = (p1 + w2 / w12) / size;
+    let ka = w12.x * w0.y;
+    let kb = w0.x * w12.y;
+    let kc = w12.x * w12.y;
+    let kd = w3.x * w12.y;
+    let ke = w12.x * w3.y;
+    var c = tap(vec2<f32>(q12.x, q0.y)) * ka + tap(vec2<f32>(q0.x, q12.y)) * kb + tap(q12) * kc
+        + tap(vec2<f32>(q3.x, q12.y)) * kd + tap(vec2<f32>(q12.x, q3.y)) * ke;
+    c /= ka + kb + kc + kd + ke;
+    c += (c - tap(uv)) * G.rct.w;
+    let i = vec2<i32>(floor(sp - 0.5));
+    let mx = vec2<i32>(size) - 1;
+    let a = textureLoad(t0, clamp(i, vec2<i32>(0), mx), 0).rgb;
+    let b = textureLoad(t0, clamp(i + vec2<i32>(1, 0), vec2<i32>(0), mx), 0).rgb;
+    let d = textureLoad(t0, clamp(i + vec2<i32>(0, 1), vec2<i32>(0), mx), 0).rgb;
+    let e = textureLoad(t0, clamp(i + vec2<i32>(1, 1), vec2<i32>(0), mx), 0).rgb;
+    return clamp(c, min(min(a, b), min(d, e)), max(max(a, b), max(d, e)));
+}
+
+fn finish(base: vec3<f32>, in: FullOut) -> vec4<f32> {
     let bloom = textureSampleLevel(t1, samp, in.uv, 0.0).rgb * G.post2.w;
-    let hdr = (base + bloom * G.post.y) * G.post.x;
-    // Tonemap on the brightest channel so saturated gold and crimson keep their
-    // hue, then let only the very brightest highlights drift toward white.
-    let m = max(max(hdr.r, hdr.g), max(hdr.b, 1e-5));
-    let mapped = 1.0 - exp(-m);
-    var col = hdr * (mapped / m);
-    col = mix(col, vec3<f32>(mapped), smoothstep(0.75, 1.0, mapped) * 0.3);
+    var col = tonemap((base + bloom * G.post.y) * G.post.x);
 
     let n = hash12(in.pos.xy + vec2<f32>(G.post2.y * 17.0, G.post2.y * 29.0)) - 0.5;
     col += n * G.post.z * (0.15 + col * 0.6);
 
     let v = length((in.uv - 0.5) * vec2<f32>(1.1, 1.0));
     col *= mix(1.0, smoothstep(0.95, 0.2, v), G.post.w);
+    return vec4<f32>(encode_out(col), 1.0);
+}
 
-    col = max(col, vec3<f32>(0.0));
-    if (G.post2.z > 0.5) {
-        col = pow(col, vec3<f32>(1.0 / 2.2));
-    }
-    return vec4<f32>(col, 1.0);
+// Output at the internal resolution.
+@fragment
+fn fs_final(in: FullOut) -> @location(0) vec4<f32> {
+    return finish(textureSampleLevel(t0, samp, in.uv, 0.0).rgb, in);
+}
+
+// Output larger than the internal resolution.
+@fragment
+fn fs_final_up(in: FullOut) -> @location(0) vec4<f32> {
+    return finish(upscale(in.uv), in);
 }

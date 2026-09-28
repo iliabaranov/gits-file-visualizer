@@ -18,6 +18,7 @@ pub struct Config {
     pub calm: Calm,
     pub tower: Tower,
     pub labels: Labels,
+    pub system_monitor: SystemMonitor,
     pub background: Background,
     pub camera: Camera,
     pub monitors: BTreeMap<String, Monitor>,
@@ -142,6 +143,13 @@ pub struct Labels {
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct SystemMonitor {
+    /// "main", "all" or "off".
+    pub show: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Background {
     pub calligraphy: bool,
     pub calligraphy_brightness: f32,
@@ -173,6 +181,7 @@ pub struct Performance {
     pub render_scale: f32,
     /// 0 = no cap.
     pub max_internal_megapixels: f32,
+    pub upscale_sharpness: f32,
     pub integrated_render_scale: f32,
     pub integrated_max_megapixels: f32,
 }
