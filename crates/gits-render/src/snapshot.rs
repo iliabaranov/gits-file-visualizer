@@ -180,7 +180,8 @@ fn numbered(p: &Path, i: u32) -> PathBuf {
     p.with_file_name(format!("{stem}_{i:03}.{ext}"))
 }
 
-fn save_png(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, w: u32, h: u32, path: &Path) -> Result<()> {
+pub(crate) fn save_png(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, w: u32, h: u32, path: &Path) -> Result<()> {
+    let bgra = matches!(tex.format(), wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
     let bpr = (w * 4).div_ceil(256) * 256;
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
@@ -214,6 +215,9 @@ fn save_png(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, w: 
         }
     }
     buf.unmap();
+    if bgra {
+        rgba.chunks_exact_mut(4).for_each(|p| p.swap(0, 2));
+    }
 
     let file = std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);

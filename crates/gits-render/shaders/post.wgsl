@@ -22,8 +22,11 @@ fn fs_bg(in: FullOut) -> @location(0) vec4<f32> {
 fn fs_combine(in: FullOut) -> @location(0) vec4<f32> {
     let bg = textureSampleLevel(t0, samp, in.uv, 0.0).rgb;
     let scene = textureSampleLevel(t1, samp, in.uv, 0.0).rgb;
-    let prev = textureSampleLevel(t2, samp, in.uv, 0.0).rgb;
-    return vec4<f32>(max(bg + scene, prev * G.post2.x), 1.0);
+    var col = finite(bg + scene);
+    if (G.post2.x > 0.0) {
+        col = max(col, finite(textureSampleLevel(t2, samp, in.uv, 0.0).rgb) * G.post2.x);
+    }
+    return vec4<f32>(min(col, vec3<f32>(6.0e4)), 1.0);
 }
 
 fn tap(uv: vec2<f32>) -> vec3<f32> {

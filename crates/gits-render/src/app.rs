@@ -189,6 +189,8 @@ struct Output {
     stats_since: Instant,
     /// Longest gap between presented frames since `stats_since` (judder check).
     worst_gap: Duration,
+    /// Save the next presented frame (see `capture_request`).
+    capture: bool,
 }
 
 impl Output {
@@ -338,6 +340,10 @@ impl App {
                 .get_default_config(&g.adapter, size.width.max(1), size.height.max(1))
                 .context("surface not supported by adapter")?;
             surface_cfg.format = format;
+            // Allows `capture` to read presented frames back.
+            if surface.get_capabilities(&g.adapter).usages.contains(wgpu::TextureUsages::COPY_SRC) {
+                surface_cfg.usage |= wgpu::TextureUsages::COPY_SRC;
+            }
             // Frames are paced by the compositor's frame callbacks (see about_to_wait);
             // mailbox presentation never blocks the other windows.
             let modes = surface.get_capabilities(&g.adapter).present_modes;
@@ -361,6 +367,7 @@ impl App {
                 frames: 0,
                 stats_since: now,
                 worst_gap: Duration::ZERO,
+                capture: false,
             });
         }
 
@@ -391,6 +398,18 @@ impl App {
             return;
         }
         self.last_cfg_check = Instant::now();
+        // Diagnostics: `touch $XDG_RUNTIME_DIR/gits-file-visualizer/capture` saves
+        // the next frame each monitor presents next to it (capture-<connector>.png).
+        let trigger = capture_dir().join("capture");
+        if std::fs::remove_file(&trigger).is_ok()
+            && let Some(s) = &mut self.state
+        {
+            log::info!("capture requested");
+            for o in &mut s.outputs {
+                o.capture = true;
+                o.next_frame = Instant::now();
+            }
+        }
         let Some(path) = self.opts.config_path.clone() else { return };
         let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         if mtime == self.cfg_mtime {
@@ -488,6 +507,14 @@ impl App {
         let cam = Camera::new(o.composition, aspect, &s.world.cfg.tower, s.world.y_top(), s.world.cfg.camera.drift, s.world.t as f32);
         let _ = real_dt;
         s.renderer.render(&mut o.view, &mut s.world, &cam, &out, frame_dt.as_secs_f32());
+        if std::mem::take(&mut o.capture) {
+            let path = capture_dir().join(format!("capture-{}.png", o.spec.name));
+            let (w, h) = (o.surface_cfg.width, o.surface_cfg.height);
+            match crate::snapshot::save_png(&s.gpu.device, &s.gpu.queue, &tex.texture, w, h, &path) {
+                Ok(()) => log::info!("{}: saved {w}x{h} frame to {}", o.spec.name, path.display()),
+                Err(e) => log::warn!("{}: capture failed: {e:#}", o.spec.name),
+            }
+        }
         o.window.pre_present_notify();
         s.gpu.queue.present(tex);
         o.last_draw = Instant::now();
@@ -513,6 +540,11 @@ impl App {
             o.stats_since = Instant::now();
         }
     }
+}
+
+/// Where diagnostics captures go: next to the collector socket.
+fn capture_dir() -> PathBuf {
+    gits_core::protocol::default_socket_path().parent().map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
 }
 
 /// Which views draw the system readout (`[system_monitor] show`).
@@ -579,7 +611,7 @@ impl ApplicationHandler<Control> for App {
                     && size.width > 0
                     && size.height > 0
                 {
-                    log::debug!("{}: resized to {}x{}", o.spec.name, size.width, size.height);
+                    log::info!("{}: window resized to {}x{}", o.spec.name, size.width, size.height);
                     o.surface_cfg.width = size.width;
                     o.surface_cfg.height = size.height;
                     o.surface.configure(&s.gpu.device, &o.surface_cfg);

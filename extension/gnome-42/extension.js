@@ -301,8 +301,11 @@ class Extension {
 
     _fill(holder) {
         const source = this._sources.get(holder._gitsMonitor) ?? null;
+        // Compare with our own record of the clone's source: reading
+        // `clone.source` throws once the renderer window's actor is disposed,
+        // which would leave the stale clone in place.
         const clone = holder.get_first_child();
-        if (clone && clone.source === source)
+        if (clone && clone._gitsSource === source)
             return;
         holder.destroy_all_children();
         if (!source) {
@@ -312,6 +315,7 @@ class Extension {
         }
         // A Clone paints its source scaled to its own allocation: the holder's size.
         const scaled = new Clutter.Clone({ source, x: 0, y: 0 });
+        scaled._gitsSource = source;
         scaled.add_constraint(new Clutter.BindConstraint({ source: holder, coordinate: Clutter.BindCoordinate.SIZE }));
         holder.add_child(scaled);
         holder.ease({ opacity: 255, duration: FADE_MS, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
@@ -319,8 +323,13 @@ class Extension {
 
     _refill(monitor) {
         for (const h of this._holders) {
-            if (monitor === undefined || h._gitsMonitor === monitor)
+            if (monitor !== undefined && h._gitsMonitor !== monitor)
+                continue;
+            try {
                 this._fill(h);
+            } catch (e) {
+                logError(e, '[gits] refreshing a wallpaper clone');
+            }
         }
     }
 

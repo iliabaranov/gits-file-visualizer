@@ -63,6 +63,14 @@ fn encode_out(c: vec3<f32>) -> vec3<f32> {
     return col;
 }
 
+// Replaces NaN and infinite components with 0. One bad pixel would otherwise
+// be spread over the screen by the bloom and kept forever by the frame
+// feedback (NaN * 0 is NaN).
+fn finite(c: vec3<f32>) -> vec3<f32> {
+    let bits = bitcast<vec3<u32>>(c) & vec3<u32>(0x7fffffffu);
+    return select(c, vec3<f32>(0.0), bits >= vec3<u32>(0x7f800000u));
+}
+
 fn hash12(p: vec2<f32>) -> f32 {
     var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
     p3 += dot(p3, p3.yzx + 33.33);
