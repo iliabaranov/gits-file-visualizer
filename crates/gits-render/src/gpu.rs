@@ -9,8 +9,11 @@
 //! - only the Vulkan backend is used (OpenGL is a fallback if Vulkan finds nothing);
 //! - before the first Vulkan instance, the driver list is narrowed to drivers
 //!   for GPUs that should be used: lavapipe is dropped whenever real GPUs exist,
-//!   and with `prefer_igpu` NVIDIA's driver is dropped when an Intel or AMD GPU
-//!   is present. `VK_ICD_FILENAMES` / `VK_DRIVER_FILES` set by the user win.
+//!   and when the integrated GPU is wanted NVIDIA's driver is dropped (if an
+//!   Intel or AMD GPU is present). `VK_ICD_FILENAMES` / `VK_DRIVER_FILES` set by
+//!   the user win.
+//! - `[performance] gpu` chooses: "discrete" (high-performance adapter),
+//!   "integrated", or "auto" (discrete on mains power, integrated on battery).
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -51,7 +54,8 @@ fn icd_dirs() -> Vec<PathBuf> {
 
 /// Chooses which Vulkan drivers to load (see module docs). Must run before any
 /// other thread starts, because it sets an environment variable.
-pub fn select_vulkan_drivers(prefer_igpu: bool) {
+pub fn select_vulkan_drivers(want_discrete: bool) {
+    let prefer_igpu = !want_discrete;
     if std::env::var_os("VK_ICD_FILENAMES").is_some() || std::env::var_os("VK_DRIVER_FILES").is_some() {
         log::info!("Vulkan driver list set by the environment; not narrowing it");
         return;
@@ -117,9 +121,31 @@ async fn adapter(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>,
         .ok()
 }
 
+/// True if the machine has a discrete GPU the Vulkan loader could use.
+pub fn has_discrete_gpu() -> bool {
+    let v = gpu_vendors();
+    v.iter().any(|x| x == VENDOR_NVIDIA) || v.iter().filter(|x| *x == VENDOR_AMD).count() > 1
+}
+
+impl Gpu {
+    pub fn is_integrated(&self) -> bool {
+        !matches!(self.adapter.get_info().device_type, wgpu::DeviceType::DiscreteGpu)
+    }
+}
+
 /// Picks an adapter (the integrated GPU when `low_power`) and opens a device.
+/// If the preferred kind cannot present to `surface`, the other kind is used.
 pub async fn init(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, low_power: bool) -> Result<Gpu> {
-    let adapter = adapter(instance, surface, low_power).await.context("no suitable GPU adapter")?;
+    for a in instance.enumerate_adapters(wgpu::Backends::all()).await {
+        let i = a.get_info();
+        let ok =
+            surface.map(|s| if a.is_surface_supported(s) { "can present" } else { "cannot present to this window" }).unwrap_or("headless");
+        log::info!("adapter: {} ({:?}, {:?}): {ok}", i.name, i.backend, i.device_type);
+    }
+    let adapter = match adapter(instance, surface, low_power).await {
+        Some(a) => a,
+        None => adapter(instance, surface, !low_power).await.context("no suitable GPU adapter")?,
+    };
     let info = adapter.get_info();
     log::info!("GPU: {} ({:?}, {:?}, driver {})", info.name, info.backend, info.device_type, info.driver_info);
 
@@ -150,4 +176,39 @@ pub fn init_headless(low_power: bool) -> Result<(wgpu::Instance, Gpu)> {
         log::warn!("no {} adapter", if fallback { "OpenGL" } else { "Vulkan" });
     }
     anyhow::bail!("no usable GPU adapter (Vulkan or OpenGL)")
+}
+
+/// `gits-render gpu-check`: which GPUs can present to a window of this display
+/// server (the window is never shown).
+pub fn check() -> Result<()> {
+    use winit::application::ApplicationHandler;
+    use winit::event::WindowEvent;
+    use winit::event_loop::{ActiveEventLoop, EventLoop};
+    use winit::window::{Window, WindowId};
+    struct Check(Option<Result<()>>);
+    impl ApplicationHandler for Check {
+        fn resumed(&mut self, el: &ActiveEventLoop) {
+            let run = || -> Result<()> {
+                let window = std::sync::Arc::new(el.create_window(Window::default_attributes().with_visible(false))?);
+                let display = if std::env::var_os("WAYLAND_DISPLAY").is_some() { "Wayland" } else { "X11" };
+                for fallback in [false, true] {
+                    let inst = instance(fallback);
+                    let surface = inst.create_surface(window.clone())?;
+                    for a in pollster::block_on(inst.enumerate_adapters(wgpu::Backends::all())) {
+                        let i = a.get_info();
+                        let ok = if a.is_surface_supported(&surface) { "can present" } else { "cannot present" };
+                        println!("{display}: {} ({:?}, {:?}): {ok}", i.name, i.backend, i.device_type);
+                    }
+                }
+                Ok(())
+            };
+            self.0 = Some(run());
+            el.exit();
+        }
+        fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+    }
+    let el = EventLoop::new()?;
+    let mut c = Check(None);
+    el.run_app(&mut c)?;
+    c.0.unwrap_or(Ok(()))
 }

@@ -23,6 +23,8 @@ const SHELL_MAJOR = parseInt(Config.PACKAGE_VERSION.split('.')[0]);
 const FADE_MS = 900;
 const RESPAWN_DELAY_MS = 3000;
 const MAX_RESPAWNS = 5;
+// gits-render exits with this code to ask for a restart (see app.rs EXIT_RESTART).
+const EXIT_RESTART = 75;
 const RESPAWN_WINDOW_US = 5 * 60 * 1000000;
 const VISIBILITY_DEBOUNCE_MS = 150;
 const VISIBILITY_POLL_S = 3;
@@ -395,6 +397,14 @@ class Extension {
         this._sent.clear();
         if (!this._enabled || status === 'exit 0')
             return;
+        if (status === `exit ${EXIT_RESTART}`) {
+            // Requested restart (e.g. power source changed, switch GPU): not a failure.
+            this._timeout(200, () => {
+                if (this._enabled && !this._renderer.running)
+                    this._renderer.start(currentMonitors());
+            });
+            return;
+        }
         const now = GLib.get_monotonic_time();
         this._respawns = this._respawns.filter(t => now - t < RESPAWN_WINDOW_US);
         if (this._respawns.length >= MAX_RESPAWNS) {

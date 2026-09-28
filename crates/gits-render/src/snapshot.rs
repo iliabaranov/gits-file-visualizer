@@ -44,11 +44,12 @@ fn wait_for_data(world: &mut World) -> Result<()> {
 /// With live data `--at` is ignored: captures start once the snapshot arrives
 /// and are spaced `every` real seconds apart.
 pub fn run(cfg: Config, opts: Options, collector: Option<std::path::PathBuf>) -> Result<()> {
-    let (_instance, g) = gpu::init_headless(cfg.performance.prefer_igpu)?;
+    let (_instance, g) = gpu::init_headless(!crate::want_discrete(&cfg))?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format)?;
+    let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format, crate::renderer::Quality::for_gpu(g.is_integrated()))?;
     let mut view = renderer.new_view();
-    renderer.resize(&mut view, opts.width, opts.height, cfg.performance.render_scale, cfg.performance.max_internal_megapixels);
+    let (sc, mp) = cfg.performance.resolution(g.is_integrated());
+    renderer.resize(&mut view, opts.width, opts.height, sc, mp);
     let mut world = World::new(cfg, renderer.max_rings(), collector);
     let live = !world.is_synthetic();
     if live {
@@ -115,11 +116,10 @@ pub fn bench(
     collector: Option<std::path::PathBuf>,
     composition: Option<String>,
 ) -> Result<()> {
-    let (_instance, g) = gpu::init_headless(cfg.performance.prefer_igpu)?;
+    let (_instance, g) = gpu::init_headless(!crate::want_discrete(&cfg))?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let scale = cfg.performance.render_scale;
-    let max_mp = cfg.performance.max_internal_megapixels;
-    let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format)?;
+    let (scale, max_mp) = cfg.performance.resolution(g.is_integrated());
+    let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format, crate::renderer::Quality::for_gpu(g.is_integrated()))?;
     let mut view = renderer.new_view();
     renderer.resize(&mut view, width, height, scale, max_mp);
     let mut world = World::new(cfg, renderer.max_rings(), collector);
@@ -253,9 +253,9 @@ fn gpu_busy_over(secs: f64) -> Option<f64> {
 pub fn loadtest(cfg: Config, outputs: Vec<(u32, u32)>, seconds: f64, collector: Option<std::path::PathBuf>) -> Result<()> {
     use crate::camera::Composition;
     let baseline = gpu_busy_over(5.0);
-    let (_instance, g) = gpu::init_headless(cfg.performance.prefer_igpu)?;
+    let (_instance, g) = gpu::init_headless(!crate::want_discrete(&cfg))?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format)?;
+    let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format, crate::renderer::Quality::for_gpu(g.is_integrated()))?;
     let comps = Composition::auto(&outputs);
     struct Out {
         view: crate::renderer::View,
@@ -267,7 +267,8 @@ pub fn loadtest(cfg: Config, outputs: Vec<(u32, u32)>, seconds: f64, collector: 
     }
     let mut outs = vec![];
     for (&(w, h), comp) in outputs.iter().zip(comps) {
-        let size = crate::app::wallpaper_size(&cfg, w, h);
+        let (sc, mp) = cfg.performance.resolution(g.is_integrated());
+        let size = crate::app::wallpaper_size(w, h, sc, mp);
         let mut view = renderer.new_view();
         renderer.resize(&mut view, size.0, size.1, 1.0, f32::MAX);
         let tex = g
@@ -292,39 +293,42 @@ pub fn loadtest(cfg: Config, outputs: Vec<(u32, u32)>, seconds: f64, collector: 
     }
     let perf = world.cfg.performance.clone();
     let battery = crate::app::on_battery();
+    let fps = if battery { perf.fps.min(perf.fps_battery) } else { perf.fps }.max(1);
+    let interval = std::time::Duration::from_secs_f64(1.0 / fps as f64);
+    println!("GPU: {} ({}), target {fps} fps", g.adapter.get_info().name, if g.is_integrated() { "integrated" } else { "discrete" });
+    let mut gaps: Vec<f64> = vec![];
+    let mut last_frame = std::time::Instant::now();
+    let (mut t_step, mut t_render) = (0.0f64, 0.0f64);
     let (cpu0, gpu0, t0) = (process_cpu_seconds(), gpu_idle_ms(), std::time::Instant::now());
     let mut last = t0;
     let mut accum = 0.0;
-    let mut fast_time = 0.0;
     while t0.elapsed().as_secs_f64() < seconds {
         let now = std::time::Instant::now();
         let real_dt = now.duration_since(last).as_secs_f64();
         last = now;
         accum += real_dt;
-        if world.is_synthetic() {
-            while accum >= DT {
-                world.step(DT);
-                accum -= DT;
-            }
-        }
-        let fast = world.wants_fast_frames();
-        if fast {
-            fast_time += real_dt;
-        }
-        let mut fps = if fast { perf.fps_active } else { perf.fps_calm };
-        if battery {
-            fps = fps.min(perf.fps_battery);
-        }
-        let interval = std::time::Duration::from_secs_f64(1.0 / fps.max(1) as f64);
         let mut wake = now + interval;
-        if !world.is_synthetic() && outs.iter().any(|o| now >= o.next) {
+        if outs.iter().any(|o| now >= o.next) {
+            let ts = std::time::Instant::now();
             world.step(accum.min(0.5));
+            t_step += ts.elapsed().as_secs_f64();
             accum = 0.0;
+            if t0.elapsed().as_secs_f64() > 5.0 {
+                // Steady state only (the first seconds include loading).
+                let g = now.duration_since(last_frame).as_secs_f64() * 1e3;
+                gaps.push(g);
+                if g > 20.0 {
+                    log::debug!("slow frame: {g:.1} ms at t={:.1}s (layout v{})", t0.elapsed().as_secs_f64(), world.layout_version);
+                }
+            }
+            last_frame = now;
         }
         for o in &mut outs {
             if now >= o.next {
                 let cam = Camera::new(o.comp, o.size.0 as f32 / o.size.1 as f32, &world.cfg.tower, world.y_top(), 0.0, world.t as f32);
+                let tr = std::time::Instant::now();
                 renderer.render(&mut o.view, &mut world, &cam, &o.tex, interval.as_secs_f32());
+                t_render += tr.elapsed().as_secs_f64();
                 o.frames += 1;
                 o.next = now + interval;
             }
@@ -340,15 +344,18 @@ pub fn loadtest(cfg: Config, outputs: Vec<(u32, u32)>, seconds: f64, collector: 
         (Some(a), Some(b)) => Some((1.0 - (b - a) / (secs * 1e3)) * 100.0),
         _ => None,
     };
-    println!(
-        "{secs:.0} s, {:.0}% of the time at the active frame rate{}",
-        fast_time / secs * 100.0,
-        if battery { " (battery)" } else { "" }
-    );
+    gaps.sort_by(|a, b| a.total_cmp(b));
+    let p99 = gaps.get(gaps.len() * 99 / 100).copied().unwrap_or(0.0);
+    let max_gap = gaps.last().copied().unwrap_or(0.0);
+    println!("{secs:.0} s{}; frame interval p99 {p99:.1} ms, max {max_gap:.1} ms", if battery { " (battery)" } else { "" });
     for o in &outs {
         println!("  {}x{} {:?}: {:.1} fps", o.size.0, o.size.1, o.comp, o.frames as f64 / secs);
     }
-    println!("renderer CPU: {cpu:.1}% of one core");
+    println!(
+        "renderer CPU: {cpu:.1}% of one core (world step {:.1}%, render+encode {:.1}%)",
+        t_step / secs * 100.0,
+        t_render / secs * 100.0
+    );
     match (baseline, gpu) {
         (Some(b), Some(g)) => {
             println!("iGPU busy: {g:.1}% (baseline without the renderer {:.1}%, so +{:.1} points)", b * 100.0, g - b * 100.0)

@@ -12,10 +12,10 @@
 // Rings closer than this many per pixel start using the dense path.
 const DENSE_FROM: f32 = 0.7;
 const DENSE_TO: f32 = 1.4;
-// Vertical taps in the dense path. Rings only rotate and the colour texture is
-// filtered along each ring, so a few stable taps are enough.
-const DENSE_TAPS_FRONT: f32 = 2.0;
-const DENSE_TAPS_BACK: f32 = 1.0;
+// Vertical taps in the dense path: one per ring covered by the pixel, up to
+// G.times2.w (16 on discrete GPUs, 4 on integrated), i.e. a box filter over the
+// rings in the pixel's footprint. Fewer taps would pick a random subset of the
+// rings, which crawls like sensor noise as the rings turn.
 
 struct TowerOut {
     @builtin(position) clip: vec4<f32>,
@@ -56,7 +56,7 @@ fn exact(in: TowerOut, rr: f32, turn0: f32, pitch: f32, ds_px: f32, dturn_px: f3
     }
     let turn = fract(turn0 - ring_phase(ring, t));
     let x = min(u32(turn * atlas_w), u32(atlas_w) - 1u);
-    let local = textureLoad(atlas, vec2<u32>(x, ri), 0).r;
+    let local = textureLoad(atlas, vec2<u32>(x, ring.row), 0).r;
     if (local == 0u) {
         return vec3<f32>(0.0);
     }
@@ -103,7 +103,7 @@ fn dense(in: TowerOut, r: f32, dr_px: f32, turn0: f32, max_taps: f32, t: f32) ->
             continue;
         }
         let u = fract(turn0 - ring_phase(ring, t));
-        acc += textureSampleLevel(ring_tex, ring_samp, vec2<f32>(u, (f32(ri) + 0.5) / rows), 0.0).rgb;
+        acc += textureSampleLevel(ring_tex, ring_samp, vec2<f32>(u, (f32(ring.row) + 0.5) / rows), 0.0).rgb;
     }
     // Packed rings cover `fill` of their pitch.
     return acc * (G.tower2.z / f32(n));
@@ -139,7 +139,8 @@ fn fs_tower(in: TowerOut, @builtin(front_facing) front: bool) -> @location(0) ve
         acc += exact(in, r, turn0, pitch, ds_px, dturn_px, t) * (1.0 - w);
     }
     if (w > 0.0) {
-        acc += dense(in, r, dr_px, turn0, select(DENSE_TAPS_BACK, DENSE_TAPS_FRONT, front || G.tower2.w > 0.99), t) * w;
+        let taps = select(max(G.times2.w * 0.5, 1.0), G.times2.w, front || G.tower2.w > 0.99);
+        acc += dense(in, r, dr_px, turn0, taps, t) * w;
     }
     if (!front) {
         acc *= G.tower2.w;

@@ -9,7 +9,7 @@ use crate::camera::Camera;
 use crate::fx;
 use crate::gpu_types::{Globals, RingGpu, SegmentGpu, SpriteVertex};
 use crate::text::GlyphAtlas;
-use crate::world::{ATLAS_W, BOOST_TAU, LUT_BINS, RCT_BINS, World};
+use crate::world::{ATLAS_W, BOOST_TAU, LUT_BINS, World};
 use anyhow::Result;
 use wgpu::util::DeviceExt;
 
@@ -74,7 +74,23 @@ struct Targets {
     final_bg: [wgpu::BindGroup; 2],
 }
 
+/// GPU-dependent quality settings.
+#[derive(Clone, Copy, Debug)]
+pub struct Quality {
+    /// Angle bins per ring in the ring colour texture (tower dense path).
+    pub ring_bins: u32,
+    /// Most rings averaged per pixel where rings are packed (dense path).
+    pub dense_taps: u32,
+}
+
+impl Quality {
+    pub fn for_gpu(integrated: bool) -> Self {
+        if integrated { Self { ring_bins: 256, dense_taps: 4 } } else { Self { ring_bins: ATLAS_W, dense_taps: 16 } }
+    }
+}
+
 pub struct Renderer {
+    quality: Quality,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pub out_format: wgpu::TextureFormat,
@@ -100,11 +116,16 @@ pub struct Renderer {
     bands_buf: wgpu::Buffer,
     bands_cap: usize,
     n_bands: u32,
+    /// Ring index of each atlas slot (u32::MAX = free).
+    slot_ring_buf: wgpu::Buffer,
+    slot_ring_cap: usize,
+    /// Slots whose colours must be redrawn with the next ring colour pass.
+    recolour: Vec<u32>,
     atlas_tex: wgpu::Texture,
     atlas_view: wgpu::TextureView,
     atlas_rows: u32,
 
-    // Ring colour texture (tower dense path), RCT_BINS x atlas_rows.
+    // Ring colour texture (tower dense path), ring_bins x atlas_rows.
     rct_view: wgpu::TextureView,
     _rct_tex: wgpu::Texture,
     rct_bgl: wgpu::BindGroupLayout,
@@ -216,10 +237,10 @@ fn atlas_texture(device: &wgpu::Device, rows: u32) -> (wgpu::Texture, wgpu::Text
     (tex, view)
 }
 
-fn rct_texture(device: &wgpu::Device, rows: u32, format: wgpu::TextureFormat) -> (wgpu::Texture, wgpu::TextureView) {
+fn rct_texture(device: &wgpu::Device, bins: u32, rows: u32, format: wgpu::TextureFormat) -> (wgpu::Texture, wgpu::TextureView) {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("ring colours"),
-        size: wgpu::Extent3d { width: RCT_BINS, height: rows.max(1), depth_or_array_layers: 1 },
+        size: wgpu::Extent3d { width: bins, height: rows.max(1), depth_or_array_layers: 1 },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -263,7 +284,8 @@ fn vertex_buffer(device: &wgpu::Device, label: &str, count: usize) -> wgpu::Buff
 }
 
 impl Renderer {
-    pub fn new(device: wgpu::Device, queue: wgpu::Queue, out_format: wgpu::TextureFormat) -> Result<Self> {
+    pub fn new(device: wgpu::Device, queue: wgpu::Queue, out_format: wgpu::TextureFormat, quality: Quality) -> Result<Self> {
+        log::info!("quality: {quality:?}");
         let atlas = GlyphAtlas::build()?;
         let hdr = if device.features().contains(wgpu::Features::RG11B10UFLOAT_RENDERABLE) && std::env::var_os("GITS_HDR16").is_none() {
             wgpu::TextureFormat::Rg11b10Ufloat
@@ -323,6 +345,7 @@ impl Renderer {
                     },
                     count: None,
                 },
+                storage_entry(6),
             ],
         });
         let sprite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -544,7 +567,7 @@ impl Renderer {
         let seg_cap = 1024;
         let ring_cap = 256;
         let (atlas_tex, atlas_view) = atlas_texture(&device, 256);
-        let (rct_tex, rct_view) = rct_texture(&device, 256, hdr);
+        let (rct_tex, rct_view) = rct_texture(&device, quality.ring_bins, 256, hdr);
         let rct_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("ring colours"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -571,12 +594,16 @@ impl Renderer {
         let dummy = Target::new(&device, 1, 1, hdr, "dummy");
 
         Ok(Self {
+            quality,
             seg_buf: storage_buffer(&device, "segments", (seg_cap * std::mem::size_of::<SegmentGpu>()) as u64),
             ring_buf: storage_buffer(&device, "rings", (ring_cap * std::mem::size_of::<RingGpu>()) as u64),
             open_buf: storage_buffer(&device, "ring open", (ring_cap * 4) as u64),
             lut_buf: storage_buffer(&device, "lut", ((LUT_BINS + 1) * 4) as u64),
             bands_buf: storage_buffer(&device, "layer bands", 16 * 16),
             bands_cap: 16,
+            slot_ring_buf: storage_buffer(&device, "slot rings", 1024 * 4),
+            slot_ring_cap: 1024,
+            recolour: vec![],
             n_bands: 0,
             seg_cap,
             ring_cap,
@@ -660,7 +687,8 @@ impl Renderer {
     /// (Re)creates the internal render targets for an output of `out_w`×`out_h`.
     pub fn resize(&self, view: &mut View, out_w: u32, out_h: u32, render_scale: f32, max_megapixels: f32) {
         let mut s = render_scale.clamp(0.2, 1.0);
-        let max_px = (max_megapixels.max(0.1) * 1.0e6) as f64;
+        // 0 or less: no cap.
+        let max_px = if max_megapixels > 0.0 { (max_megapixels.max(0.1) * 1.0e6) as f64 } else { f64::INFINITY };
         let px = out_w as f64 * out_h as f64 * (s * s) as f64;
         if px > max_px {
             s *= (max_px / px).sqrt() as f32;
@@ -692,6 +720,16 @@ impl Renderer {
     }
 
     fn upload_world(&mut self, w: &mut World) {
+        let t0 = std::time::Instant::now();
+        let full = w.layout_version != self.layout_version;
+        self.upload_world_inner(w);
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        if ms > 3.0 {
+            log::debug!("upload took {ms:.1} ms (full layout upload: {full})");
+        }
+    }
+
+    fn upload_world_inner(&mut self, w: &mut World) {
         let q = &self.queue;
         if w.layout_version != self.layout_version {
             let n_segs = w.segs.len().max(1);
@@ -708,11 +746,12 @@ impl Renderer {
                 self.open_buf = storage_buffer(&self.device, "ring open", (self.ring_cap * 4) as u64);
                 rebind = true;
             }
-            if n_rings as u32 > self.atlas_rows {
-                let rows = ((n_rings as u32 * 5 / 4).div_ceil(256) * 256).min(self.max_atlas_rows);
+            let n_slots = w.n_slots.max(1);
+            if n_slots > self.atlas_rows {
+                let rows = ((n_slots * 5 / 4).div_ceil(256) * 256).min(self.max_atlas_rows);
                 (self.atlas_tex, self.atlas_view) = atlas_texture(&self.device, rows);
                 self.atlas_rows = rows;
-                let (tex, view) = rct_texture(&self.device, rows, self.hdr);
+                let (tex, view) = rct_texture(&self.device, self.quality.ring_bins, rows, self.hdr);
                 self.rct_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("ring colours"),
                     layout: &self.rct_bgl,
@@ -723,6 +762,12 @@ impl Renderer {
                 });
                 (self._rct_tex, self.rct_view) = (tex, view);
                 w.rct_full = true;
+                w.slots_full = true;
+                rebind = true;
+            }
+            if n_slots as usize > self.slot_ring_cap {
+                self.slot_ring_cap = n_slots as usize * 3 / 2 + 256;
+                self.slot_ring_buf = storage_buffer(&self.device, "slot rings", (self.slot_ring_cap * 4) as u64);
                 rebind = true;
             }
             if !w.segs.is_empty() {
@@ -731,18 +776,31 @@ impl Renderer {
             if !w.rings.is_empty() {
                 q.write_buffer(&self.ring_buf, 0, bytemuck::cast_slice(&w.rings));
                 q.write_buffer(&self.open_buf, 0, bytemuck::cast_slice(&w.ring_open));
-                let rows = (w.rings.len() as u32).min(self.atlas_rows);
-                q.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &self.atlas_tex,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    &w.atlas[..(rows * ATLAS_W) as usize],
-                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(ATLAS_W), rows_per_image: Some(rows) },
-                    wgpu::Extent3d { width: ATLAS_W, height: rows, depth_or_array_layers: 1 },
-                );
+                q.write_buffer(&self.slot_ring_buf, 0, bytemuck::cast_slice(&w.slot_ring));
+                // Atlas rows: all of them the first time, afterwards only rows
+                // whose ring changed (rings keep their row across relayouts).
+                let n = w.n_slots.min(self.atlas_rows);
+                let mut dirty = std::mem::take(&mut w.dirty_slots);
+                let runs = if w.slots_full { vec![[0, n]] } else { coalesce(&mut dirty) };
+                w.slots_full = false;
+                for [a, b] in runs {
+                    let b = b.min(n);
+                    if a >= b {
+                        continue;
+                    }
+                    q.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &self.atlas_tex,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d { x: 0, y: a, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &w.slot_rows[(a * ATLAS_W) as usize..(b * ATLAS_W) as usize],
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(ATLAS_W), rows_per_image: Some(b - a) },
+                        wgpu::Extent3d { width: ATLAS_W, height: b - a, depth_or_array_layers: 1 },
+                    );
+                    self.recolour.extend(a..b);
+                }
             }
             if rebind {
                 self.tower_bg = None;
@@ -809,6 +867,7 @@ impl Renderer {
                     wgpu::BindGroupEntry { binding: 3, resource: self.lut_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.atlas_view) },
                     wgpu::BindGroupEntry { binding: 5, resource: self.bands_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: self.slot_ring_buf.as_entire_binding() },
                 ],
             }));
         }
@@ -818,10 +877,10 @@ impl Renderer {
     /// Chooses the ring colour texture rows to redraw for world time `w.t`
     /// (once per world time, however many views render it).
     fn plan_ring_colours(&mut self, w: &mut World) {
-        if w.t == self.rct_t && !w.rct_full {
+        if w.t == self.rct_t && !w.rct_full && self.recolour.is_empty() {
             return;
         }
-        let n = (w.rings.len() as u32).min(self.atlas_rows);
+        let n = w.n_slots.min(self.atlas_rows);
         let dt = (w.t - self.rct_t).clamp(0.0, RCT_REFRESH_S);
         self.rct_t = w.t;
         self.ranges.clear();
@@ -831,6 +890,7 @@ impl Renderer {
         if w.rct_full {
             w.rct_full = false;
             w.take_hot_rows();
+            self.recolour.clear();
             self.ranges.push([0, n]);
             return;
         }
@@ -839,7 +899,10 @@ impl Renderer {
         let start = self.rct_cursor % n;
         let end = (start + slice).min(n);
         self.rct_cursor = if end >= n { 0 } else { end };
-        let mut rows: Vec<u32> = w.take_hot_rows().into_iter().filter(|&r| r < n).collect();
+        // Hot rows are ring indices; the texture is indexed by slot.
+        let mut rows: Vec<u32> = w.take_hot_rows().into_iter().filter_map(|r| w.ring_slot.get(r as usize).copied()).collect();
+        rows.append(&mut self.recolour);
+        rows.retain(|&r| r < n);
         let mut ranges = coalesce(&mut rows);
         ranges.push([start, end]);
         self.ranges = ranges;
@@ -881,12 +944,12 @@ impl Renderer {
             col_teal: rgb("teal", 1.0),
             col_bg: rgb("background", 1.0),
             times: [c.events.read.decay.0, c.events.write.decay.0, c.events.create.grow.0.max(0.01), c.events.delete.ghost_hours * 3600.0],
-            times2: [c.calm.attack.0, tw.fill_open, w.loop_fade, 0.0],
+            times2: [c.calm.attack.0, tw.fill_open, w.loop_fade, self.quality.dense_taps as f32],
             age: [c.age.fresh_days.max(1e-3).log10(), c.age.old_days.max(1e-3).log10(), c.age.stale_days.max(1e-3).log10(), 0.0],
             screen: [iw as f32, ih as f32, 1.0 / iw.max(1) as f32, 1.0 / ih.max(1) as f32],
             post: [c.palette.exposure, c.palette.bloom, c.palette.grain, c.palette.vignette],
             post2: [smear_decay, (view.frame % 997) as f32, if self.out_format.is_srgb() { 0.0 } else { 1.0 }, 1.0 / BLOOM_LEVELS as f32],
-            rct: [self.atlas_rows as f32, RCT_BINS as f32, (ATLAS_W / RCT_BINS) as f32, self.n_bands as f32],
+            rct: [self.atlas_rows as f32, self.quality.ring_bins as f32, (ATLAS_W / self.quality.ring_bins) as f32, self.n_bands as f32],
         }
     }
 

@@ -491,6 +491,39 @@ per-process CPU, and iGPU busy time from `rc6_residency_ms`):
   connector via `[monitors."DP-1"]`. Not done: `band`, security-voice HUD
   lines during surges, optional composition rotation.
 
+### Comfort pass (2026-09-28)
+
+First real use: the 6 fps timer-paced frames plus motion trails caused
+nausea, and the drum looked like a noisy low-light photo. Guidance reviewed:
+the VR comfort guides (Oculus/Meta/Qualcomm) call for a steady frame rate locked
+to the display (≥60), no judder or dropped frames, no motion blur, and avoiding
+high-contrast fine patterns and sudden accelerations. The W3C/web.dev guidance
+agrees (and also lists flicker and rotation).
+
+- Frame pacing: 60 fps (`fps`), each redraw released by the compositor's
+  frame callback (vsync-locked), mailbox presentation, with all motion driven
+  by real elapsed time. The synthetic session keeps fixed internal steps, so it
+  stays deterministic.
+- Removed defaults: motion smear (trails) and film grain. Bloom lowered.
+- GPU: `gpu = "auto"` uses NVIDIA at native resolution on mains (the NVIDIA
+  Vulkan driver can present to GNOME 42 Wayland windows in the real session,
+  though not in the headless sandbox). Battery: integrated GPU at 0.6 scale and
+  30 fps; a power change makes the renderer exit with code 75 and the extension
+  restarts it.
+- Noise: the dense path averages every ring in the pixel footprint (up to 16
+  taps, box filter), and the ring colour texture has 1024 angle bins (from 256).
+  The drum now reads as brushed-gold striations.
+- Hitches: layout builds run on a worker thread against a shared, frozen
+  `Arc<Model>` (collector updates wait in their channel for the ~20–40 ms).
+  Rings keep their atlas and colour-texture row ("slot") across relayouts, so an
+  install uploads and recolours only changed rings (typically 1 of 15.7k). Ghost
+  expiry is incremental. The full sweep only runs while hidden. Live relayouts
+  run at most every 20 s. Result: longest frame 16.9 ms over 75 s at 60 fps.
+- Write spin boosts ease in and out (smoothstep over 12 s, one at a time), not
+  an instant jump in angular speed; `spin_up` 0.35 → 0.15.
+- CPU at 60 fps × 3 monitors: ~20% of one core (world step ~6%, encoding
+  ~14%, of which the lookup-table/bands update is ~0.6 ms/step).
+
 ### Efficiency backlog
 
 - Tower fragment shader is ~65% of GPU time: cheaper samples in the dense drum,

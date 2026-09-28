@@ -117,6 +117,8 @@ enum Cmd {
     },
     /// Print the built-in default configuration.
     DefaultConfig,
+    /// Report which GPUs can present to a window here (nothing is shown).
+    GpuCheck,
 }
 
 fn main() -> Result<()> {
@@ -131,7 +133,7 @@ fn main() -> Result<()> {
         log::info!("config: {} (merged over defaults)", p.display());
     }
     // Before any thread exists (it sets an environment variable).
-    gpu::select_vulkan_drivers(cfg.performance.prefer_igpu);
+    gpu::select_vulkan_drivers(want_discrete(&cfg));
     if let Some(seed) = cli.seed {
         cfg.synthetic.seed = seed;
     }
@@ -150,11 +152,16 @@ fn main() -> Result<()> {
         Cmd::Window { width, height, warmup, speed } => {
             let outputs = vec![app::OutputSpec { index: -1, name: "window".into(), width, height }];
             let fell_back = fell_back.then(|| socket.clone());
-            app::run(cfg, app::Options { config_path, outputs, wallpaper: false, warmup, speed, collector, fell_back })
+            app::run(cfg, app::Options { config_path, outputs, wallpaper: false, warmup, speed, collector, fell_back }).map(|_| ())
         }
         Cmd::Wallpaper { outputs } => {
             let fell_back = fell_back.then(|| socket.clone());
-            app::run(cfg, app::Options { config_path, outputs, wallpaper: true, warmup: 0.0, speed: None, collector, fell_back })
+            let code =
+                app::run(cfg, app::Options { config_path, outputs, wallpaper: true, warmup: 0.0, speed: None, collector, fell_back })?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
         }
         Cmd::Snapshot { out, width, height, at, frames, every, composition } => {
             snapshot::run(cfg, snapshot::Options { out, width, height, at, frames, every, composition }, collector)
@@ -173,11 +180,17 @@ fn main() -> Result<()> {
             stats(cfg, minutes, timeline, collector);
             Ok(())
         }
+        Cmd::GpuCheck => gpu::check(),
         Cmd::DefaultConfig => {
             print!("{}", gits_core::config::DEFAULT_TOML);
             Ok(())
         }
     }
+}
+
+/// Discrete GPU wanted (per `[performance] gpu`) and present.
+pub fn want_discrete(cfg: &Config) -> bool {
+    cfg.performance.wants_discrete(app::on_battery()) && gpu::has_discrete_gpu()
 }
 
 /// Returns the collector socket to use (None = synthetic) and whether "auto"

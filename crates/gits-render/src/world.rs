@@ -11,10 +11,9 @@ use gits_core::rng::{Rng, hash01};
 use gits_core::synth::{self, Session};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub const ATLAS_W: u32 = 1024;
-/// Angle bins per ring in the ring colour texture (the tower's dense path).
-pub const RCT_BINS: u32 = 256;
 /// How long a ring's row keeps being redrawn every frame after it changed.
 const HOT_SECONDS: f32 = 3.0;
 /// Each depth layer's cylinder is drawn only over the height bands holding its
@@ -23,12 +22,18 @@ const BAND_MERGE: f32 = 0.04;
 /// At most this many bands per layer (the merge distance grows until it fits).
 const MAX_BANDS_PER_LAYER: usize = 128;
 pub const LUT_BINS: usize = 16384;
-pub const BOOST_TAU: f32 = 6.0;
+/// Duration of a write's spin boost. The extra rotation eases in and out
+/// (smoothstep), so the ring never jumps in speed.
+pub const BOOST_TAU: f32 = 12.0;
 /// Max tilt of an unwound ring, in ring pitches (mirrors TILT in tower.wgsl).
 pub const TILT: f32 = 0.3;
 const RELAYOUT_MIN_INTERVAL: f64 = 0.5;
+/// Fixed step of the synthetic work session.
+const SESSION_DT: f64 = 1.0 / 24.0;
+/// Folder activity (decay, which folders are open) is updated this often.
+const ACTIVITY_INTERVAL: f32 = 0.05;
 /// Live trees are large (a rebuild takes tens of ms), so rebuild at most this often.
-const RELAYOUT_LIVE_INTERVAL: f64 = 5.0;
+const RELAYOUT_LIVE_INTERVAL: f64 = 20.0;
 /// Directory activity below this does not count as "hot" for layout priority.
 const HOT_MIN: f32 = 0.5;
 /// Activity at which a collapsed directory is unfolded, and how often that may happen.
@@ -86,25 +91,51 @@ pub struct World {
     /// Nothing is being drawn: skip work that only matters on screen (layout
     /// rebuilds are deferred until the next visible frame).
     pub hidden: bool,
+    session_accum: f64,
+    session_t: f64,
+    /// Time since folder activity was last decayed (it changes slowly).
+    activity_dt: f32,
+    /// Per ring: fraction of the open pitch it gets (recomputed per layout).
+    ring_share: Vec<f32>,
     /// A screencast/screen share is running (labels are obfuscated if configured).
     pub sharing: bool,
     pub notice: Option<Notice>,
-    pub model: Model,
+    /// Shared with the layout worker while a build runs (nothing mutates it then).
+    pub model: Arc<Model>,
     pub source: Source,
+    /// A layout being built on a worker thread (live data only).
+    pending_layout: Option<std::sync::mpsc::Receiver<LayoutResult>>,
+    /// Files before this index already have their arc length.
+    arcs_assigned: usize,
     pub t: f64,
     pub layout: Layout,
     pub layout_version: u64,
     layout_t: f64,
     needs_relayout: bool,
     last_purge_t: f64,
+    /// Deleted files (deletion time, file) whose ghosts are still shown.
+    ghosts: std::collections::VecDeque<(f64, u32)>,
     max_rings: usize,
 
     pub segs: Vec<SegmentGpu>,
     pub rings: Vec<RingGpu>,
     pub ring_open: Vec<f32>,
     ring_presence: Vec<f32>,
-    /// Per ring row: 1-based index of the segment within its ring (0 = gap).
-    pub atlas: Vec<u8>,
+    /// Segment atlas by stable row ("slot"): per row, the 1-based index of the
+    /// segment within its ring (0 = gap). A ring keeps its slot across
+    /// relayouts, so a rebuild only uploads and recolours rings that changed.
+    pub slot_rows: Vec<u8>,
+    /// Slot of each ring, and ring of each slot (NONE = free).
+    pub ring_slot: Vec<u32>,
+    pub slot_ring: Vec<u32>,
+    pub n_slots: u32,
+    slot_of_key: HashMap<u64, u32>,
+    slot_hash: Vec<u64>,
+    slot_free: Vec<u32>,
+    /// Slots whose atlas row changed since the renderer last uploaded them.
+    pub dirty_slots: Vec<u32>,
+    /// The renderer must upload every slot (first layout).
+    pub slots_full: bool,
     pub lut: Vec<f32>,
     /// Centre height (distance from the tower top) and pitch of each ring.
     pub ring_s: Vec<f32>,
@@ -172,6 +203,10 @@ impl World {
         let initial_model = model.clone();
         let initial_files = initial_model.files.len();
         let mut w = Self {
+            session_accum: 0.0,
+            session_t: 0.0,
+            activity_dt: 0.0,
+            ring_share: vec![],
             hidden: false,
             sharing: false,
             initial_model,
@@ -186,20 +221,31 @@ impl World {
             ring_presence_target: vec![],
             cfg,
             notice,
-            model,
+            model: Arc::new(model),
             source,
+            pending_layout: None,
+            arcs_assigned: 0,
             t: 0.0,
             layout: Layout::default(),
             layout_version: 0,
             layout_t: -1.0,
             needs_relayout: true,
             last_purge_t: 0.0,
+            ghosts: Default::default(),
             max_rings,
             segs: vec![],
             rings: vec![],
             ring_open: vec![],
             ring_presence: vec![],
-            atlas: vec![],
+            slot_rows: vec![],
+            ring_slot: vec![],
+            slot_ring: vec![],
+            n_slots: 0,
+            slot_of_key: HashMap::new(),
+            slot_hash: vec![],
+            slot_free: vec![],
+            dirty_slots: vec![],
+            slots_full: true,
             lut: vec![0.0; LUT_BINS + 1],
             ring_s: vec![],
             ring_pitch: vec![],
@@ -243,9 +289,10 @@ impl World {
         }
         self.cfg = cfg;
         if relayout {
-            for f in &mut self.model.files {
+            for f in &mut Arc::make_mut(&mut self.model).files {
                 f.arc = 0.0;
             }
+            self.arcs_assigned = 0;
             self.relayout();
         }
         self.sync_spin();
@@ -274,11 +321,110 @@ impl World {
         }
     }
 
-    fn tf(&self, t: f64) -> f32 {
-        if t <= NEVER * 0.5 { -1.0e9 } else { t as f32 }
+    fn building(&self) -> bool {
+        self.pending_layout.is_some()
     }
 
+    /// Captures what a layout build needs (assigning arcs to new files first).
+    fn layout_job(&mut self) -> LayoutJob {
+        let params = self.layout_params();
+        self.arcs_assigned = layout::assign_arcs(Arc::make_mut(&mut self.model), &params, self.arcs_assigned);
+        // Directories with current activity get expanded first ("unfolding").
+        let hot: Vec<f32> = self.dir_act.iter().map(|&a| if a >= HOT_MIN { a } else { 0.0 }).collect();
+        LayoutJob {
+            now_unix: self.model.epoch_unix as f64 + self.t - self.age_offset,
+            model: self.model.clone(),
+            params,
+            hot,
+            prev_layout_t: self.layout_t,
+            t: self.t,
+        }
+    }
+
+    /// Rebuilds the layout now, on this thread.
     pub fn relayout(&mut self) {
+        // A build still running on a worker is superseded.
+        self.pending_layout = None;
+        let job = self.layout_job();
+        let res = run_layout_job(job);
+        self.install_layout(res);
+    }
+
+    /// Starts a rebuild: on a worker thread for live data (large trees), so
+    /// frames keep coming while it runs; inline for synthetic data.
+    fn start_relayout(&mut self) {
+        if self.is_synthetic() || self.layout_version == 0 {
+            self.relayout();
+            return;
+        }
+        let job = self.layout_job();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("layout".into()).spawn(move || {
+            let _ = tx.send(run_layout_job(job));
+        });
+        match spawned {
+            Ok(_) => {
+                self.pending_layout = Some(rx);
+                self.needs_relayout = false;
+            }
+            Err(e) => {
+                log::warn!("layout thread: {e}; building inline");
+                self.relayout();
+            }
+        }
+    }
+
+    /// Gives every ring a stable slot (atlas row) and copies rows whose content
+    /// changed. Returns the number of changed rows.
+    fn assign_slots(&mut self, atlas: &[u8], row_hash: &[u64]) -> usize {
+        let w = ATLAS_W as usize;
+        let n = row_hash.len();
+        let mut old = std::mem::take(&mut self.slot_of_key);
+        let mut new_keys: HashMap<u64, u32> = HashMap::with_capacity(n);
+        self.ring_slot = vec![0; n];
+        let mut changed = 0;
+        for (i, &hash) in row_hash.iter().enumerate() {
+            let key = self.layout.rings[i].key();
+            // Duplicate keys (a deleted folder and a new one with the same name)
+            // get a fresh slot.
+            let reused = if new_keys.contains_key(&key) { None } else { old.remove(&key) };
+            let slot = match reused {
+                Some(s) => s,
+                None => {
+                    if let Some(s) = self.slot_free.pop() {
+                        self.slot_hash[s as usize] = !hash; // force a copy
+                        s
+                    } else {
+                        self.n_slots += 1;
+                        self.slot_rows.resize(self.n_slots as usize * w, 0);
+                        self.slot_hash.push(!hash);
+                        self.n_slots - 1
+                    }
+                }
+            };
+            new_keys.entry(key).or_insert(slot);
+            self.ring_slot[i] = slot;
+            if self.slot_hash[slot as usize] != hash {
+                self.slot_hash[slot as usize] = hash;
+                let (d, s) = (slot as usize * w, i * w);
+                self.slot_rows[d..d + w].copy_from_slice(&atlas[s..s + w]);
+                self.dirty_slots.push(slot);
+                changed += 1;
+            }
+        }
+        for (_, s) in old.drain() {
+            self.slot_free.push(s);
+        }
+        self.slot_of_key = new_keys;
+        self.slot_ring = vec![NONE; self.n_slots as usize];
+        for (i, &s) in self.ring_slot.iter().enumerate() {
+            self.slot_ring[s as usize] = i as u32;
+        }
+        changed
+    }
+
+    /// Installs a finished layout, carrying ring animation state over.
+    fn install_layout(&mut self, res: LayoutResult) {
         let started = std::time::Instant::now();
         let first = self.layout_version == 0;
         let mut persist: HashMap<u64, RingPersist> = HashMap::with_capacity(self.layout.rings.len());
@@ -287,75 +433,23 @@ impl World {
                 persist.insert(r.key(), RingPersist { gpu: self.rings[i], open: self.ring_open[i], presence: self.ring_presence[i] });
             }
         }
-
-        let params = self.layout_params();
-        // Directories with current activity get expanded first ("unfolding").
-        let hot: Vec<f32> = self.dir_act.iter().map(|&a| if a >= HOT_MIN { a } else { 0.0 }).collect();
-        self.layout = layout::build(&mut self.model, &params, &hot);
-        let t_build = started.elapsed().as_secs_f64() * 1e3;
-        let m = &self.model;
-        let n_rings = self.layout.rings.len();
-
-        // Segments.
-        let now_unix = m.epoch_unix as f64 + self.t - self.age_offset;
-        let prev_layout_t = self.layout_t;
-        let mut segs = Vec::with_capacity(self.layout.segments.len());
-        for (i, s) in self.layout.segments.iter().enumerate() {
-            let mut g = SegmentGpu {
-                a0: s.a0,
-                a1: s.a1,
-                ring: s.ring,
-                flags: s.flags,
-                hash: hash01(i as u64 * 7919 + s.ring as u64),
-                ..Default::default()
-            };
-            g.t_create = -1.0e9;
-            g.t_read = -1.0e9;
-            g.t_write = -1.0e9;
-            g.t_delete = -1.0e9;
-            g.t_retract = -1.0e9;
-            g.t_age = -1.0e9;
-            match s.source {
-                SegSource::File(f) => {
-                    let file = &m.files[f as usize];
-                    g.age_days = ((now_unix - file.mtime as f64) / 86400.0).max(0.0) as f32;
-                    g.size_f = ((file.size as f64 + 1.0).log2() / 34.0).clamp(0.0, 1.0) as f32;
-                    g.t_read = self.tf(file.t_read);
-                    g.t_write = self.tf(file.t_write);
-                    if file.t_create != NEVER {
-                        // Files created since the previous layout grow in now.
-                        g.t_create = if file.t_create > prev_layout_t { self.t as f32 } else { file.t_create as f32 };
-                    }
-                    if file.t_delete != NEVER {
-                        g.flags |= SEG_DELETED;
-                        g.t_delete = file.t_delete as f32;
-                    }
-                    g.hash = hash01(f as u64);
-                }
-                SegSource::Dir(_) => {
-                    g.age_days = 1.0;
-                    g.size_f = 0.2;
-                }
-                SegSource::Agg(_) => {
-                    g.age_days = 30.0;
-                    g.size_f = 0.8;
-                }
-            }
-            g.age_from = g.age_days;
-            segs.push(g);
-        }
+        let LayoutResult { layout, segs, atlas, row_hash, first_seg, job_t, t_build, t_segs, t_atlas } = res;
+        self.layout = layout;
         self.segs = segs;
+        let n_rings = self.layout.rings.len();
+        let changed_rows = self.assign_slots(&atlas, &row_hash);
 
-        // Rings, carrying animation state over by key.
         self.rings = Vec::with_capacity(n_rings);
         self.ring_open = Vec::with_capacity(n_rings);
         self.ring_presence = Vec::with_capacity(n_rings);
-        for r in &self.layout.rings {
+        for (i, r) in self.layout.rings.iter().enumerate() {
             let h = r.hash();
             let depth = r.depth as f32;
             if let Some(p) = persist.get(&r.key()) {
                 let mut g = p.gpu;
                 g.depth = depth;
+                g.first_seg = first_seg[i];
+                g.row = self.ring_slot[i];
                 self.rings.push(g);
                 self.ring_open.push(p.open);
                 self.ring_presence.push(p.presence);
@@ -368,37 +462,15 @@ impl World {
                     boost: 0.0,
                     boost_t0: -1.0e9,
                     hash: hash01(h ^ 0x77),
-                    first_seg: 0,
-                    _pad: 0.0,
+                    first_seg: first_seg[i],
+                    row: self.ring_slot[i],
                 });
                 self.ring_open.push(0.0);
                 self.ring_presence.push(if first { 1.0 } else { 0.0 });
             }
         }
 
-        let t_segs = started.elapsed().as_secs_f64() * 1e3;
-        // Segment atlas: one row per ring, ATLAS_W texels around it, holding the
-        // segment's 1-based position within its ring (segments are stored in ring
-        // order, so the shader adds the ring's first segment index).
-        let w = ATLAS_W as usize;
-        self.atlas = vec![0u8; w * n_rings.max(1)];
-        let mut first = u32::MAX;
-        let mut cur_ring = u32::MAX;
-        for (i, s) in self.layout.segments.iter().enumerate() {
-            if s.ring != cur_ring {
-                cur_ring = s.ring;
-                first = i as u32;
-                self.rings[s.ring as usize].first_seg = first;
-            }
-            let local = (i as u32 - first + 1).min(255) as u8;
-            let row = s.ring as usize * w;
-            let x0 = (s.a0 * w as f32).floor().max(0.0) as usize;
-            let x1 = ((s.a1 * w as f32).ceil() as usize).min(w);
-            self.atlas[row + x0..row + x1].fill(local);
-        }
-
-        let t_atlas = started.elapsed().as_secs_f64() * 1e3;
-        let n_dirs = m.dirs.len();
+        let n_dirs = self.model.dirs.len();
         self.dir_act.resize(n_dirs, 0.0);
         self.dir_open_target.resize(n_dirs, 0.0);
         self.dir_rings = vec![0; n_dirs];
@@ -408,11 +480,17 @@ impl World {
         }
 
         self.ring_presence_target = vec![1.0; n_rings];
+        self.ring_share.clear();
         self.hot_until = vec![f32::MIN; n_rings];
         self.hot.clear();
-        self.rct_full = true;
+        // Only changed rows are recoloured (see assign_slots); the first layout
+        // colours everything.
+        if first {
+            self.rct_full = true;
+            self.slots_full = true;
+        }
         self.mark_animated_rows();
-        self.layout_t = self.t;
+        self.layout_t = job_t;
         self.layout_version += 1;
         self.needs_relayout = false;
         self.dirty_segs.clear();
@@ -434,26 +512,32 @@ impl World {
         }
         self.update_lut();
         log::debug!(
-            "layout v{}: {} rings, {} segments, {} dirs expanded, {} collapsed, {:.1} ms (build {t_build:.1}, segs+rings {:.1}, atlas {:.1})",
+            "layout v{}: {} rings ({changed_rows} changed), {} segments, {} dirs expanded, {} collapsed; build {t_build:.1} + segs {t_segs:.1} + atlas {t_atlas:.1} ms, install {:.1} ms",
             self.layout_version,
             n_rings,
             self.segs.len(),
             self.layout.expanded,
             self.layout.collapsed,
             started.elapsed().as_secs_f64() * 1e3,
-            t_segs - t_build,
-            t_atlas - t_segs
         );
     }
 
     /// Advances the simulation by `dt` seconds.
     pub fn step(&mut self, dt: f64) {
+        let start = std::time::Instant::now();
         let dt = dt.clamp(0.0, 0.5);
         let t = self.t + dt;
         match &mut self.source {
             Source::Synthetic { index, session } => {
-                if self.loop_stage == LoopStage::Running {
-                    session.step(&mut self.model, index, t, dt);
+                // The session advances in fixed steps, so its story is the same
+                // whatever the frame rate; everything else uses `dt` directly.
+                self.session_accum += dt;
+                while self.session_accum >= SESSION_DT {
+                    self.session_accum -= SESSION_DT;
+                    self.session_t += SESSION_DT;
+                    if self.loop_stage == LoopStage::Running {
+                        session.step(Arc::make_mut(&mut self.model), index, self.session_t, SESSION_DT);
+                    }
                 }
             }
             Source::Collector(_) => self.poll_collector(t),
@@ -461,7 +545,9 @@ impl World {
         self.t = t;
         let tf = t as f32;
 
-        let events = self.model.drain_events();
+        // While a layout is being built the model is shared and unchanged (collector
+        // updates wait in their channel), so there is nothing to drain.
+        let events = if self.building() { vec![] } else { Arc::make_mut(&mut self.model).drain_events() };
         let n_events = events.len();
         let min_flash = 1.0 / self.cfg.calm.max_flash_hz.max(0.1);
         let mut falls = vec![];
@@ -519,14 +605,18 @@ impl World {
                     let spin_up = self.cfg.events.write.spin_up;
                     if spin_up > 0.0 && (ring as usize) < self.rings.len() {
                         let r = &mut self.rings[ring as usize];
-                        let elapsed = (tf - r.boost_t0).max(0.0);
-                        r.phase0 += r.boost * (1.0 - (-elapsed / BOOST_TAU).exp());
-                        r.boost = spin_up * (0.6 + 0.8 * r.hash);
-                        r.boost_t0 = tf;
+                        // Only one boost at a time: restarting a boost midway
+                        // would change the ring's speed abruptly.
+                        if tf - r.boost_t0 >= BOOST_TAU {
+                            r.phase0 += r.boost;
+                            r.boost = spin_up * (0.6 + 0.8 * r.hash);
+                            r.boost_t0 = tf;
+                        }
                         self.dirty_rings.push(ring);
                     }
                 }
                 EventKind::Delete => {
+                    self.ghosts.push_back((t, ev.file));
                     if matches!(self.layout.segments[seg as usize].source, SegSource::File(_)) {
                         s.flags |= SEG_DELETED;
                         s.t_delete = tf;
@@ -570,16 +660,45 @@ impl World {
         self.activity += (n_events as f32 / dt.max(1e-3) as f32 - self.activity) * a;
 
         // Expire deletion ghosts occasionally (a looping session restores them instead).
-        if !self.looping() && t - self.last_purge_t > 30.0 {
+        // Deletion ghosts expire one by one (cheap), in the order they were made.
+        let ghost_s = self.cfg.events.delete.ghost_hours as f64 * 3600.0;
+        if !self.looping() && !self.building() && self.ghosts.front().is_some_and(|&(td, _)| td < t - ghost_s) {
+            let model = Arc::make_mut(&mut self.model);
+            while let Some(&(td, f)) = self.ghosts.front() {
+                if td >= t - ghost_s {
+                    break;
+                }
+                self.ghosts.pop_front();
+                if model.files.get(f as usize).is_some_and(|x| !x.purged && x.t_delete != NEVER) {
+                    model.purge_file(f);
+                    self.needs_relayout = true;
+                }
+            }
+        }
+        // Removed folders are dropped by a full sweep of the tree, which takes a
+        // few milliseconds: only while nothing is drawn, or every 30 minutes.
+        if !self.looping() && !self.building() && t - self.last_purge_t > if self.hidden { 60.0 } else { 1800.0 } {
             self.last_purge_t = t;
-            let before = t - self.cfg.events.delete.ghost_hours as f64 * 3600.0;
-            if self.model.purge_deleted(before) > 0 {
+            if Arc::make_mut(&mut self.model).purge_deleted(t - ghost_s) > 0 {
                 self.needs_relayout = true;
             }
         }
+        if let Some(rx) = &self.pending_layout {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.pending_layout = None;
+                    self.install_layout(res);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    log::warn!("layout worker failed");
+                    self.pending_layout = None;
+                }
+            }
+        }
         let min_interval = if self.is_synthetic() { RELAYOUT_MIN_INTERVAL } else { RELAYOUT_LIVE_INTERVAL };
-        if self.needs_relayout && !self.hidden && t - self.layout_t >= min_interval {
-            self.relayout();
+        if self.needs_relayout && !self.hidden && !self.building() && t - self.layout_t >= min_interval {
+            self.start_relayout();
         }
 
         // A busy directory that is collapsed gets unfolded by the next layout.
@@ -589,14 +708,46 @@ impl World {
             self.needs_relayout = true;
         }
 
+        let p0 = std::time::Instant::now();
         self.update_loop();
-        self.update_activity(dt as f32);
+        self.activity_dt += dt as f32;
+        if self.activity_dt >= ACTIVITY_INTERVAL {
+            let adt = std::mem::take(&mut self.activity_dt);
+            self.update_activity(adt);
+        }
+        let p1 = std::time::Instant::now();
         self.update_rings(dt as f32);
+        let p2 = std::time::Instant::now();
         if self.lut_dirty {
             self.update_lut();
         }
+        let p3 = std::time::Instant::now();
         let fx = std::mem::take(&mut self.fx);
         self.fx = fx.step(self, dt as f32);
+        let p4 = std::time::Instant::now();
+        if PROFILE.with(|p| p.get()) {
+            PROF.with(|pr| {
+                let mut pr = pr.borrow_mut();
+                pr[0] += (p0 - start).as_secs_f64();
+                pr[1] += (p1 - p0).as_secs_f64();
+                pr[2] += (p2 - p1).as_secs_f64();
+                pr[3] += (p3 - p2).as_secs_f64();
+                pr[4] += (p4 - p3).as_secs_f64();
+                pr[5] += 1.0;
+                if pr[5] >= 300.0 {
+                    let n = pr[5];
+                    eprintln!(
+                        "step profile (ms/step): events+source {:.3} activity {:.3} rings {:.3} lut {:.3} fx {:.3}",
+                        pr[0] / n * 1e3,
+                        pr[1] / n * 1e3,
+                        pr[2] / n * 1e3,
+                        pr[3] / n * 1e3,
+                        pr[4] / n * 1e3
+                    );
+                    *pr = [0.0; 6];
+                }
+            });
+        }
     }
 
     fn dir_mark_segment(&self, first_ring: u32) -> Option<u32> {
@@ -635,24 +786,6 @@ impl World {
         self.hot.clone()
     }
 
-    /// True while something on screen moves fast enough to need the active
-    /// frame rate: a deleted file's segment falling, the loop wind-down fade.
-    /// Colour changes, labels, flakes, new files growing, the slow ring spin and
-    /// folders unwinding (a ~10 s ease) look fine at the calm rate.
-    pub fn wants_fast_frames(&self) -> bool {
-        self.motion_reason().is_some()
-    }
-
-    pub fn motion_reason(&self) -> Option<&'static str> {
-        if self.fx.in_motion() {
-            Some("falling")
-        } else if self.loop_fade > 0.0 && self.loop_fade < 1.0 {
-            Some("loop fade")
-        } else {
-            None
-        }
-    }
-
     fn looping(&self) -> bool {
         self.is_synthetic() && self.cfg.synthetic.loop_len.0 > 0.0
     }
@@ -688,6 +821,9 @@ impl World {
 
     /// Applies whatever the collector sent since the last frame.
     fn poll_collector(&mut self, t: f64) {
+        if self.building() {
+            return; // updates wait in the channel until the layout is installed
+        }
         let Source::Collector(client) = &mut self.source else { return };
         let mut snapshot = None;
         let mut ops = Vec::new();
@@ -722,16 +858,21 @@ impl World {
                 error: false,
                 until: t + 6.0,
             });
-            self.model = *m;
+            self.model = Arc::new(*m);
+            self.arcs_assigned = 0;
+            self.pending_layout = None;
             self.fx = Fx::default();
             self.dir_act.clear();
             self.needs_relayout = true;
             self.layout_t = -1.0e9;
         }
         let mut applied = 0usize;
-        for op in &ops {
-            if self.model.apply(op, t) {
-                applied += 1;
+        if !ops.is_empty() {
+            let model = Arc::make_mut(&mut self.model);
+            for op in &ops {
+                if model.apply(op, t) {
+                    applied += 1;
+                }
             }
         }
         if applied < ops.len() {
@@ -788,7 +929,7 @@ impl World {
         let epoch = self.initial_model.epoch_unix;
         for f in 0..self.initial_files {
             let orig = &self.initial_model.files[f];
-            let cur = &mut self.model.files[f];
+            let cur = &mut Arc::make_mut(&mut self.model).files[f];
             cur.t_read = NEVER;
             cur.t_write = NEVER;
             cur.t_delete = NEVER;
@@ -851,7 +992,8 @@ impl World {
             // Keep the arcs currently on screen (they differ if the tower config changed).
             file.arc = self.model.files[f].arc;
         }
-        self.model = model;
+        self.model = Arc::new(model);
+        self.arcs_assigned = self.model.files.len();
         if let Source::Synthetic { session, .. } = &mut self.source {
             *session = Session::new(self.cfg.synthetic.seed);
         }
@@ -931,20 +1073,25 @@ impl World {
 
     /// Recomputes ring pitches and the height → ring-coordinate lookup table.
     fn update_lut(&mut self) {
+        let lut_start = std::time::Instant::now();
         let n = self.layout.rings.len();
         let h = self.cfg.tower.height;
-        // A directory unwinds to at most MAX_OPEN_RINGS ring pitches in total, so
-        // one huge build directory cannot take over the tower.
-        const MAX_OPEN_RINGS: f32 = 5.0;
-        let open_share = |dir: u32| -> f32 {
-            let c = self.dir_rings.get(dir as usize).copied().unwrap_or(1).max(1) as f32;
-            (MAX_OPEN_RINGS / c).min(1.0)
-        };
+        if self.ring_share.len() != n {
+            // A directory unwinds to at most MAX_OPEN_RINGS ring pitches in total,
+            // so one huge build directory cannot take over the tower.
+            const MAX_OPEN_RINGS: f32 = 5.0;
+            self.ring_share = self
+                .layout
+                .rings
+                .iter()
+                .map(|r| (MAX_OPEN_RINGS / self.dir_rings.get(r.dir as usize).copied().unwrap_or(1).max(1) as f32).min(1.0))
+                .collect();
+        }
         let mut u_sum = 0.0f32;
         let mut w_sum = 0.0f32;
         for i in 0..n {
             let (e, u) = (self.ring_presence[i], self.ring_open[i]);
-            u_sum += e * u * open_share(self.layout.rings[i].dir);
+            u_sum += e * u * self.ring_share[i];
             w_sum += e * (1.0 - u);
         }
         let mut po = self.cfg.tower.open_pitch;
@@ -960,7 +1107,7 @@ impl World {
         ys.push(0.0);
         for i in 0..n {
             let (e, u) = (self.ring_presence[i], self.ring_open[i]);
-            let p = e * (u * po * open_share(self.layout.rings[i].dir) + (1.0 - u) * pw);
+            let p = e * (u * po * self.ring_share[i] + (1.0 - u) * pw);
             self.ring_pitch[i] = p;
             self.ring_s[i] = y + p * 0.5;
             y += p;
@@ -979,33 +1126,58 @@ impl World {
                 if p <= 1e-9 { ri as f32 } else { ri as f32 + ((s - ys[ri]) / p).clamp(0.0, 0.9999) }
             };
         }
+        let tb = std::time::Instant::now();
         self.update_layer_bands();
+        if PROFILE.with(|p| p.get()) {
+            PROF.with(|pr| pr.borrow_mut()[5] += 0.0);
+            LUTP.with(|l| {
+                let mut l = l.borrow_mut();
+                l.0 += (tb - lut_start).as_secs_f64();
+                l.1 += tb.elapsed().as_secs_f64();
+                l.2 += 1;
+                if l.2 >= 300 {
+                    eprintln!("lut {:.3} ms, bands {:.3} ms", l.0 / l.2 as f64 * 1e3, l.1 / l.2 as f64 * 1e3);
+                    *l = (0.0, 0.0, 0);
+                }
+            });
+        }
         self.lut_dirty = true;
     }
 
     fn update_layer_bands(&mut self) {
         let layers = self.cfg.tower.depth_layers.max(1) as usize;
         let h = self.cfg.tower.height;
-        let mut all = vec![];
-        for layer in 0..layers {
-            let mut merge = BAND_MERGE;
-            let bands = loop {
-                let mut bands: Vec<[f32; 2]> = vec![];
-                for (i, r) in self.layout.rings.iter().enumerate() {
-                    let p = self.ring_pitch.get(i).copied().unwrap_or(0.0);
-                    if (r.depth as usize).min(layers - 1) != layer || p <= 0.0 {
-                        continue;
-                    }
-                    let (s0, s1) = (self.ring_s[i] - p * 0.5 - merge * 0.5, self.ring_s[i] + p * 0.5 + merge * 0.5);
-                    match bands.last_mut() {
-                        Some(last) if s0 <= last[1] => last[1] = last[1].max(s1),
-                        _ => bands.push([s0, s1]),
+        let half = BAND_MERGE * 0.5;
+        let mut per: Vec<Vec<[f32; 2]>> = vec![vec![]; layers];
+        for (i, r) in self.layout.rings.iter().enumerate() {
+            let p = self.ring_pitch.get(i).copied().unwrap_or(0.0);
+            if p <= 0.0 {
+                continue;
+            }
+            let (s0, s1) = (self.ring_s[i] - p * 0.5 - half, self.ring_s[i] + p * 0.5 + half);
+            let bands = &mut per[(r.depth as usize).min(layers - 1)];
+            match bands.last_mut() {
+                Some(last) if s0 <= last[1] => last[1] = last[1].max(s1),
+                _ => bands.push([s0, s1]),
+            }
+        }
+        let mut all = Vec::with_capacity(per.iter().map(|b| b.len().min(MAX_BANDS_PER_LAYER)).sum());
+        for (layer, bands) in per.into_iter().enumerate() {
+            let bands = if bands.len() > MAX_BANDS_PER_LAYER {
+                // Merge across the smallest gaps until it fits.
+                let mut gaps: Vec<f32> = bands.windows(2).map(|w| w[1][0] - w[0][1]).collect();
+                gaps.sort_by(|a, b| a.total_cmp(b));
+                let limit = gaps[bands.len() - MAX_BANDS_PER_LAYER - 1];
+                let mut merged: Vec<[f32; 2]> = Vec::with_capacity(MAX_BANDS_PER_LAYER);
+                for b in bands {
+                    match merged.last_mut() {
+                        Some(last) if b[0] - last[1] <= limit => last[1] = last[1].max(b[1]),
+                        _ => merged.push(b),
                     }
                 }
-                if bands.len() <= MAX_BANDS_PER_LAYER {
-                    break bands;
-                }
-                merge *= 2.0;
+                merged
+            } else {
+                bands
             };
             all.extend(bands.into_iter().map(|b| [b[0].clamp(0.0, h), b[1].clamp(0.0, h), layer as f32, 0.0]));
         }
@@ -1015,7 +1187,8 @@ impl World {
     /// Ring rotation (turns) at time `t`; mirrors `ring_phase` in tower.wgsl.
     pub fn ring_phase(&self, ring: usize, t: f32) -> f32 {
         let r = &self.rings[ring];
-        r.phase0 + r.speed * t + r.boost * (1.0 - (-(t - r.boost_t0).max(0.0) / BOOST_TAU).exp())
+        let x = ((t - r.boost_t0) / BOOST_TAU).clamp(0.0, 1.0);
+        r.phase0 + r.speed * t + r.boost * x * x * (3.0 - 2.0 * x)
     }
 
     pub fn ring_radius(&self, ring: usize) -> f32 {
@@ -1056,6 +1229,125 @@ impl World {
             _ => Some(f.name.clone()),
         }
     }
+}
+
+/// Inputs of a layout build (see `World::start_relayout`).
+struct LayoutJob {
+    model: Arc<Model>,
+    params: LayoutParams,
+    hot: Vec<f32>,
+    now_unix: f64,
+    prev_layout_t: f64,
+    t: f64,
+}
+
+struct LayoutResult {
+    layout: Layout,
+    segs: Vec<SegmentGpu>,
+    /// Ring-ordered atlas rows, and a hash of each row.
+    atlas: Vec<u8>,
+    row_hash: Vec<u64>,
+    first_seg: Vec<u32>,
+    job_t: f64,
+    t_build: f64,
+    t_segs: f64,
+    t_atlas: f64,
+}
+
+fn tf(t: f64) -> f32 {
+    if t <= NEVER * 0.5 { -1.0e9 } else { t as f32 }
+}
+
+/// Builds the layout, the GPU segment records and the segment atlas. Pure: runs
+/// on a worker thread for live data.
+fn run_layout_job(job: LayoutJob) -> LayoutResult {
+    let t0 = std::time::Instant::now();
+    let m = &*job.model;
+    let layout = layout::build(m, &job.params, &job.hot);
+    let t1 = std::time::Instant::now();
+    let mut segs = Vec::with_capacity(layout.segments.len());
+    for (i, s) in layout.segments.iter().enumerate() {
+        let mut g = SegmentGpu {
+            a0: s.a0,
+            a1: s.a1,
+            ring: s.ring,
+            flags: s.flags,
+            hash: hash01(i as u64 * 7919 + s.ring as u64),
+            ..Default::default()
+        };
+        g.t_create = -1.0e9;
+        g.t_read = -1.0e9;
+        g.t_write = -1.0e9;
+        g.t_delete = -1.0e9;
+        g.t_retract = -1.0e9;
+        g.t_age = -1.0e9;
+        match s.source {
+            SegSource::File(f) => {
+                let file = &m.files[f as usize];
+                g.age_days = ((job.now_unix - file.mtime as f64) / 86400.0).max(0.0) as f32;
+                g.size_f = ((file.size as f64 + 1.0).log2() / 34.0).clamp(0.0, 1.0) as f32;
+                g.t_read = tf(file.t_read);
+                g.t_write = tf(file.t_write);
+                if file.t_create != NEVER {
+                    // Files created since the previous layout grow in now.
+                    g.t_create = if file.t_create > job.prev_layout_t { job.t as f32 } else { file.t_create as f32 };
+                }
+                if file.t_delete != NEVER {
+                    g.flags |= SEG_DELETED;
+                    g.t_delete = file.t_delete as f32;
+                }
+                g.hash = hash01(f as u64);
+            }
+            SegSource::Dir(_) => {
+                g.age_days = 1.0;
+                g.size_f = 0.2;
+            }
+            SegSource::Agg(_) => {
+                g.age_days = 30.0;
+                g.size_f = 0.8;
+            }
+        }
+        g.age_from = g.age_days;
+        segs.push(g);
+    }
+    let t2 = std::time::Instant::now();
+    // Segment atlas: one row per ring, ATLAS_W texels around it, holding the
+    // segment's 1-based position within its ring (segments are stored in ring
+    // order, so the shader adds the ring's first segment index).
+    let n_rings = layout.rings.len();
+    let w = ATLAS_W as usize;
+    let mut atlas = vec![0u8; w * n_rings.max(1)];
+    let mut first_seg = vec![0u32; n_rings];
+    let mut first = u32::MAX;
+    let mut cur_ring = u32::MAX;
+    for (i, s) in layout.segments.iter().enumerate() {
+        if s.ring != cur_ring {
+            cur_ring = s.ring;
+            first = i as u32;
+            first_seg[s.ring as usize] = first;
+        }
+        let local = (i as u32 - first + 1).min(255) as u8;
+        let row = s.ring as usize * w;
+        let x0 = (s.a0 * w as f32).floor().max(0.0) as usize;
+        let x1 = ((s.a1 * w as f32).ceil() as usize).min(w);
+        atlas[row + x0..row + x1].fill(local);
+    }
+    let row_hash: Vec<u64> = atlas
+        .chunks_exact(w)
+        .take(n_rings)
+        .map(|row| {
+            row.chunks_exact(8).fold(0x9E37_79B9_7F4A_7C15u64, |h, c| gits_core::rng::mix64(h ^ u64::from_le_bytes(c.try_into().unwrap())))
+        })
+        .collect();
+    let t3 = std::time::Instant::now();
+    let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+    LayoutResult { layout, segs, atlas, row_hash, first_seg, job_t: job.t, t_build: ms(t0, t1), t_segs: ms(t1, t2), t_atlas: ms(t2, t3) }
+}
+
+thread_local! {
+    static PROFILE: std::cell::Cell<bool> = std::cell::Cell::new(std::env::var_os("GITS_PROFILE").is_some());
+    static PROF: std::cell::RefCell<[f64; 6]> = const { std::cell::RefCell::new([0.0; 6]) };
+    static LUTP: std::cell::RefCell<(f64, f64, u32)> = const { std::cell::RefCell::new((0.0, 0.0, 0)) };
 }
 
 pub fn wall_clock() -> i64 {

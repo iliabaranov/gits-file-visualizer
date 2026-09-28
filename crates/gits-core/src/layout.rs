@@ -130,14 +130,21 @@ impl Ord for Cand {
     }
 }
 
-/// Builds the layout within `max_rings`. `hot` (per directory, may be shorter
-/// than the directory list) boosts directories with current activity.
-pub fn build(model: &mut Model, p: &LayoutParams, hot: &[f32]) -> Layout {
-    for f in &mut model.files {
+/// Gives files from index `from` on their arc length (frozen at first layout so
+/// positions stay stable). Returns the number of files, to pass as `from` next time.
+pub fn assign_arcs(model: &mut Model, p: &LayoutParams, from: usize) -> usize {
+    for f in model.files.iter_mut().skip(from) {
         if f.arc <= 0.0 {
             f.arc = arc_for_size(f.size, p);
         }
     }
+    model.files.len()
+}
+
+/// Builds the layout within `max_rings`. `hot` (per directory, may be shorter
+/// than the directory list) boosts directories with current activity. Files
+/// need their arcs assigned first (see [`assign_arcs`]).
+pub fn build(model: &Model, p: &LayoutParams, hot: &[f32]) -> Layout {
     let expanded = choose_expanded(model, p, hot);
     place(model, p, &expanded)
 }
@@ -377,7 +384,8 @@ mod tests {
     #[test]
     fn segments_fit_rings_and_do_not_overlap() {
         let mut m = sample();
-        let l = build(&mut m, &params(10_000), &[]);
+        assign_arcs(&mut m, &params(10_000), 0);
+        let l = build(&m, &params(10_000), &[]);
         assert!(l.segments.iter().all(|s| s.a0 >= 0.0 && s.a1 <= 1.0 && s.a0 < s.a1));
         for w in l.segments.windows(2) {
             if w[0].ring == w[1].ring {
@@ -391,8 +399,9 @@ mod tests {
     #[test]
     fn collapses_to_fit_budget_preferring_recent_and_hot() {
         let mut m = sample();
-        let full = build(&mut m, &params(10_000), &[]).rings.len();
-        let l = build(&mut m, &params(full - 4), &[]);
+        assign_arcs(&mut m, &params(10_000), 0);
+        let full = build(&m, &params(10_000), &[]).rings.len();
+        let l = build(&m, &params(full - 4), &[]);
         assert!(l.rings.len() <= full - 4 + 2);
         assert!(l.segments.iter().any(|s| s.flags & SEG_AGG != 0));
         assert!(l.seg_of_file.iter().all(|&s| s != NONE));
@@ -402,7 +411,7 @@ mod tests {
         // Heat on c flips the choice.
         let mut hot = vec![0.0; m.dirs.len()];
         hot[3] = 5.0;
-        let l = build(&mut m, &params(full - 4), &hot);
+        let l = build(&m, &params(full - 4), &hot);
         assert!(l.is_expanded(3) && !l.is_expanded(2));
     }
 }

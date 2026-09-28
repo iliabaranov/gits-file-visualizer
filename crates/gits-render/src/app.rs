@@ -23,8 +23,15 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-/// Fixed simulation step, identical to headless snapshots so runs are reproducible.
+/// Warm-up step for the synthetic session (matches headless snapshots).
 const SIM_DT: f64 = 1.0 / 24.0;
+/// Several windows drawing within this interval share one simulation step.
+const MIN_STEP: Duration = Duration::from_millis(3);
+/// A redraw is requested this long before it is due; the compositor's frame
+/// callback then releases it on the next display refresh (vsync pacing).
+const PACING_SLACK: Duration = Duration::from_millis(3);
+/// Exit code asking the extension to restart the renderer (e.g. to switch GPU).
+pub const EXIT_RESTART: i32 = 75;
 /// While nothing can draw (hidden, covered, locked), the simulation still
 /// advances this often so collector updates are applied at their real time
 /// instead of piling up.
@@ -97,10 +104,9 @@ pub struct Options {
 /// Wallpaper windows are only as large as the internal resolution; GNOME
 /// scales them up to the monitor (it is soft glow, and this saves both our
 /// final pass and the compositor's work at 4K).
-pub fn wallpaper_size(cfg: &Config, width: u32, height: u32) -> (u32, u32) {
-    let perf = &cfg.performance;
+pub fn wallpaper_size(width: u32, height: u32, scale: f32, max_megapixels: f32) -> (u32, u32) {
     let area = width as f64 * height as f64;
-    let s = (perf.render_scale as f64).clamp(0.2, 1.0).min((perf.max_internal_megapixels.max(0.1) as f64 * 1.0e6 / area).sqrt());
+    let s = (scale as f64).clamp(0.2, 1.0).min((max_megapixels.max(0.1) as f64 * 1.0e6 / area).sqrt());
     (((width as f64 * s).round() as u32).max(16), ((height as f64 * s).round() as u32).max(16))
 }
 
@@ -162,6 +168,8 @@ struct Output {
     next_frame: Instant,
     frames: u32,
     stats_since: Instant,
+    /// Longest gap between presented frames since `stats_since` (judder check).
+    worst_gap: Duration,
 }
 
 impl Output {
@@ -171,6 +179,8 @@ impl Output {
 }
 
 struct State {
+    /// Rendering on an integrated GPU (lower resolution profile).
+    integrated: bool,
     gpu: Gpu,
     renderer: Renderer,
     world: World,
@@ -190,9 +200,11 @@ struct App {
     locked: bool,
     state: Option<State>,
     error: Option<anyhow::Error>,
+    exit_code: i32,
 }
 
-pub fn run(cfg: Config, opts: Options) -> Result<()> {
+/// Returns the process exit code (0, or [`EXIT_RESTART`]).
+pub fn run(cfg: Config, opts: Options) -> Result<i32> {
     anyhow::ensure!(!opts.outputs.is_empty(), "no outputs");
     let event_loop = EventLoop::<Control>::with_user_event().build().context("creating event loop")?;
     if opts.wallpaper {
@@ -206,15 +218,16 @@ pub fn run(cfg: Config, opts: Options) -> Result<()> {
         last_cfg_check: Instant::now(),
         next_probe: Instant::now() + COLLECTOR_PROBE,
         next_power_check: Instant::now(),
-        battery: false,
+        battery: on_battery(),
         locked: false,
         state: None,
         error: None,
+        exit_code: 0,
     };
     event_loop.run_app(&mut app)?;
     match app.error {
         Some(e) => Err(e),
-        None => Ok(()),
+        None => Ok(app.exit_code),
     }
 }
 
@@ -227,26 +240,30 @@ impl App {
         self.opts.outputs.iter().zip(auto).map(|(o, a)| Composition::parse(&self.cfg.monitor(&o.name).composition).unwrap_or(a)).collect()
     }
 
-    fn wallpaper_size(&self, spec: &OutputSpec) -> (u32, u32) {
-        wallpaper_size(&self.cfg, spec.width, spec.height)
+    /// Wallpaper windows are created at the internal resolution (GNOME scales
+    /// the clone up); the look-dev window renders internally at that scale.
+    fn wallpaper_size(&self, spec: &OutputSpec, integrated: bool) -> (u32, u32) {
+        let (s, mp) = self.cfg.performance.resolution(integrated);
+        wallpaper_size(spec.width, spec.height, s, mp)
     }
 
-    /// Internal render scale for an output: wallpaper windows are already at
-    /// the internal resolution.
-    fn render_scale(&self) -> (f32, f32) {
-        if self.opts.wallpaper {
-            (1.0, f32::MAX)
-        } else {
-            (self.cfg.performance.render_scale, self.cfg.performance.max_internal_megapixels)
-        }
+    /// Internal render scale for a view.
+    fn render_scale(&self, integrated: bool) -> (f32, f32) {
+        if self.opts.wallpaper { (1.0, f32::INFINITY) } else { self.cfg.performance.resolution(integrated) }
+    }
+
+    fn target_fps(&self) -> u32 {
+        let p = &self.cfg.performance;
+        (if self.battery { p.fps.min(p.fps_battery) } else { p.fps }).max(1)
     }
 
     fn init(&mut self, el: &ActiveEventLoop) -> Result<()> {
+        let want_discrete = self.cfg.performance.wants_discrete(self.battery) && gpu::has_discrete_gpu();
         let mut windows = Vec::new();
         for spec in &self.opts.outputs {
             let mut attrs = Window::default_attributes();
             if self.opts.wallpaper {
-                let (w, h) = self.wallpaper_size(spec);
+                let (w, h) = self.wallpaper_size(spec, !want_discrete);
                 attrs = attrs
                     .with_title(format!("{WALLPAPER_TITLE}{}", spec.index))
                     .with_decorations(false)
@@ -268,7 +285,7 @@ impl App {
             let instance = gpu::instance(fallback);
             let surfaces: Result<Vec<_>, _> = windows.iter().map(|(_, w)| instance.create_surface(w.clone())).collect();
             let Ok(surfaces) = surfaces else { continue };
-            match pollster::block_on(gpu::init(&instance, Some(&surfaces[0]), self.cfg.performance.prefer_igpu)) {
+            match pollster::block_on(gpu::init(&instance, Some(&surfaces[0]), !want_discrete)) {
                 Ok(g) => {
                     chosen = Some((g, surfaces));
                     break;
@@ -277,24 +294,38 @@ impl App {
             }
         }
         let (g, surfaces) = chosen.context("no usable GPU (Vulkan or OpenGL)")?;
+        let integrated = g.is_integrated();
+        if integrated == want_discrete {
+            log::warn!("wanted the {} GPU, got {}", if want_discrete { "discrete" } else { "integrated" }, g.adapter.get_info().name);
+        }
         let windows: Vec<_> = windows.into_iter().zip(surfaces).map(|((spec, w), s)| (spec, w, s)).collect();
         let caps = windows[0].2.get_capabilities(&g.adapter);
         let format =
             caps.formats.iter().copied().find(|f| f.is_srgb()).or(caps.formats.first().copied()).context("surface has no formats")?;
-        let renderer = Renderer::new(g.device.clone(), g.queue.clone(), format)?;
+        let renderer = Renderer::new(g.device.clone(), g.queue.clone(), format, crate::renderer::Quality::for_gpu(g.is_integrated()))?;
         let now = Instant::now();
         let mut outputs = Vec::new();
         let compositions = self.compositions();
-        let (scale, max_mp) = self.render_scale();
+        let (scale, max_mp) = self.render_scale(integrated);
         for ((spec, window, surface), composition) in windows.into_iter().zip(compositions) {
             log::info!("{}: composition {composition:?}", spec.name);
+            if self.opts.wallpaper && integrated == want_discrete {
+                // The GPU differs from the one the window was sized for.
+                let (w, h) = self.wallpaper_size(&spec, integrated);
+                let _ = window.request_inner_size(LogicalSize::new(w, h));
+            }
             let size = window.inner_size();
             let mut surface_cfg = surface
                 .get_default_config(&g.adapter, size.width.max(1), size.height.max(1))
                 .context("surface not supported by adapter")?;
             surface_cfg.format = format;
-            surface_cfg.present_mode = wgpu::PresentMode::Fifo;
+            // Frames are paced by the compositor's frame callbacks (see about_to_wait);
+            // mailbox presentation never blocks the other windows.
+            let modes = surface.get_capabilities(&g.adapter).present_modes;
+            surface_cfg.present_mode =
+                if modes.contains(&wgpu::PresentMode::Mailbox) { wgpu::PresentMode::Mailbox } else { wgpu::PresentMode::Fifo };
             surface_cfg.desired_maximum_frame_latency = 2;
+            log::debug!("{}: present mode {:?} (available {modes:?})", spec.name, surface_cfg.present_mode);
             surface.configure(&g.device, &surface_cfg);
             let mut view = renderer.new_view();
             renderer.resize(&mut view, surface_cfg.width, surface_cfg.height, scale, max_mp);
@@ -310,6 +341,7 @@ impl App {
                 next_frame: now,
                 frames: 0,
                 stats_since: now,
+                worst_gap: Duration::ZERO,
             });
         }
 
@@ -330,7 +362,7 @@ impl App {
             outputs.len(),
             outputs.iter().map(|o| format!("{} {}x{}", o.spec.name, o.spec.width, o.spec.height)).collect::<Vec<_>>().join(", ")
         );
-        self.state = Some(State { gpu: g, renderer, world, outputs, last_step: now, sim_accum: 0.0 });
+        self.state = Some(State { integrated, gpu: g, renderer, world, outputs, last_step: now, sim_accum: 0.0 });
         Ok(())
     }
 
@@ -353,8 +385,8 @@ impl App {
                 s.world.set_config(cfg);
                 s.world.notice =
                     Some(Notice { text: format!("config reloaded: {}", path.display()), error: false, until: s.world.t + 3.0 });
-                let perf = &self.cfg.performance;
-                let (scale, max_mp) = if self.opts.wallpaper { (1.0, f32::MAX) } else { (perf.render_scale, perf.max_internal_megapixels) };
+                let (scale, max_mp) =
+                    if self.opts.wallpaper { (1.0, f32::INFINITY) } else { self.cfg.performance.resolution(s.integrated) };
                 for o in &mut s.outputs {
                     o.view.invalidate_background();
                     s.renderer.resize(&mut o.view, o.surface_cfg.width, o.surface_cfg.height, scale, max_mp);
@@ -395,28 +427,14 @@ impl App {
         let now = Instant::now();
         let real_dt = now.duration_since(s.last_step).as_secs_f64();
         s.last_step = now;
+        // Everything on screen advances by the real time elapsed, every frame
+        // (the synthetic session keeps its own fixed steps inside World::step).
+        // Long gaps (hidden, suspend) are applied in chunks of at most 0.5 s.
         s.sim_accum += real_dt * speed;
-        if !s.world.is_synthetic() {
-            // Live data: one step per frame (fixed steps only matter for the
-            // synthetic session's reproducibility), in chunks of at most 0.5 s.
-            while s.sim_accum > 1e-4 {
-                let dt = s.sim_accum.min(0.5);
-                s.world.step(dt);
-                s.sim_accum -= dt;
-            }
-            return real_dt;
-        }
-        let mut steps = 0;
-        while s.sim_accum >= SIM_DT && steps < 48 {
-            s.world.step(SIM_DT);
-            s.sim_accum -= SIM_DT;
-            steps += 1;
-        }
-        if steps == 48 && s.sim_accum >= SIM_DT {
-            // Fell far behind (e.g. after suspend): jump ahead in one step.
-            let rest = s.sim_accum - s.sim_accum % SIM_DT;
-            s.world.step(rest);
-            s.sim_accum -= rest;
+        while s.sim_accum > 1e-6 {
+            let dt = s.sim_accum.min(0.5);
+            s.world.step(dt);
+            s.sim_accum -= dt;
         }
         real_dt
     }
@@ -429,9 +447,10 @@ impl App {
             return;
         }
         s.world.hidden = false;
-        let real_dt = self.advance();
+        let real_dt = if s.last_step.elapsed() >= MIN_STEP { self.advance() } else { 0.0 };
         let Some(s) = &mut self.state else { return };
         let o = &mut s.outputs[i];
+        let frame_dt = o.last_draw.elapsed();
 
         let tex = match o.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -444,24 +463,30 @@ impl App {
         let out = tex.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let aspect = o.surface_cfg.width as f32 / o.surface_cfg.height.max(1) as f32;
         let cam = Camera::new(o.composition, aspect, &s.world.cfg.tower, s.world.y_top(), s.world.cfg.camera.drift, s.world.t as f32);
-        s.renderer.render(&mut o.view, &mut s.world, &cam, &out, real_dt as f32);
+        let _ = real_dt;
+        s.renderer.render(&mut o.view, &mut s.world, &cam, &out, frame_dt.as_secs_f32());
         o.window.pre_present_notify();
         s.gpu.queue.present(tex);
         o.last_draw = Instant::now();
+        // Next redraw request goes out as soon as it is due (see about_to_wait).
+        o.next_frame = o.last_draw;
+        if frame_dt < HIDDEN_STEP {
+            o.worst_gap = o.worst_gap.max(frame_dt);
+        }
         o.frames += 1;
         let elapsed = o.stats_since.elapsed().as_secs_f64();
         if elapsed >= 5.0 {
             log::debug!(
-                "{}: {:.1} fps, sim t={:.0}s phase={} activity={:.1}/s rings={} motion={}",
+                "{}: {:.1} fps (longest gap {:.1} ms), sim t={:.0}s activity={:.1}/s rings={}",
                 o.spec.name,
                 o.frames as f64 / elapsed,
+                o.worst_gap.as_secs_f64() * 1e3,
                 s.world.t,
-                s.world.phase_name(),
                 s.world.activity,
                 s.world.rings.len(),
-                s.world.motion_reason().unwrap_or("none")
             );
             o.frames = 0;
+            o.worst_gap = Duration::ZERO;
             o.stats_since = Instant::now();
         }
     }
@@ -510,6 +535,7 @@ impl ApplicationHandler<Control> for App {
                 }
             }
             WindowEvent::Resized(size) => {
+                let wallpaper = self.opts.wallpaper;
                 let perf = self.cfg.performance.clone();
                 if let Some(s) = &mut self.state
                     && let Some(o) = s.outputs.iter_mut().find(|o| o.window.id() == id)
@@ -520,8 +546,7 @@ impl ApplicationHandler<Control> for App {
                     o.surface_cfg.width = size.width;
                     o.surface_cfg.height = size.height;
                     o.surface.configure(&s.gpu.device, &o.surface_cfg);
-                    let (scale, max_mp) =
-                        if self.opts.wallpaper { (1.0, f32::MAX) } else { (perf.render_scale, perf.max_internal_megapixels) };
+                    let (scale, max_mp) = if wallpaper { (1.0, f32::INFINITY) } else { perf.resolution(s.integrated) };
                     s.renderer.resize(&mut o.view, size.width, size.height, scale, max_mp);
                     o.view.invalidate_background();
                     o.window.request_redraw();
@@ -541,9 +566,20 @@ impl ApplicationHandler<Control> for App {
             if b != self.battery {
                 log::info!("power: {}", if b { "battery (frame rate capped)" } else { "mains" });
                 self.battery = b;
+                // gpu = "auto": switch between discrete and integrated via a restart.
+                if let Some(s) = &self.state
+                    && self.opts.wallpaper
+                    && gpu::has_discrete_gpu()
+                    && self.cfg.performance.wants_discrete(b) == s.integrated
+                {
+                    log::info!("power source changed: restarting to switch GPU");
+                    self.exit_code = EXIT_RESTART;
+                    el.exit();
+                    return;
+                }
             }
         }
-        let perf = self.cfg.performance.clone();
+        let interval = Duration::from_secs_f64(1.0 / self.target_fps() as f64);
         let locked = self.locked;
         let Some(s) = &mut self.state else { return };
         let now = Instant::now();
@@ -554,24 +590,26 @@ impl ApplicationHandler<Control> for App {
             self.advance();
         }
         let Some(s) = &mut self.state else { return };
-        let busy = s.world.wants_fast_frames();
-        let mut fps = if busy { perf.fps_active } else { perf.fps_calm };
-        if self.battery {
-            fps = fps.min(perf.fps_battery);
-        }
-        let fps = fps.max(1);
         let mut wake = now + HIDDEN_STEP;
         for o in &mut s.outputs {
             if o.paused(locked) {
                 continue;
             }
-            if now >= o.next_frame {
-                // Ignored by the compositor while the window cannot be seen.
-                o.window.request_redraw();
-                let hidden = now.duration_since(o.last_draw) > HIDDEN_STEP;
-                o.next_frame = now + if hidden { HIDDEN_STEP } else { Duration::from_secs_f64(1.0 / fps as f64) };
+            // Ask for the next frame shortly before it is due. Because each frame
+            // calls pre_present_notify, winit delivers the redraw on the
+            // compositor's next frame callback, i.e. in step with the display.
+            // A window the compositor is not showing gets no callbacks and is
+            // retried once a second.
+            let request_at = (o.last_draw + interval).checked_sub(PACING_SLACK).unwrap_or(o.last_draw);
+            if now >= request_at {
+                if now >= o.next_frame {
+                    o.window.request_redraw();
+                    o.next_frame = now + HIDDEN_STEP;
+                }
+                wake = wake.min(o.next_frame);
+            } else {
+                wake = wake.min(request_at);
             }
-            wake = wake.min(o.next_frame);
         }
         el.set_control_flow(ControlFlow::WaitUntil(wake));
     }

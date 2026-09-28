@@ -56,18 +56,27 @@ and back in once; the script says when that is needed. The extension:
 
 Logs: `journalctl --user -f -o cat /usr/bin/gnome-shell | grep gits`.
 
-Measured cost on the development laptop (Intel UHD 630, three monitors
-1920×1200 + 3840×2160 + 1440×2560, live data at ~35 file events/s):
+Rendering (see `[performance]` in `config/default.toml`):
 
-| | Renderer | GNOME Shell (compositing it) | Integrated GPU busy |
-|---|---|---|---|
-| Desktop visible on all monitors | 5.4% of one core | 2.8% | ~19% |
-| All monitors covered by windows | 0.5% | 0.4% | ~1% |
-| Collector (always) | 0.3% | | |
+- 60 fps, timed to the display refresh (each frame is released by the
+  compositor's frame callback), with every animation advancing by the real
+  time elapsed. No motion trails and no film grain by default.
+- On the discrete GPU (NVIDIA) at native resolution when on mains power
+  (`gpu = "auto"`). On battery it switches to the integrated GPU at reduced
+  resolution and 30 fps, restarting itself when the power source changes.
+- Where many rings share a pixel, all of them are averaged (up to 16), so the
+  drum reads as fine striations instead of crawling noise.
+- Layouts are rebuilt on a worker thread, and rings keep their texture rows, so
+  file-system changes never stall a frame.
 
-It renders at 6 fps (12 while a deleted file's segment falls, 4 on battery),
-at about 0.8 megapixels per monitor; GNOME scales that up. `gits-render
-loadtest` measures this headlessly on your machine.
+Measured headlessly on the development laptop (RTX 2060 Max-Q, three monitors
+1920×1200 + 1080×1920 + 3840×2160, live data): 60 fps with the longest frame
+16.9 ms over 75 s; NVIDIA ~35% busy at ~22 W; renderer ~20% of one CPU core.
+`gits-render loadtest` measures this on your machine; `gits-render gpu-check`
+lists which GPUs can present to a window.
+
+Logs: `journalctl --user -b _COMM=gits-render -f` (renderer) and
+`journalctl --user -f -o cat /usr/bin/gnome-shell | grep gits` (extension).
 
 ### With your real files, in a window
 

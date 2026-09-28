@@ -1,6 +1,6 @@
 // Ring colour pass: renders the ring colour texture used by the tower's dense
-// path. Texel (x, y) = average colour of ring y over angle bin x (in the ring's
-// own rotating frame), from the atlas texels inside the bin. Each instance
+// path. Texel (x, y) = average colour of the ring in slot y over angle bin x (in
+// the ring's own rotating frame), from the atlas texels inside the bin. Each instance
 // redraws a range of rows; only rows that changed (or are due for a periodic
 // refresh) are drawn each frame.
 
@@ -24,10 +24,11 @@ fn vs_rows(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
 @fragment
 fn fs_rows(in: RowOut) -> @location(0) vec4<f32> {
     let t = G.cam_pos.w;
-    let ri = u32(in.pos.y);
+    let slot = u32(in.pos.y);
     let bin = u32(in.pos.x);
     let per_bin = u32(G.rct.z);
     let atlas_w = G.lut.z;
+    let ri = slot_ring[slot];
     if (ri >= u32(G.lut.y)) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
@@ -36,7 +37,7 @@ fn fs_rows(in: RowOut) -> @location(0) vec4<f32> {
     var acc = vec3<f32>(0.0);
     for (var j = 0u; j < per_bin; j++) {
         let x = bin * per_bin + j;
-        let local = textureLoad(atlas, vec2<u32>(x, ri), 0).r;
+        let local = textureLoad(atlas, vec2<u32>(x, slot), 0).r;
         if (local == 0u) {
             continue;
         }

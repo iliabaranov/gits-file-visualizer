@@ -18,7 +18,7 @@ struct Globals {
     col_teal: vec4<f32>,
     col_bg: vec4<f32>,
     times: vec4<f32>,       // read fade, write fade, grow, ghost seconds
-    times2: vec4<f32>,      // attack, unwound ribbon fill, loop fade
+    times2: vec4<f32>,      // attack, unwound ribbon fill, loop fade, dense taps
     age: vec4<f32>,         // log10 fresh/old/stale days
     screen: vec4<f32>,      // w, h, 1/w, 1/h (internal)
     post: vec4<f32>,        // exposure, bloom, grain, vignette

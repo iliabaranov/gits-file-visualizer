@@ -9,6 +9,7 @@
 #   tools/sandbox-shell.sh log               shell + renderer log
 #   tools/sandbox-shell.sh run CMD...        run a client inside the sandbox (clean env)
 #   tools/sandbox-shell.sh env               print exports to talk to the sandbox bus
+#   GITS_SANDBOX_X11=1 tools/sandbox-shell.sh start   ... with Xwayland (X11 clients)
 #
 # Isolation: own HOME, XDG_RUNTIME_DIR, session D-Bus and dconf database, no
 # Xwayland, no connection to the real display. The extension under test is
@@ -47,6 +48,7 @@ start)
     mkdir -p "$SB/run/gits-file-visualizer"; ln -s "$GITS_COLLECTOR_SOCKET" "$SB/run/gits-file-visualizer/collector.sock"
   fi
   args=(); for m in "${mons[@]}"; do args+=(--virtual-monitor "$m"); done
+  x11flag=--no-x11; [[ -n "${GITS_SANDBOX_X11:-}" ]] && x11flag=
   env -i HOME="$SB/home" XDG_RUNTIME_DIR="$SB/run" PATH=/usr/bin:/bin USER="$USER" LANG="${LANG:-C.UTF-8}" \
       XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=ubuntu:GNOME \
       ${GITS_RENDER_BIN:+GITS_RENDER_BIN="$GITS_RENDER_BIN"} \
@@ -59,7 +61,7 @@ start)
         dconf write /org/gnome/desktop/session/idle-delay "uint32 0"
         dconf write /org/gnome/desktop/screensaver/lock-enabled false
         dconf write /org/gnome/shell/welcome-dialog-last-shown-version "\"999\""
-        exec gnome-shell --headless --wayland --no-x11 --mode=ubuntu '"${args[*]}"' ' \
+        exec gnome-shell --headless --wayland '"$x11flag"' --mode=ubuntu '"${args[*]}"' ' \
       >"$SB/shell.log" 2>&1 &
   echo $! > "$SB/pid"
   for _ in $(seq 1 100); do
@@ -71,7 +73,7 @@ start)
   echo "sandbox shell did not come up; see $SB/shell.log" >&2; tail -20 "$SB/shell.log" >&2; exit 1 ;;
 stop)
   if [[ -f "$SB/pid" ]]; then kill -- -"$(cat "$SB/pid")" 2>/dev/null || kill "$(cat "$SB/pid")" 2>/dev/null || true; fi
-  pkill -f "gnome-shell --headless --wayland --no-x11" 2>/dev/null || true
+  pkill -f "gnome-shell --headless --wayland" 2>/dev/null || true
   # Anything else started inside the sandbox (renderer, DING, ibus, portals...).
   for p in $(pgrep -u "$USER"); do
     grep -qs "XDG_RUNTIME_DIR=$SB/run" "/proc/$p/environ" && kill "$p" 2>/dev/null

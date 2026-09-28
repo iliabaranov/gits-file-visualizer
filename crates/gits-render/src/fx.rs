@@ -206,12 +206,6 @@ impl Fx {
         self
     }
 
-    /// Something moves fast: a cut segment falling (its first 2.4 s), or the
-    /// probe gliding. Flakes drift slowly and look fine at the calm rate.
-    pub fn in_motion(&self) -> bool {
-        !self.falls.is_empty() || (self.probe.target.is_some() && self.probe.alpha > 0.02)
-    }
-
     /// Per-frame sprites (world + screen space).
     pub fn build(&self, w: &World, cam: &Camera, atlas: &GlyphAtlas, width: f32, height: f32, out: &mut Vec<SpriteVertex>) {
         let cfg = &w.cfg;

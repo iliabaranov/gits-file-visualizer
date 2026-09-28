@@ -10,7 +10,7 @@ struct Segment {
 
 struct Ring {
     depth: f32, speed: f32, phase0: f32, boost: f32,
-    boost_t0: f32, hash: f32, first_seg: u32, pad1: f32,
+    boost_t0: f32, hash: f32, first_seg: u32, row: u32,
 };
 
 @group(1) @binding(0) var<storage, read> segs: array<Segment>;
@@ -20,6 +20,9 @@ struct Ring {
 @group(1) @binding(4) var atlas: texture_2d<u32>;
 // Per depth layer, the height intervals holding its rings: (s0, s1, layer, _).
 @group(1) @binding(5) var<storage, read> bands: array<vec4<f32>>;
+// Ring index of each atlas row ("slot"); 0xffffffff = free. Rings keep their
+// row across relayouts, so only changed rings need new atlas and colour rows.
+@group(1) @binding(6) var<storage, read> slot_ring: array<u32>;
 
 const SEG_DIR: u32 = 1u;
 const SEG_AGG: u32 = 2u;
@@ -67,8 +70,9 @@ fn dash(s: Segment, u: f32) -> f32 {
 }
 
 fn ring_phase(r: Ring, t: f32) -> f32 {
-    let bt = max(t - r.boost_t0, 0.0);
-    return r.phase0 + r.speed * t + r.boost * (1.0 - exp(-bt / G.lut.w));
+    // Write boost: extra rotation that eases in and out over G.lut.w seconds.
+    let x = clamp((t - r.boost_t0) / G.lut.w, 0.0, 1.0);
+    return r.phase0 + r.speed * t + r.boost * x * x * (3.0 - 2.0 * x);
 }
 
 // Colour of a segment at position `u` (0..1) along its arc; alpha = visibility.

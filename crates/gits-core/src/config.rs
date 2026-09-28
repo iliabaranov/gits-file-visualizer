@@ -155,12 +155,15 @@ pub struct Monitor {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Performance {
-    pub fps_active: u32,
-    pub fps_calm: u32,
+    pub fps: u32,
     pub fps_battery: u32,
+    /// "auto", "discrete" or "integrated".
+    pub gpu: String,
     pub render_scale: f32,
+    /// 0 = no cap.
     pub max_internal_megapixels: f32,
-    pub prefer_igpu: bool,
+    pub integrated_render_scale: f32,
+    pub integrated_max_megapixels: f32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -234,6 +237,27 @@ pub fn parse_duration(s: &str) -> std::result::Result<f32, String> {
         u => return Err(format!("unknown duration unit '{u}' in '{s}'")),
     };
     Ok(n * mult)
+}
+
+impl Performance {
+    /// Whether to render on a discrete GPU. `on_battery` is only consulted for "auto".
+    pub fn wants_discrete(&self, on_battery: bool) -> bool {
+        match self.gpu.as_str() {
+            "discrete" => true,
+            "integrated" => false,
+            _ => !on_battery,
+        }
+    }
+
+    /// (render scale, megapixel cap or f32::INFINITY) for the kind of GPU in use.
+    pub fn resolution(&self, integrated: bool) -> (f32, f32) {
+        let (s, mp) = if integrated {
+            (self.integrated_render_scale, self.integrated_max_megapixels)
+        } else {
+            (self.render_scale, self.max_internal_megapixels)
+        };
+        (s.clamp(0.2, 1.0), if mp > 0.0 { mp } else { f32::INFINITY })
+    }
 }
 
 impl Default for Config {
@@ -328,7 +352,7 @@ mod tests {
     #[test]
     fn defaults_parse() {
         let c = Config::default();
-        assert_eq!(c.performance.fps_active, 12);
+        assert_eq!(c.performance.fps, 60);
         assert!((c.events.write.decay.0 - 900.0).abs() < 1e-3);
     }
 

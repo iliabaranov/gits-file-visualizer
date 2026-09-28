@@ -36,7 +36,8 @@ pub struct RingGpu {
     pub hash: f32,
     /// Index of this ring's first segment (segments are stored in ring order).
     pub first_seg: u32,
-    pub _pad: f32,
+    /// The ring's row in the segment atlas and ring colour texture ("slot").
+    pub row: u32,
 }
 
 #[repr(C)]
@@ -65,7 +66,7 @@ pub struct Globals {
     pub col_bg: [f32; 4],
     /// read fade, write fade, grow, ghost seconds.
     pub times: [f32; 4],
-    /// attack, unwound ribbon fill, loop fade (0..1 multiplier on event highlights), _.
+    /// attack, unwound ribbon fill, loop fade (0..1 multiplier on event highlights), dense taps.
     pub times2: [f32; 4],
     /// log10 fresh/old/stale days.
     pub age: [f32; 4],

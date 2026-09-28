@@ -18,10 +18,10 @@ orange     = "#ff7a18"
 crimson    = "#c41230"
 teal       = "#2fe0c4"      # environment only (lattice, floor lights)
 exposure   = 1.35
-bloom      = 0.7
-grain      = 0.05
+bloom      = 0.45
+grain      = 0.0         # film grain (animated noise); 0 = off
 vignette   = 0.55
-smear      = "110ms"        # motion-smear time constant (0 disables)
+smear      = "0"         # motion trails; 0 = off (trails read as blur)
 
 [events.read]
 color     = "cream"
@@ -33,7 +33,7 @@ probe     = false           # wireframe probe that glides to the file being touc
 color     = "crimson"
 decay     = "15m"           # time for a written segment to fade back to gold
 intensity = 1.3
-spin_up   = 0.35            # extra ring spin (turns) given by a write; 0 = none
+spin_up   = 0.15            # extra ring rotation (turns) per write, eased in and out over 12 s; 0 = none
 
 [events.create]
 color     = "cream"
@@ -95,14 +95,17 @@ composition = "auto"        # wide | drum | dial | auto. auto: portrait screens 
                             # close-up, the largest landscape screen the wide shot, others the dial
 
 [performance]
-# The desktop itself already keeps an integrated GPU busy, so the wallpaper
-# stays at a low, steady rate; the motion smear hides the steps.
-fps_active   = 12           # while a deleted file's segment falls
-fps_calm     = 6            # everything else
-fps_battery  = 4            # cap for both while running on battery
-render_scale = 0.5          # internal resolution relative to the output
-max_internal_megapixels = 0.8   # cap per monitor, so 4K costs about the same as 1080p
-prefer_igpu  = true
+# Frames are paced by the compositor (one per display refresh, up to `fps`),
+# and all motion advances by real elapsed time, so movement is smooth and steady.
+fps          = 60
+fps_battery  = 30           # cap while running on battery
+gpu          = "auto"       # auto | discrete | integrated. auto: the discrete GPU
+                            # (e.g. NVIDIA) when on mains power, otherwise integrated
+render_scale = 1.0          # internal resolution relative to the output (1.0 = native)
+max_internal_megapixels = 0 # per-monitor cap, 0 = none
+# Used instead when rendering on an integrated GPU, which also draws the desktop:
+integrated_render_scale = 0.6
+integrated_max_megapixels = 1.2
 
 [privacy]
 text                   = "paths"   # paths | dirs | glyphs | none
