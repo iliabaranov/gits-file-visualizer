@@ -128,8 +128,13 @@ GPU, and is both peaceful and cheap.
   directory with many files wraps onto several stacked rings, forming a *band*.
 - **Vertical order = depth-first path order**, so every subtree is a
   contiguous stretch of the tower. `~` is at the top.
-- **Radius steps inward slightly with depth**, which gives the layered
-  see-through parallax visible in the wide shot.
+- **Radius grows with depth**, like the ring chart of a disk-usage analyzer
+  (Filelight, Baobab): `~`'s own files sit nearest the axis and each folder
+  level down is a shell further out (`inner_radius` → `radius` over
+  `depth_layers` shells; deeper folders share the outermost). From the side the
+  tower becomes stepped shells with see-through parallax; the dial view down
+  the axis reads as concentric rings. (Angular sectors per folder, as in a
+  sunburst, are not done: a folder's rings still go all the way round.)
 - Each ring spins slowly at its own rate (seeded by a hash, alternating
   direction) and speeds up gently when touched. Spin rates are kept slow and
   eased so the tower "breathes" rather than whirls.
@@ -523,6 +528,36 @@ agrees (and also lists flicker and rotation).
   an instant jump in angular speed; `spin_up` 0.35 → 0.15.
 - CPU at 60 fps × 3 monitors: ~20% of one core (world step ~6%, encoding
   ~14%, of which the lookup-table/bands update is ~0.6 ms/step).
+
+### Callouts and radius by depth (2026-09-28)
+
+- Radius by depth (§5.1). With 8 shells, folders of different depths
+  interleave finely along the tower, so several shells overlap in most pixels
+  of the dense drum and the old dense path (up to 16 taps per shell, most
+  hitting other shells' rings) dropped the frame rate to 48 fps. Each shell now
+  visits only its own rings: `layer_index` lists each layer's rings in order
+  with a per-ring lookup table, the shader box-filters those in the pixel's
+  footprint (weighted by coverage, every `stride`-th counted from the start of
+  the list when there are more than the tap budget, so the chosen rings do not
+  change as rings move), and discards pixels where its shell has no rings.
+  Back at 60 fps with the GPU less busy than before the change.
+- Callouts (`callouts.rs`, `[labels]`): up to 36 at once for creates, edits,
+  reads and deletes (tagged NEW / EDIT / READ / DELETED with size and folder).
+  Labels sit in two columns just outside the tower's silhouette with leader
+  lines to the file, like the outside labels of a pie chart. Each monitor
+  gives a new callout the free row nearest its file and keeps it there until
+  it fades, so labels never slide; the leader line follows the turning ring.
+  A new file's line points at its folder's tick until the file appears, then
+  glides over. Deleted files keep their callout, anchored at the ghost. Rate
+  limited (6/s, bursts of 4, reads leave room for other kinds), a file gets a
+  new callout at most every 30 s, and when full the oldest one fades out.
+- Live relayouts every 5 s (was 20 s): new files appear sooner. Install costs
+  ~4 ms on the render thread (the build is on the worker).
+- The collector watches folders found inside a newly created folder straight
+  away (`mkdir -p`, `git clone`, unpacking archives), which were previously
+  only picked up by the crawl.
+- `tools/stress.py` drives real file activity in `~/gits-stress`.
+- One copy of the verse on the wall is the English translation.
 
 ### Efficiency backlog
 

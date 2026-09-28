@@ -17,6 +17,7 @@ pub struct Config {
     pub age: Age,
     pub calm: Calm,
     pub tower: Tower,
+    pub labels: Labels,
     pub background: Background,
     pub camera: Camera,
     pub monitors: BTreeMap<String, Monitor>,
@@ -114,7 +115,7 @@ pub struct Calm {
 pub struct Tower {
     pub height: f32,
     pub radius: f32,
-    pub depth_step: f32,
+    pub inner_radius: f32,
     pub depth_layers: u32,
     pub min_arc: f32,
     pub max_arc: f32,
@@ -127,6 +128,16 @@ pub struct Tower {
     pub idle_wound: f32,
     pub idle_open: f32,
     pub back_face: f32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Labels {
+    pub max: usize,
+    pub hold: Dur,
+    pub repeat: Dur,
+    pub per_second: f32,
+    pub reads: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

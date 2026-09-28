@@ -1,5 +1,6 @@
-// The tower: a few concentric cylinders (one per depth layer) whose fragment
-// shader works out which ring it is showing.
+// The tower: concentric cylinders, one per folder depth (the root's files
+// nearest the axis, deeper folders further out), whose fragment shader works
+// out which ring it is showing.
 // - Sparse rings (unwound, several pixels apart) are drawn exactly: the ring's
 //   file segment under the pixel is looked up and coloured per pixel.
 // - Dense rings (the packed drum, many rings per pixel) average a few samples
@@ -17,6 +18,14 @@ const DENSE_TO: f32 = 1.4;
 // rings in the pixel's footprint. Fewer taps would pick a random subset of the
 // rings, which crawls like sensor noise as the rings turn.
 
+// Position in layer_index's ring list of layer `layer`'s first ring at or
+// after fractional ring coordinate `rr`.
+fn layer_pos(layer: u32, rr: f32) -> u32 {
+    let n = u32(G.lut.y);
+    let i = u32(clamp(ceil(rr), 0.0, f32(n)));
+    return layer_index[layer * (n + 1u) + i];
+}
+
 struct TowerOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) world: vec3<f32>,
@@ -30,7 +39,7 @@ fn vs_tower(@location(0) p: vec3<f32>, @builtin(instance_index) ii: u32) -> Towe
     let band = bands[ii];
     let layer = u32(band.z);
     let s = mix(band.x, band.y, p.y);
-    let r = G.tower.y * (1.0 - G.tower.z * f32(layer));
+    let r = mix(G.tower.z, G.tower.y, f32(layer) / max(G.tower2.x - 1.0, 1.0));
     let world = vec3<f32>(p.x * r, G.tower.w - s, p.z * r);
     var o: TowerOut;
     o.clip = G.view_proj * vec4<f32>(world, 1.0);
@@ -83,30 +92,28 @@ fn exact(in: TowerOut, rr: f32, turn0: f32, pitch: f32, ds_px: f32, dturn_px: f3
     return c.rgb * c.a * hcov * vcov;
 }
 
-// Average colour of this layer's rings covered by the pixel (dense path).
-fn dense(in: TowerOut, r: f32, dr_px: f32, turn0: f32, max_taps: f32, t: f32) -> vec3<f32> {
-    let n_rings = u32(G.lut.y);
+// Box filter over the pixel's footprint [lo, hi] (ring coordinates): the sum
+// of this layer's rings' colours weighted by how much of the footprint each
+// covers (dense path). Only this layer's rings are visited (from its list in
+// layer_index), every `stride`-th one when there are more than `max_taps`;
+// the stride is counted from the start of the list, so as rings move the
+// chosen ones stay the same and only the ends of the footprint change.
+fn dense(in: TowerOut, lo: f32, hi: f32, p0: u32, p1: u32, turn0: f32, max_taps: f32, t: f32) -> vec3<f32> {
     let rows = G.rct.x;
-    let n = i32(clamp(ceil(dr_px), 1.0, max_taps));
+    let dr = hi - lo;
+    let stride = u32(max(ceil(dr / max_taps), 1.0));
     var acc = vec3<f32>(0.0);
-    for (var k = 0; k < n; k++) {
-        let rr = r + ((f32(k) + 0.5) / f32(n) - 0.5) * dr_px;
-        if (rr < 0.0) {
-            continue;
-        }
-        let ri = u32(rr);
-        if (ri >= n_rings) {
-            continue;
-        }
+    var p = (p0 + stride - 1u) / stride * stride;
+    for (var k = 0u; k <= u32(max_taps) && p < p1; k++) {
+        let ri = layer_index[p];
         let ring = rings[ri];
-        if (min(u32(ring.depth), u32(G.tower2.x) - 1u) != in.layer) {
-            continue;
-        }
+        let cover = clamp(min(hi, f32(ri) + 1.0) - max(lo, f32(ri)), 0.0, 1.0);
         let u = fract(turn0 - ring_phase(ring, t));
-        acc += textureSampleLevel(ring_tex, ring_samp, vec2<f32>(u, (f32(ring.row) + 0.5) / rows), 0.0).rgb;
+        acc += textureSampleLevel(ring_tex, ring_samp, vec2<f32>(u, (f32(ring.row) + 0.5) / rows), 0.0).rgb * cover;
+        p += stride;
     }
     // Packed rings cover `fill` of their pitch.
-    return acc * (G.tower2.z / f32(n));
+    return acc * (G.tower2.z * f32(stride) / max(dr, 1e-3));
 }
 
 @fragment
@@ -131,6 +138,14 @@ fn fs_tower(in: TowerOut, @builtin(front_facing) front: bool) -> @location(0) ve
     let dr_px = ds_px * drds;
     let turn0 = atan2(in.world.z, in.world.x) / TAU + 0.5;
     let dturn_px = darc_px / (TAU * radius);
+    // Layers interleave finely wherever folders of different depths alternate,
+    // so a layer's bands cover heights where it has no rings: skip those.
+    let half = 0.5 * max(dr_px, 1.0);
+    let p0 = layer_pos(in.layer, r - half - 1.0);
+    let p1 = layer_pos(in.layer, r + half);
+    if (p1 == p0) {
+        discard;
+    }
 
     // Blend from the exact path to the dense path as rings get closer than a pixel.
     let w = smoothstep(DENSE_FROM, DENSE_TO, dr_px);
@@ -140,7 +155,7 @@ fn fs_tower(in: TowerOut, @builtin(front_facing) front: bool) -> @location(0) ve
     }
     if (w > 0.0) {
         let taps = select(max(G.times2.w * 0.5, 1.0), G.times2.w, front || G.tower2.w > 0.99);
-        acc += dense(in, r, dr_px, turn0, taps, t) * w;
+        acc += dense(in, r - 0.5 * dr_px, r + 0.5 * dr_px, p0, p1, turn0, taps, t) * w;
     }
     if (!front) {
         acc *= G.tower2.w;

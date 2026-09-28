@@ -2,6 +2,7 @@
 //! window or headlessly to PNG.
 
 mod app;
+mod callouts;
 mod camera;
 mod fx;
 mod gpu;

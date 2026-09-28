@@ -32,8 +32,9 @@ const RELAYOUT_MIN_INTERVAL: f64 = 0.5;
 const SESSION_DT: f64 = 1.0 / 24.0;
 /// Folder activity (decay, which folders are open) is updated this often.
 const ACTIVITY_INTERVAL: f32 = 0.05;
-/// Live trees are large (a rebuild takes tens of ms), so rebuild at most this often.
-const RELAYOUT_LIVE_INTERVAL: f64 = 20.0;
+/// Live trees are large (a rebuild takes tens of ms, on a worker thread), so
+/// rebuild at most this often. New files appear with the next rebuild.
+const RELAYOUT_LIVE_INTERVAL: f64 = 5.0;
 /// Directory activity below this does not count as "hot" for layout priority.
 const HOT_MIN: f32 = 0.5;
 /// Activity at which a collapsed directory is unfolded, and how often that may happen.
@@ -143,6 +144,12 @@ pub struct World {
     /// Per depth layer, the height intervals (distance from the tower top)
     /// holding its rings: `[s0, s1, layer, 0]`.
     pub layer_bands: Vec<[f32; 4]>,
+    /// Each depth layer's rings, so the tower shader can visit only the rings of
+    /// the layer it is drawing: for layer L and ring index i,
+    /// `layer_index[L * (n + 1) + i]` is the position in the list (stored after
+    /// the table, from `layers * (n + 1)`) of L's first ring at or after i.
+    pub layer_index: Vec<u32>,
+    pub layer_index_dirty: bool,
 
     pub dir_act: Vec<f32>,
     dir_open_target: Vec<f32>,
@@ -250,6 +257,8 @@ impl World {
             ring_s: vec![],
             ring_pitch: vec![],
             layer_bands: vec![],
+            layer_index: vec![],
+            layer_index_dirty: false,
             dir_act: vec![],
             dir_open_target: vec![],
             dir_rings: vec![],
@@ -510,6 +519,7 @@ impl World {
                 self.loop_retire();
             }
         }
+        self.update_layer_index();
         self.update_lut();
         log::debug!(
             "layout v{}: {} rings ({changed_rows} changed), {} segments, {} dirs expanded, {} collapsed; build {t_build:.1} + segs {t_segs:.1} + atlas {t_atlas:.1} ms, install {:.1} ms",
@@ -568,6 +578,7 @@ impl World {
                 let a = &mut self.dir_act[dir];
                 *a += impulse * (1.0 - *a / DIR_ACT_MAX).max(0.0);
             }
+            self.fx.on_event(&self.cfg, ev.kind, ev.file, t);
             if ev.kind == EventKind::Create {
                 if self.layout.is_expanded(dir as u32) {
                     self.needs_relayout = true;
@@ -640,7 +651,6 @@ impl World {
                 self.dirty_segs.push(mark);
                 self.mark_hot(first, tf + HOT_SECONDS);
             }
-            self.fx.on_event(ev.kind, ev.file, seg, t);
             if ev.kind == EventKind::Delete
                 && self.cfg.events.delete.fall
                 && matches!(self.layout.segments[seg as usize].source, SegSource::File(_))
@@ -747,6 +757,26 @@ impl World {
                     *pr = [0.0; 6];
                 }
             });
+        }
+    }
+
+    /// Segment a callout for `file` points at: the file's own segment, or while
+    /// it has none (created since the last layout) its folder's tick, or the
+    /// aggregate of the collapsed folder holding it.
+    pub fn anchor_segment(&self, file: u32) -> Option<u32> {
+        if let Some(&s) = self.layout.seg_of_file.get(file as usize).filter(|&&s| s != NONE && (s as usize) < self.segs.len()) {
+            return Some(s);
+        }
+        let mut d = self.model.files.get(file as usize)?.dir;
+        loop {
+            if let Some(&first) = self.layout.dir_first_ring.get(d as usize).filter(|&&r| r != NONE) {
+                let ring = self.rings.get(first as usize)?;
+                return self.dir_mark_segment(first).or(Some(ring.first_seg).filter(|&s| (s as usize) < self.segs.len()));
+            }
+            if let Some(&s) = self.layout.agg_seg.get(d as usize).filter(|&&s| s != NONE && (s as usize) < self.segs.len()) {
+                return Some(s);
+            }
+            d = self.model.dirs.get(d as usize)?.parent?;
         }
     }
 
@@ -1154,8 +1184,9 @@ impl World {
             if p <= 0.0 {
                 continue;
             }
+            let layer = (r.depth as usize).min(layers - 1);
             let (s0, s1) = (self.ring_s[i] - p * 0.5 - half, self.ring_s[i] + p * 0.5 + half);
-            let bands = &mut per[(r.depth as usize).min(layers - 1)];
+            let bands = &mut per[layer];
             match bands.last_mut() {
                 Some(last) if s0 <= last[1] => last[1] = last[1].max(s1),
                 _ => bands.push([s0, s1]),
@@ -1184,6 +1215,15 @@ impl World {
         self.layer_bands = all;
     }
 
+    /// Rebuilds `layer_index` (after a relayout: it depends only on the rings'
+    /// order and depths).
+    fn update_layer_index(&mut self) {
+        let layers = self.cfg.tower.depth_layers.max(1) as usize;
+        let idx = layer_index(self.layout.rings.iter().map(|r| (r.depth as usize).min(layers - 1)), self.layout.rings.len(), layers);
+        self.layer_index = idx;
+        self.layer_index_dirty = true;
+    }
+
     /// Ring rotation (turns) at time `t`; mirrors `ring_phase` in tower.wgsl.
     pub fn ring_phase(&self, ring: usize, t: f32) -> f32 {
         let r = &self.rings[ring];
@@ -1193,8 +1233,10 @@ impl World {
 
     pub fn ring_radius(&self, ring: usize) -> f32 {
         let tw = &self.cfg.tower;
-        let layer = (self.rings[ring].depth as u32).min(tw.depth_layers.max(1) - 1);
-        tw.radius * (1.0 - tw.depth_step * layer as f32)
+        // Mirrors vs_tower in tower.wgsl.
+        let layers = tw.depth_layers.max(1);
+        let layer = (self.rings[ring].depth as u32).min(layers - 1);
+        tw.inner_radius + (tw.radius - tw.inner_radius) * layer as f32 / (layers - 1).max(1) as f32
     }
 
     pub fn y_top(&self) -> f32 {
@@ -1218,17 +1260,46 @@ impl World {
     }
 
     /// Short label for a file according to the privacy setting.
+    /// The privacy text mode in effect: paths | dirs | glyphs | none.
+    pub fn label_mode(&self) -> &str {
+        if self.sharing && self.cfg.privacy.obfuscate_when_sharing { "glyphs" } else { self.cfg.privacy.text.as_str() }
+    }
+
     pub fn label_for(&self, file: u32) -> Option<String> {
         let m = &self.model;
         let f = m.files.get(file as usize)?;
-        let mode = if self.sharing && self.cfg.privacy.obfuscate_when_sharing { "glyphs" } else { self.cfg.privacy.text.as_str() };
-        match mode {
+        match self.label_mode() {
             "none" => None,
             "dirs" => Some(m.dirs[f.dir as usize].name.clone()),
             "glyphs" => Some(format!("{:08X}", gits_core::rng::mix64(file as u64) as u32)),
             _ => Some(f.name.clone()),
         }
     }
+}
+
+/// See `World::layer_index`. `ring_layers` gives each ring's layer, in order.
+fn layer_index(ring_layers: impl Iterator<Item = usize> + Clone, n: usize, layers: usize) -> Vec<u32> {
+    let mut start = vec![0u32; layers + 1];
+    for l in ring_layers.clone() {
+        start[l + 1] += 1;
+    }
+    for l in 0..layers {
+        start[l + 1] += start[l];
+    }
+    let list_at = (layers * (n + 1)) as u32;
+    let mut idx = vec![0u32; layers * (n + 1) + n];
+    let mut next: Vec<u32> = start[..layers].to_vec();
+    for (i, l) in ring_layers.enumerate() {
+        for (k, nx) in next.iter().enumerate() {
+            idx[k * (n + 1) + i] = list_at + nx;
+        }
+        idx[(list_at + next[l]) as usize] = i as u32;
+        next[l] += 1;
+    }
+    for (k, nx) in next.iter().enumerate() {
+        idx[k * (n + 1) + n] = list_at + nx;
+    }
+    idx
 }
 
 /// Inputs of a layout build (see `World::start_relayout`).
@@ -1357,4 +1428,30 @@ pub fn wall_clock() -> i64 {
 pub fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layer_index_lists_each_layers_rings() {
+        // Rings 0..6 in layers 0 1 1 0 2 1 (3 layers).
+        let ring_layers = [0usize, 1, 1, 0, 2, 1];
+        let (n, layers) = (ring_layers.len(), 3);
+        let idx = layer_index(ring_layers.iter().copied(), n, layers);
+        let list_at = layers * (n + 1);
+        // The rings of `layer` from ring index a up to (not including) b.
+        let rings = |layer: usize, a: usize, b: usize| -> Vec<u32> {
+            let (p0, p1) = (idx[layer * (n + 1) + a] as usize, idx[layer * (n + 1) + b] as usize);
+            assert!(p0 >= list_at && p1 <= idx.len());
+            idx[p0..p1].to_vec()
+        };
+        assert_eq!(rings(0, 0, n), [0, 3]);
+        assert_eq!(rings(1, 0, n), [1, 2, 5]);
+        assert_eq!(rings(2, 0, n), [4]);
+        assert_eq!(rings(1, 2, 5), [2]);
+        assert_eq!(rings(0, 1, 3), Vec::<u32>::new());
+        assert_eq!(rings(2, 4, 5), [4]);
+    }
 }

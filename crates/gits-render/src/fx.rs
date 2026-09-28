@@ -1,7 +1,8 @@
-//! Overlay effects drawn as sprites: cards + labels on touched files, the
-//! wireframe probe, falling "cut string" segments, gold flakes, and the static
-//! chamber (teal lattice, floor lights, calligraphy wall).
+//! Overlay effects drawn as sprites: callouts on touched files (callouts.rs),
+//! the wireframe probe, falling "cut string" segments, gold flakes, and the
+//! static chamber (teal lattice, floor lights, calligraphy wall).
 
+use crate::callouts::{Callouts, Slots};
 use crate::camera::Camera;
 use crate::gpu_types::{SpriteVertex, sprite_kind as K};
 use crate::text::{Face, GlyphAtlas, ZEAMI_ENGLISH, ZEAMI_VERSE};
@@ -13,23 +14,9 @@ use gits_core::rng::{Rng, hash01};
 use glam::{Mat3, Vec3};
 use std::f32::consts::{PI, TAU};
 
-const MAX_CARDS: usize = 6;
-const CARD_HOLD: f64 = 7.0;
-const CARD_FADE: f64 = 1.6;
-const CARD_MIN_INTERVAL: f64 = 0.8;
-/// A file that already had a card gets a new one only after this long.
-const CARD_REPEAT: f64 = 120.0;
 const PROBE_HOLD: f64 = 25.0;
 const MAX_FLAKES: usize = 1500;
 const FALL_LIFE: f32 = 2.4;
-
-#[derive(Clone, Debug)]
-pub struct Card {
-    pub file: FileId,
-    pub kind: EventKind,
-    pub t0: f64,
-    pub t_last: f64,
-}
 
 #[derive(Clone, Debug, Default)]
 pub struct Probe {
@@ -63,59 +50,29 @@ struct Flake {
 }
 
 pub struct Fx {
-    pub cards: Vec<Card>,
-    /// When each file last got a card: files touched constantly (logs, soak
-    /// tests) do not keep a card pinned forever.
-    carded: std::collections::HashMap<FileId, f64>,
+    pub cards: Callouts,
     pub probe: Probe,
     falls: Vec<Fall>,
     flakes: Vec<Flake>,
-    last_card_t: f64,
     rng: Rng,
 }
 
 impl Default for Fx {
     fn default() -> Self {
-        Self {
-            cards: vec![],
-            carded: Default::default(),
-            probe: Probe::default(),
-            falls: vec![],
-            flakes: vec![],
-            last_card_t: -1e9,
-            rng: Rng::new(2501),
-        }
+        Self { cards: Callouts::default(), probe: Probe::default(), falls: vec![], flakes: vec![], rng: Rng::new(2501) }
     }
 }
 
 impl Fx {
-    pub fn on_event(&mut self, kind: EventKind, file: FileId, _seg: u32, t: f64) {
+    pub fn on_event(&mut self, cfg: &Config, kind: EventKind, file: FileId, t: f64) {
+        self.cards.on_event(&cfg.labels, kind, file, t);
         match kind {
             EventKind::Read | EventKind::Write => {
                 self.probe.target = Some(file);
                 self.probe.t_last = t;
-                if let Some(c) = self.cards.iter_mut().find(|c| c.file == file) {
-                    c.kind = kind;
-                } else if t - self.last_card_t >= CARD_MIN_INTERVAL && self.carded.get(&file).is_none_or(|&t0| t - t0 >= CARD_REPEAT) {
-                    self.last_card_t = t;
-                    self.carded.insert(file, t);
-                    if self.carded.len() > 4096 {
-                        self.carded.retain(|_, t0| t - *t0 < CARD_REPEAT);
-                    }
-                    self.cards.push(Card { file, kind, t0: t, t_last: t });
-                    if self.cards.len() > MAX_CARDS {
-                        let oldest = (0..self.cards.len()).min_by(|&a, &b| self.cards[a].t_last.total_cmp(&self.cards[b].t_last)).unwrap();
-                        self.cards.remove(oldest);
-                    }
-                }
             }
-            EventKind::Delete => {
-                self.cards.retain(|c| c.file != file);
-                if self.probe.target == Some(file) {
-                    self.probe.target = None;
-                }
-            }
-            EventKind::Create => {}
+            EventKind::Delete if self.probe.target == Some(file) => self.probe.target = None,
+            _ => {}
         }
     }
 
@@ -142,7 +99,7 @@ impl Fx {
 
     pub fn step(mut self, w: &World, dt: f32) -> Self {
         let t = w.t;
-        self.cards.retain(|c| t - c.t_last < CARD_HOLD + CARD_FADE && w.model.is_live(c.file));
+        self.cards.step(&w.cfg.labels, &w.model, t);
 
         // Probe glides toward the most recently touched file.
         let target = self.probe.target.and_then(|f| Self::seg_of(w, f)).and_then(|s| w.segment_point(s, 0.5));
@@ -206,79 +163,26 @@ impl Fx {
         self
     }
 
-    /// Per-frame sprites (world + screen space).
-    pub fn build(&self, w: &World, cam: &Camera, atlas: &GlyphAtlas, width: f32, height: f32, out: &mut Vec<SpriteVertex>) {
+    /// Per-frame sprites (world + screen space) for one monitor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build(
+        &self,
+        w: &World,
+        cam: &Camera,
+        atlas: &GlyphAtlas,
+        slots: &mut Slots,
+        width: f32,
+        height: f32,
+        dt: f32,
+        out: &mut Vec<SpriteVertex>,
+    ) {
         let cfg = &w.cfg;
         let t = w.t;
         let cream = cfg.color(&cfg.events.read.color);
         let gold = cfg.color(&cfg.age.fresh);
         let crimson = cfg.color(&cfg.events.delete.color);
-        let write_col = cfg.color(&cfg.events.write.color);
         let ui = height / 1080.0;
-
-        // Cards and labels.
-        for c in &self.cards {
-            let Some(seg) = Self::seg_of(w, c.file) else { continue };
-            let Some((p, r)) = w.segment_point(seg, 0.5) else { continue };
-            let age = t - c.t0;
-            let since = t - c.t_last;
-            let alpha = (smoothstep(0.0, 0.35, age as f32)
-                * (1.0 - smoothstep(CARD_HOLD as f32, (CARD_HOLD + CARD_FADE) as f32, since as f32)))
-            .max(0.0);
-            if alpha <= 0.0 {
-                continue;
-            }
-            let normal = Vec3::new(p.x, 0.0, p.z) / r.max(1e-3);
-            let facing = normal.dot((cam.eye - p).normalize());
-            let vis = 0.2 + 0.8 * smoothstep(-0.2, 0.35, facing);
-            let tangent = Vec3::new(-normal.z, 0.0, normal.x);
-            let center = p + normal * 0.03;
-            let (hw, hh) = (0.06, 0.34);
-            let col = [cream[0], cream[1], cream[2], 1.5 * alpha * vis];
-            quad_world(
-                out,
-                [
-                    center - tangent * hw - Vec3::Y * hh,
-                    center + tangent * hw - Vec3::Y * hh,
-                    center + tangent * hw + Vec3::Y * hh,
-                    center - tangent * hw + Vec3::Y * hh,
-                ],
-                K::CARD,
-                col,
-            );
-
-            if facing < 0.05 {
-                continue;
-            }
-            let Some(label) = w.label_for(c.file) else { continue };
-            let Some((sx, sy)) = cam.project(center + Vec3::Y * hh * 0.6, width, height) else { continue };
-            let size = 15.0 * ui;
-            let right = sx >= width * 0.5;
-            let text_w = atlas.mono.measure(&label, size);
-            let lead = 48.0 * ui;
-            let lx = if right { sx + lead } else { sx - lead - text_w };
-            let ly = sy - 10.0 * ui;
-            let la = alpha * vis;
-            line_px(
-                out,
-                [sx, sy],
-                [if right { lx - 6.0 * ui } else { lx + text_w + 6.0 * ui }, ly - size * 0.3],
-                1.2 * ui,
-                [gold[0], gold[1], gold[2], 0.9 * la],
-                width,
-                height,
-            );
-            text_px(out, &atlas.mono, &label, lx, ly, size, [gold[0], gold[1], gold[2], 1.6 * la], width, height);
-            let size_bytes = w.model.files[c.file as usize].size;
-            let (tag, tag_col) = match c.kind {
-                EventKind::Write => ("WRITE", write_col),
-                _ => ("READ ", cream),
-            };
-            let sub = format!("{tag} · {}", human_size(size_bytes));
-            let sub_size = 11.0 * ui;
-            let sub_x = if right { lx } else { lx + text_w - atlas.mono.measure(&sub, sub_size) };
-            text_px(out, &atlas.mono, &sub, sub_x, ly + 15.0 * ui, sub_size, [tag_col[0], tag_col[1], tag_col[2], 1.1 * la], width, height);
-        }
+        self.cards.build(w, cam, atlas, slots, width, height, dt, out);
 
         // Probe: three nested wire circles and a bright core.
         if self.probe.alpha > 0.01 {
@@ -529,7 +433,7 @@ fn glyph_on_wall(
     push_quad(out, quad.map(|p| p.to_array()), uv, 0.0, K::GLYPH, lod, color);
 }
 
-fn human_size(b: u64) -> String {
+pub(crate) fn human_size(b: u64) -> String {
     let b = b as f64;
     if b < 1024.0 {
         format!("{b:.0} B")
@@ -554,7 +458,7 @@ fn push_quad(out: &mut Vec<SpriteVertex>, p: [[f32; 3]; 4], uv: [[f32; 2]; 4], s
 
 const UV_BOX: [[f32; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
 
-fn quad_world(out: &mut Vec<SpriteVertex>, p: [Vec3; 4], kind: f32, color: [f32; 4]) {
+pub(crate) fn quad_world(out: &mut Vec<SpriteVertex>, p: [Vec3; 4], kind: f32, color: [f32; 4]) {
     push_quad(out, p.map(|v| v.to_array()), UV_BOX, 0.0, kind, 0.0, color);
 }
 
@@ -587,7 +491,7 @@ fn px_to_ndc(x: f32, y: f32, w: f32, h: f32) -> [f32; 3] {
     [x / w * 2.0 - 1.0, 1.0 - y / h * 2.0, 0.0]
 }
 
-fn line_px(out: &mut Vec<SpriteVertex>, a: [f32; 2], b: [f32; 2], width: f32, color: [f32; 4], w: f32, h: f32) {
+pub(crate) fn line_px(out: &mut Vec<SpriteVertex>, a: [f32; 2], b: [f32; 2], width: f32, color: [f32; 4], w: f32, h: f32) {
     let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
     let len = (dx * dx + dy * dy).sqrt().max(1e-3);
     let (nx, ny) = (-dy / len * width * 0.5, dx / len * width * 0.5);

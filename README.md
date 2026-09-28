@@ -3,8 +3,12 @@
 A live GNOME desktop wallpaper that renders your filesystem as the glowing
 security-system tower from the LOCUS SOLUS hack in *Ghost in the Shell 2:
 Innocence*. Directories are bands of stacked rings and files are arc segments.
-Reads flash cream, writes turn crimson, new files grow along their ring, and
-deleted files snap loose and fall apart into gold flakes.
+Like a disk-usage ring chart (Filelight, Disk Usage Analyzer), a folder's files
+sit closer to the axis the nearer the folder is to your home folder, and
+deeper folders form shells further out. Reads flash cream, writes turn crimson,
+new files grow along their ring, and deleted files snap loose and fall apart
+into gold flakes. Callouts beside the tower name the files being touched (NEW,
+EDIT, READ, DELETED), several dozen at a time.
 
 Targets Ubuntu 22.04, 24.04 and 26.04 (GNOME 42 / 46 / 50).
 Design: [docs/DESIGN.md](docs/DESIGN.md).
@@ -66,12 +70,15 @@ Rendering (see `[performance]` in `config/default.toml`):
   resolution and 30 fps, restarting itself when the power source changes.
 - Where many rings share a pixel, all of them are averaged (up to 16), so the
   drum reads as fine striations instead of crawling noise.
-- Layouts are rebuilt on a worker thread, and rings keep their texture rows, so
-  file-system changes never stall a frame.
+- Layouts are rebuilt on a worker thread (at most every 5 s, which is when new
+  files appear), and rings keep their texture rows, so file-system changes
+  never stall a frame.
 
 Measured headlessly on the development laptop (RTX 2060 Max-Q, three monitors
-1920×1200 + 1080×1920 + 3840×2160, live data): 60 fps with the longest frame
-16.9 ms over 75 s; NVIDIA ~35% busy at ~22 W; renderer ~20% of one CPU core.
+1920×1200 + 1080×1920 + 3840×2160, live data, 2026-09-28): 60 fps with the
+longest frame 17–19 ms; NVIDIA ~83% busy at ~64 W; renderer ~30% of one CPU
+core (~40% during the stress test below). Nothing is drawn while windows cover
+the monitors. `render_scale` lowers the GPU load.
 `gits-render loadtest` measures this on your machine; `gits-render gpu-check`
 lists which GPUs can present to a window.
 
@@ -110,6 +117,22 @@ cargo run --release -p gits-render -- loadtest --source collector       # real w
 cargo run --release -p gits-render -- stats --minutes 15
 cargo run --release -p gits-render -- default-config > my-config.toml
 ```
+
+### Stress test: watch a flurry of changes
+
+```sh
+python3 tools/stress.py                            # ~3 minutes, every kind of change
+python3 tools/stress.py --phase mixed --seconds 0  # steady mix until Ctrl-C
+python3 tools/stress.py --rate 3                   # three times as busy
+gits-collector monitor --filter gits-stress --reads   # the changes as the collector sees them
+```
+
+It works only inside `~/gits-stress` (made and removed by the script) and
+runs through phases: creating folders and files, slow edits, a build (many
+reads, writes and new files), browsing photos, a clean-up (deletes), a burst of
+everything, a steady mix, and removing the folder. Show the desktop (or press
+Super) to watch; the wallpaper pauses while windows cover it. New files appear
+within ~5 s; reads, edits and deletes immediately.
 
 ### Testing the extension safely
 

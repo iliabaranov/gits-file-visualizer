@@ -114,6 +114,8 @@ pub struct Renderer {
     ring_cap: usize,
     lut_buf: wgpu::Buffer,
     bands_buf: wgpu::Buffer,
+    layer_index_buf: wgpu::Buffer,
+    layer_index_cap: usize,
     bands_cap: usize,
     n_bands: u32,
     /// Ring index of each atlas slot (u32::MAX = free).
@@ -169,6 +171,7 @@ pub struct View {
     fx_count: u32,
     bg_vb: wgpu::Buffer,
     bg_count: u32,
+    callouts: crate::callouts::Slots,
 }
 
 impl View {
@@ -346,6 +349,7 @@ impl Renderer {
                     count: None,
                 },
                 storage_entry(6),
+                storage_entry(7),
             ],
         });
         let sprite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -600,6 +604,8 @@ impl Renderer {
             open_buf: storage_buffer(&device, "ring open", (ring_cap * 4) as u64),
             lut_buf: storage_buffer(&device, "lut", ((LUT_BINS + 1) * 4) as u64),
             bands_buf: storage_buffer(&device, "layer bands", 16 * 16),
+            layer_index_buf: storage_buffer(&device, "layer index", 16),
+            layer_index_cap: 4,
             bands_cap: 16,
             slot_ring_buf: storage_buffer(&device, "slot rings", 1024 * 4),
             slot_ring_cap: 1024,
@@ -668,6 +674,7 @@ impl Renderer {
             fx_count: 0,
             bg_vb: vertex_buffer(&self.device, "background sprites", 64),
             bg_count: 0,
+            callouts: Default::default(),
         }
     }
 
@@ -842,6 +849,18 @@ impl Renderer {
                 w.open_dirty = false;
             }
         }
+        if w.layer_index_dirty {
+            let idx = &w.layer_index;
+            if idx.len() > self.layer_index_cap {
+                self.layer_index_cap = idx.len() * 5 / 4;
+                self.layer_index_buf = storage_buffer(&self.device, "layer index", (self.layer_index_cap * 4) as u64);
+                self.tower_bg = None;
+            }
+            if !idx.is_empty() {
+                self.queue.write_buffer(&self.layer_index_buf, 0, bytemuck::cast_slice(idx));
+            }
+            w.layer_index_dirty = false;
+        }
         if w.lut_dirty {
             self.queue.write_buffer(&self.lut_buf, 0, bytemuck::cast_slice(&w.lut));
             let bands = &w.layer_bands;
@@ -868,6 +887,7 @@ impl Renderer {
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.atlas_view) },
                     wgpu::BindGroupEntry { binding: 5, resource: self.bands_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 6, resource: self.slot_ring_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: self.layer_index_buf.as_entire_binding() },
                 ],
             }));
         }
@@ -930,7 +950,7 @@ impl Renderer {
         Globals {
             view_proj: cam.view_proj().to_cols_array_2d(),
             cam_pos: [cam.eye.x, cam.eye.y, cam.eye.z, w.t as f32],
-            tower: [tw.height, tw.radius, tw.depth_step, w.y_top()],
+            tower: [tw.height, tw.radius, tw.inner_radius, w.y_top()],
             tower2: [tw.depth_layers.max(1) as f32, tw.ribbon, tw.fill, if cam.inside { 1.0 } else { tw.back_face }],
             lut: [LUT_BINS as f32, w.rings.len() as f32, ATLAS_W as f32, BOOST_TAU],
             idle: [tw.idle_wound, tw.idle_open, 0.75, 0.22],
@@ -975,7 +995,7 @@ impl Renderer {
             view.bg_count = scratch.len() as u32;
         }
         scratch.clear();
-        w.fx.build(w, cam, &self.atlas, iw as f32, ih as f32, &mut scratch);
+        w.fx.build(w, cam, &self.atlas, &mut view.callouts, iw as f32, ih as f32, frame_dt, &mut scratch);
         if scratch.len() > view.fx_cap {
             view.fx_cap = scratch.len() * 3 / 2;
             view.fx_vb = vertex_buffer(&self.device, "fx sprites", view.fx_cap);

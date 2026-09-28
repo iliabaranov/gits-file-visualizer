@@ -4,7 +4,7 @@
 struct Globals {
     view_proj: mat4x4<f32>,
     cam_pos: vec4<f32>,     // xyz, w = time
-    tower: vec4<f32>,       // height, radius, depth_step, y_top
+    tower: vec4<f32>,       // height, outer radius, inner radius, y_top
     tower2: vec4<f32>,      // depth layers, ribbon, fill, back_face
     lut: vec4<f32>,         // lut bins, ring count, atlas width, boost tau
     idle: vec4<f32>,        // idle_wound, idle_open, dir mark, ghost

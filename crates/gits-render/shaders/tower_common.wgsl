@@ -23,6 +23,10 @@ struct Ring {
 // Ring index of each atlas row ("slot"); 0xffffffff = free. Rings keep their
 // row across relayouts, so only changed rings need new atlas and colour rows.
 @group(1) @binding(6) var<storage, read> slot_ring: array<u32>;
+// Each depth layer's rings (see World::layer_index): for layer L and ring
+// index i, layer_index[L * (n + 1) + i] is where L's first ring at or after i
+// sits in the list of ring indices that follows the table.
+@group(1) @binding(7) var<storage, read> layer_index: array<u32>;
 
 const SEG_DIR: u32 = 1u;
 const SEG_AGG: u32 = 2u;

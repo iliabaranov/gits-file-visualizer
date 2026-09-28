@@ -46,7 +46,7 @@ pub struct Globals {
     pub view_proj: [[f32; 4]; 4],
     /// xyz = camera position, w = time (s).
     pub cam_pos: [f32; 4],
-    /// height, radius, depth_step, y_top.
+    /// height, radius (outermost shell), inner_radius (root shell), y_top.
     pub tower: [f32; 4],
     /// depth layers, ribbon, fill, back_face.
     pub tower2: [f32; 4],

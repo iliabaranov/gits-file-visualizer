@@ -4,18 +4,21 @@
     tools/stress.py                     # the full show, about 3 minutes
     tools/stress.py --rate 3            # three times as busy
     tools/stress.py --phase burst --seconds 30
+    tools/stress.py --phase mixed --seconds 0   # steady mix of all four, until Ctrl-C
     tools/stress.py --keep              # leave the files (default: delete at the end)
 
 Everything happens in one folder (default ~/gits-stress), which the collector
 watches because it is under your home and not excluded. Phases:
 
   setup    create folders and files, then wait for the tower to show them
-           (new folders appear at the next layout rebuild, at most ~20 s)
+           (new files appear at the next layout rebuild, within ~5 s)
   edit     a few files rewritten slowly           -> crimson flashes, spin boosts
   build    many reads + writes + new object files  -> the folder unwinds, cream/crimson storm
   browse   files read one after another            -> cream flashes, labels
   cleanup  a batch of files deleted                -> segments fall into gold flakes
   burst    everything at once, as fast as --rate allows
+  mixed    a steady mix of reads, edits, new files and deletes all over the
+           folder (NEW / EDIT / READ / DELETED callouts)
   teardown the whole folder deleted (unless --keep) -> a big fall of flakes
 
 Watch with the desktop visible (press Super for the overview, or minimize
@@ -174,6 +177,36 @@ class Stress:
 
         self.run_for(seconds, 120, step)
 
+    def mixed(self, seconds):
+        log("mixed: reads, edits, new files and deletes all over the folder" + (" (Ctrl-C to stop)" if seconds <= 0 else ""))
+        folders = sorted({os.path.dirname(p) for p in self.files})
+
+        def step():
+            r = self.rng.random()
+            if r < 0.35:
+                p = self.pick()
+                p and self.read(p)
+            elif r < 0.65:
+                p = self.pick()
+                p and (self.append(p) if p.endswith((".rs", ".log", ".md")) else self.write(p))
+            elif r < 0.83 or len(self.files) < 150:
+                d = self.rng.choice(folders)
+                ext = os.path.splitext(self.rng.choice([p for p in self.files if os.path.dirname(p) == d] or ["x.txt"]))[1]
+                p = os.path.join(d, f"{self.rng.choice(WORDS)}_{self.rng.getrandbits(24):06x}{ext}")
+                self.write(p)
+                self.files.append(p)
+            else:
+                p = self.pick()
+                if p:
+                    try:
+                        os.remove(p)
+                        self.files.remove(p)
+                        self.ops += 1
+                    except FileNotFoundError:
+                        pass
+
+        self.run_for(seconds if seconds > 0 else float("inf"), 10, step)
+
     def teardown(self):
         log(f"teardown: deleting {self.root}")
         shutil.rmtree(self.root, ignore_errors=True)
@@ -183,8 +216,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dir", default=os.path.expanduser("~/gits-stress"), help="working folder (default ~/gits-stress)")
     ap.add_argument("--rate", type=float, default=1.0, help="activity multiplier (default 1)")
-    ap.add_argument("--phase", choices=["all", "edit", "build", "browse", "cleanup", "burst"], default="all")
-    ap.add_argument("--seconds", type=float, default=25, help="length of each timed phase (default 25)")
+    ap.add_argument("--phase", choices=["all", "edit", "build", "browse", "cleanup", "burst", "mixed"], default="all")
+    ap.add_argument("--seconds", type=float, default=25, help="length of each timed phase (default 25; 0 = mixed runs until Ctrl-C)")
     ap.add_argument("--wait", type=float, default=25, help="pause after creating files (default 25)")
     ap.add_argument("--keep", action="store_true", help="do not delete the folder at the end")
     ap.add_argument("--seed", type=int, default=2501)
@@ -209,8 +242,9 @@ def main():
             "browse": lambda: s.browse(a.seconds),
             "cleanup": lambda: s.cleanup(),
             "burst": lambda: s.burst(a.seconds),
+            "mixed": lambda: s.mixed(a.seconds),
         }
-        order = ["edit", "build", "browse", "cleanup", "burst"] if a.phase == "all" else [a.phase]
+        order = ["edit", "build", "browse", "cleanup", "burst", "mixed"] if a.phase == "all" else [a.phase]
         for name in order:
             phases[name]()
         if not a.keep:
