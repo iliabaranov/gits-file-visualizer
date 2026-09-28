@@ -4,7 +4,7 @@
 
 use crate::camera::Camera;
 use crate::gpu_types::{SpriteVertex, sprite_kind as K};
-use crate::text::{Face, GlyphAtlas, ZEAMI_VERSE};
+use crate::text::{Face, GlyphAtlas, ZEAMI_ENGLISH, ZEAMI_VERSE};
 use crate::world::{World, smoothstep};
 use gits_core::config::Config;
 use gits_core::layout::NONE;
@@ -365,9 +365,31 @@ pub fn build_background(cfg: &Config, atlas: &GlyphAtlas, y_top: f32, cam: &Came
         let step = size * 1.3;
         let b = bg.calligraphy_brightness * 0.3;
         for (group, (tc, top)) in
-            [(-PI * 0.5 + 0.34, 7.4f32), (-PI * 0.5 - 0.42, 5.6), (-PI * 0.5 + 0.95, 4.2), (-PI * 0.5 - 1.05, 6.8)].iter().enumerate()
+            [(-PI * 0.5 + 0.34, 7.4f32), (-PI * 0.5 - 0.42, 5.6), (-PI * 0.5 + 0.95, 4.2), (-PI * 0.5 - 1.35, 6.8)].iter().enumerate()
         {
             let fade = if group < 2 { 1.0 } else { 0.6 };
+            if group == 1 {
+                // The English translation, in horizontal lines, left of the tower
+                // in the wide view (the Japanese stays on the right).
+                let size = 0.42;
+                for (k, line) in ZEAMI_ENGLISH.iter().enumerate() {
+                    let baseline = top - 2.2 - k as f32 * size * 1.5;
+                    for (lod, gain) in [(1.2, 1.0), (3.2, 0.7)] {
+                        text_on_wall(
+                            out,
+                            &atlas.cjk,
+                            line,
+                            *tc - 0.33,
+                            wall_r,
+                            baseline,
+                            size,
+                            lod,
+                            [gold[0], gold[1], gold[2], b * gain * 1.2],
+                        );
+                    }
+                }
+                continue;
+            }
             for (k, line) in ZEAMI_VERSE.iter().enumerate() {
                 let theta = tc + (1.5 - k as f32) * step / wall_r;
                 for (j, ch) in line.chars().enumerate() {
@@ -435,6 +457,46 @@ pub fn build_background(cfg: &Config, atlas: &GlyphAtlas, y_top: f32, cam: &Came
                 cam.eye,
             );
         }
+    }
+}
+
+/// Horizontal text centred at angle `theta` on the inside of the wall, with its
+/// baseline at height `baseline` and cap height about `size`.
+#[allow(clippy::too_many_arguments)]
+fn text_on_wall(
+    out: &mut Vec<SpriteVertex>,
+    face: &Face,
+    text: &str,
+    theta: f32,
+    wall_r: f32,
+    baseline: f32,
+    size: f32,
+    lod: f32,
+    color: [f32; 4],
+) {
+    let k = size / face.raster_px;
+    let width = face.measure(text, size);
+    let mut pen = -width * 0.5;
+    for ch in text.chars() {
+        let Some(g) = face.glyphs.get(&ch) else { continue };
+        if g.w > 0.0 {
+            let (x0, w, h) = (pen + g.xmin * k, g.w * k, g.h * k);
+            let y0 = baseline + g.ymin * k;
+            // Flat quad tangent to the wall at the glyph's centre.
+            let th = theta + (x0 + w * 0.5) / wall_r;
+            let normal = Vec3::new(th.cos(), 0.0, th.sin());
+            let tangent = Vec3::new(-th.sin(), 0.0, th.cos());
+            let c = normal * wall_r;
+            let quad = [
+                c - tangent * (w * 0.5) + Vec3::Y * y0,
+                c + tangent * (w * 0.5) + Vec3::Y * y0,
+                c + tangent * (w * 0.5) + Vec3::Y * (y0 + h),
+                c - tangent * (w * 0.5) + Vec3::Y * (y0 + h),
+            ];
+            let uv = [[g.uv0[0], g.uv1[1]], [g.uv1[0], g.uv1[1]], [g.uv1[0], g.uv0[1]], [g.uv0[0], g.uv0[1]]];
+            push_quad(out, quad.map(|p| p.to_array()), uv, 0.0, K::GLYPH, lod, color);
+        }
+        pen += g.advance * k;
     }
 }
 

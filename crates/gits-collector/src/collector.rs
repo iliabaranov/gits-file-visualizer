@@ -199,6 +199,12 @@ impl Collector {
                         continue;
                     }
                     let child = self.mkdir(d, name, p, md.mtime(), emit);
+                    if emit {
+                        // A folder that appeared while running (mkdir -p, git clone,
+                        // unpacking): watch it before scanning it, so files created
+                        // in it from now on are seen live.
+                        self.promote(child);
+                    }
                     stack.push(child);
                 } else if ft.is_file() || ft.is_symlink() {
                     if emit && self.lookup_file(d, &name).is_some() {
@@ -480,6 +486,7 @@ impl Collector {
                     && md.dev() == self.root_dev
                 {
                     let child = self.mkdir(d, name, p, md.mtime(), true);
+                    self.promote(child);
                     self.scan(child, true);
                 }
             } else if ft.is_file() || ft.is_symlink() {

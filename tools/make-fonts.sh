@@ -18,8 +18,11 @@ python3 -m fontTools.subset "$MONO_SRC" \
   --layout-features='' --no-hinting --desubroutinize \
   --output-file=assets/fonts/hud-mono.ttf
 
-# Calligraphy: Zeami's verse from the film plus a few security-system words.
+# Calligraphy: Zeami's verse from the film, a few security-system words, and
+# Latin letters for the English translation.
 CJK_TEXT="生死去来棚頭傀儡一線断時落磊防壁侵入警告攻性再構築完了第二三四五六七八九十〇層外部内接続拒否電脳"
+# Plus Latin for the English translation of the verse (same serif face).
+CJK_TEXT="${CJK_TEXT}ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz ,.;:'-—"
 python3 -m fontTools.subset "$CJK_SRC" --font-number="$CJK_INDEX" \
   --text="$CJK_TEXT" \
   --layout-features='' --no-hinting --desubroutinize \

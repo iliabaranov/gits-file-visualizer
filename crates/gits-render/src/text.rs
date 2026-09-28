@@ -7,6 +7,9 @@ const MONO_TTF: &[u8] = include_bytes!("../../../assets/fonts/hud-mono.ttf");
 const CJK_OTF: &[u8] = include_bytes!("../../../assets/fonts/calligraphy-cjk.otf");
 
 pub const ZEAMI_VERSE: [&str; 4] = ["生死去来", "棚頭傀儡", "一線断時", "落落磊磊"];
+/// The verse in English, shown in place of one of the four copies on the wall.
+pub const ZEAMI_ENGLISH: [&str; 4] =
+    ["Life and death come and go;", "puppets on a shelf.", "When the one string is cut,", "they collapse and scatter."];
 const EXTRA_CJK: &str = "防壁侵入警告攻性再構築完了第二三四五六七八九十〇層外部内接続拒否電脳";
 const EXTRA_MONO: &str = "▸◂◆◇░▒│─┼█▌·×→←↑↓";
 
@@ -113,7 +116,8 @@ impl GlyphAtlas {
         let mut cjk_raw = vec![];
         let mono_chars = (' '..='~').chain(EXTRA_MONO.chars());
         rasterize_face(&mono_font, MONO_PX, mono_chars, 3, &mut packer, &mut mono_raw);
-        let mut cjk_chars: Vec<char> = ZEAMI_VERSE.concat().chars().chain(EXTRA_CJK.chars()).collect();
+        let mut cjk_chars: Vec<char> =
+            ZEAMI_VERSE.concat().chars().chain(EXTRA_CJK.chars()).chain(ZEAMI_ENGLISH.concat().chars()).collect();
         cjk_chars.sort();
         cjk_chars.dedup();
         rasterize_face(&cjk_font, CJK_PX, cjk_chars.into_iter(), 12, &mut packer, &mut cjk_raw);
