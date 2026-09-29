@@ -98,18 +98,17 @@ fn exact(in: TowerOut, rr: f32, turn0: f32, pitch: f32, ds_px: f32, dturn_px: f3
 // layer_index), every `stride`-th one when there are more than `max_taps`;
 // the stride is counted from the start of the list, so as rings move the
 // chosen ones stay the same and only the ends of the footprint change.
-fn dense(in: TowerOut, lo: f32, hi: f32, p0: u32, p1: u32, turn0: f32, max_taps: f32, t: f32) -> vec3<f32> {
-    let rows = G.rct.x;
+// Taps read ring_list sequentially (one load per tap, phase precomputed).
+fn dense(lo: f32, hi: f32, p0: u32, p1: u32, turn0: f32, max_taps: f32) -> vec3<f32> {
+    let list_at = u32(G.tower2.x) * (u32(G.lut.y) + 1u);
     let dr = hi - lo;
     let stride = u32(max(ceil(dr / max_taps), 1.0));
     var acc = vec3<f32>(0.0);
     var p = (p0 + stride - 1u) / stride * stride;
     for (var k = 0u; k <= u32(max_taps) && p < p1; k++) {
-        let ri = layer_index[p];
-        let ring = rings[ri];
-        let cover = clamp(min(hi, f32(ri) + 1.0) - max(lo, f32(ri)), 0.0, 1.0);
-        let u = fract(turn0 - ring_phase(ring, t));
-        acc += textureSampleLevel(ring_tex, ring_samp, vec2<f32>(u, (f32(ring.row) + 0.5) / rows), 0.0).rgb * cover;
+        let e = ring_list[p - list_at];
+        let cover = clamp(min(hi, e.z + 1.0) - max(lo, e.z), 0.0, 1.0);
+        acc += textureSampleLevel(ring_tex, ring_samp, vec2<f32>(fract(turn0 - e.y), e.x), 0.0).rgb * cover;
         p += stride;
     }
     // Packed rings cover `fill` of their pitch.
@@ -155,7 +154,7 @@ fn fs_tower(in: TowerOut, @builtin(front_facing) front: bool) -> @location(0) ve
     }
     if (w > 0.0) {
         let taps = select(max(G.times2.w * 0.5, 1.0), G.times2.w, front || G.tower2.w > 0.99);
-        acc += dense(in, r - 0.5 * dr_px, r + 0.5 * dr_px, p0, p1, turn0, taps, t) * w;
+        acc += dense(r - 0.5 * dr_px, r + 0.5 * dr_px, p0, p1, turn0, taps) * w;
     }
     if (!front) {
         acc *= G.tower2.w;

@@ -27,6 +27,9 @@ struct Ring {
 // index i, layer_index[L * (n + 1) + i] is where L's first ring at or after i
 // sits in the list of ring indices that follows the table.
 @group(1) @binding(7) var<storage, read> layer_index: array<u32>;
+// The rings of layer_index's list, in its order, for the current frame:
+// (colour texture v, fract(ring phase), ring index, 0).
+@group(1) @binding(8) var<storage, read> ring_list: array<vec4<f32>>;
 
 const SEG_DIR: u32 = 1u;
 const SEG_AGG: u32 = 2u;

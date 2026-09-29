@@ -125,6 +125,13 @@ pub struct Renderer {
     bands_buf: wgpu::Buffer,
     layer_index_buf: wgpu::Buffer,
     layer_index_cap: usize,
+    /// Each ring in the order of layer_index's list, refreshed every world time:
+    /// (colour texture v, fract(ring phase), ring index, 0). The dense path reads
+    /// this sequentially instead of looking up the ring and its phase per tap.
+    ring_list_buf: wgpu::Buffer,
+    ring_list_cap: usize,
+    ring_list_key: (f64, u64),
+    ring_list: Vec<[f32; 4]>,
     bands_cap: usize,
     n_bands: u32,
     /// Ring index of each atlas slot (u32::MAX = free).
@@ -373,6 +380,7 @@ impl Renderer {
                 },
                 storage_entry(6),
                 storage_entry(7),
+                storage_entry(8),
             ],
         });
         let sprite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -659,6 +667,10 @@ impl Renderer {
             bands_buf: storage_buffer(&device, "layer bands", 16 * 16),
             layer_index_buf: storage_buffer(&device, "layer index", 16),
             layer_index_cap: 4,
+            ring_list_buf: storage_buffer(&device, "ring list", 16),
+            ring_list_cap: 1,
+            ring_list_key: (f64::NAN, 0),
+            ring_list: vec![],
             bands_cap: 16,
             slot_ring_buf: storage_buffer(&device, "slot rings", 1024 * 4),
             slot_ring_cap: 1024,
@@ -938,6 +950,7 @@ impl Renderer {
             self.n_bands = bands.len() as u32;
             w.lut_dirty = false;
         }
+        self.update_ring_list(w);
         if self.tower_bg.is_none() {
             self.tower_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("tower"),
@@ -951,10 +964,39 @@ impl Renderer {
                     wgpu::BindGroupEntry { binding: 5, resource: self.bands_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 6, resource: self.slot_ring_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 7, resource: self.layer_index_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: self.ring_list_buf.as_entire_binding() },
                 ],
             }));
         }
         self.plan_ring_colours(w);
+    }
+
+    /// Refreshes `ring_list_buf` for world time `w.t` (once per world time,
+    /// however many views render it). Phases are reduced in f64, so they stay
+    /// precise however long the renderer has been running.
+    fn update_ring_list(&mut self, w: &World) {
+        let n = w.rings.len();
+        let list_at = w.cfg.tower.depth_layers.max(1) as usize * (n + 1);
+        if n == 0 || w.layer_index.len() < list_at + n || self.ring_list_key == (w.t, self.layout_version) {
+            return;
+        }
+        self.ring_list_key = (w.t, self.layout_version);
+        if n > self.ring_list_cap {
+            self.ring_list_cap = n * 5 / 4 + 64;
+            self.ring_list_buf = storage_buffer(&self.device, "ring list", (self.ring_list_cap * 16) as u64);
+            self.tower_bg = None;
+        }
+        let rows = self.atlas_rows as f32;
+        let t = w.t;
+        self.ring_list.clear();
+        for &ri in &w.layer_index[list_at..list_at + n] {
+            let r = &w.rings[ri as usize];
+            // Mirrors ring_phase in tower_common.wgsl.
+            let x = ((t as f32 - r.boost_t0) / BOOST_TAU).clamp(0.0, 1.0);
+            let phase = r.phase0 as f64 + r.speed as f64 * t + (r.boost * x * x * (3.0 - 2.0 * x)) as f64;
+            self.ring_list.push([(r.row as f32 + 0.5) / rows, phase.rem_euclid(1.0) as f32, ri as f32, 0.0]);
+        }
+        self.queue.write_buffer(&self.ring_list_buf, 0, bytemuck::cast_slice(&self.ring_list));
     }
 
     /// Chooses the ring colour texture rows to redraw for world time `w.t`

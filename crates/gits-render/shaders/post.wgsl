@@ -91,14 +91,21 @@ fn upscale(uv: vec2<f32>) -> vec3<f32> {
     var c = tap(vec2<f32>(q12.x, q0.y)) * ka + tap(vec2<f32>(q0.x, q12.y)) * kb + tap(q12) * kc
         + tap(vec2<f32>(q3.x, q12.y)) * kd + tap(vec2<f32>(q12.x, q3.y)) * ke;
     c /= ka + kb + kc + kd + ke;
-    c += (c - tap(uv)) * G.rct.w;
-    let i = vec2<i32>(floor(sp - 0.5));
-    let mx = vec2<i32>(size) - 1;
-    let a = textureLoad(t0, clamp(i, vec2<i32>(0), mx), 0).rgb;
-    let b = textureLoad(t0, clamp(i + vec2<i32>(1, 0), vec2<i32>(0), mx), 0).rgb;
-    let d = textureLoad(t0, clamp(i + vec2<i32>(0, 1), vec2<i32>(0), mx), 0).rgb;
-    let e = textureLoad(t0, clamp(i + vec2<i32>(1, 1), vec2<i32>(0), mx), 0).rgb;
-    return clamp(c, min(min(a, b), min(d, e)), max(max(a, b), max(d, e)));
+    // The 2x2 nearest texels, one gather per channel: x = (u0, v1), y = (u1, v1),
+    // z = (u1, v0), w = (u0, v0). They give the bilinear value and the clamp.
+    let gc = (p1 + 0.5) / size;
+    let r = textureGather(0, t0, samp, gc);
+    let g = textureGather(1, t0, samp, gc);
+    let b = textureGather(2, t0, samp, gc);
+    let bilinear = vec3<f32>(
+        mix(mix(r.w, r.z, f.x), mix(r.x, r.y, f.x), f.y),
+        mix(mix(g.w, g.z, f.x), mix(g.x, g.y, f.x), f.y),
+        mix(mix(b.w, b.z, f.x), mix(b.x, b.y, f.x), f.y),
+    );
+    c += (c - bilinear) * G.rct.w;
+    let lo = vec3<f32>(min(min(r.x, r.y), min(r.z, r.w)), min(min(g.x, g.y), min(g.z, g.w)), min(min(b.x, b.y), min(b.z, b.w)));
+    let hi = vec3<f32>(max(max(r.x, r.y), max(r.z, r.w)), max(max(g.x, g.y), max(g.z, g.w)), max(max(b.x, b.y), max(b.z, b.w)));
+    return clamp(c, lo, hi);
 }
 
 fn finish(base: vec3<f32>, in: FullOut) -> vec4<f32> {
