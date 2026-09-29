@@ -128,6 +128,17 @@ cargo run --release -p gits-render -- stats --minutes 15
 cargo run --release -p gits-render -- default-config > my-config.toml
 ```
 
+### Keeping the monitor layout after login
+
+GNOME sometimes restores the wrong monitor layout after login (the monitors
+come up on different connectors, or late). `tools/display-layout.py` fixes it:
+
+```sh
+python3 tools/display-layout.py save      # remember the current layout
+python3 tools/display-layout.py install   # restore it at every login (re-checked for 3 minutes)
+python3 tools/display-layout.py show      # compare saved and current
+```
+
 ### Stress test: watch a flurry of changes
 
 ```sh

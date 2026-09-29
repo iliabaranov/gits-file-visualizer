@@ -43,7 +43,8 @@ fn vs_tower(@location(0) p: vec3<f32>, @builtin(instance_index) ii: u32) -> Towe
     let band = bands[ii];
     let layer = u32(band.z);
     let s = mix(band.x, band.y, p.y);
-    let r = mix(G.tower.z, G.tower.y, f32(layer) / max(G.tower2.x - 1.0, 1.0));
+    // Mirrors World::shell_radius.
+    let r = mix(G.tower.z, G.tower.y, pow(f32(layer) / max(G.tower2.x - 1.0, 1.0), G.post3.z));
     let world = vec3<f32>(p.x * r, G.tower.w - s, p.z * r);
     var o: TowerOut;
     o.clip = G.view_proj * vec4<f32>(world, 1.0);
@@ -119,13 +120,6 @@ fn dense(lo: f32, hi: f32, p0: u32, p1: u32, turn0: f32, max_taps: f32) -> vec3<
     return acc * (G.tower2.z * f32(stride) / max(dr, 1e-3));
 }
 
-// Colour of the ring at list position `p` (absolute index into layer_index)
-// at world angle `turn0`, and in w its ring index.
-fn ring_at(p: u32, list_at: u32, turn0: f32) -> vec4<f32> {
-    let e = ring_list[p - list_at];
-    return vec4<f32>(textureSampleLevel(ring_tex, ring_samp, vec2<f32>(fract(turn0 - e.y), e.x), 0.0).rgb, e.z);
-}
-
 // Average colour of `2^level` rings starting at list block `row`, at shell angle `us`.
 fn pyr_at(level: u32, row: u32, us: f32) -> vec3<f32> {
     let bins = G.rct.y;
@@ -137,56 +131,34 @@ fn pyr_at(level: u32, row: u32, us: f32) -> vec3<f32> {
     return textureSampleLevel(pyr_b, pyr_samp, vec2<f32>(x, y / G.pyr.w), 0.0).rgb;
 }
 
-// Most blocks read per pixel and shell by dense_cached (enough for footprints
-// of ~2000 rings; beyond, the rest is extrapolated).
-const PYR_MAX_STEPS: u32 = 24u;
+// Blocks read per pixel and shell by dense_cached.
+const PYR_TAPS: u32 = 3u;
 
-// The same box filter as `dense`, exact and cheaper when the whole tower
-// turns as one: the two partly covered rings at the ends come from the ring
-// colour texture, the fully covered ones in between from the shell image
-// pyramid, as aligned blocks of 1, 2, 4 … 256 rings.
-fn dense_cached(layer: u32, lo: f32, hi: f32, turn0: f32) -> vec3<f32> {
+// The same box filter as `dense`, cheaper when the whole tower turns as one:
+// the shell's rings under the pixel (list positions p0..p1) are read from one
+// level of the shell image pyramid, in at most PYR_TAPS + 1 blocks of 2^L
+// rings, each weighted by how many of its rings are under the pixel. The two
+// end rings' partial coverage is applied to the total.
+fn dense_cached(layer: u32, lo: f32, hi: f32, p0: u32, p1: u32, turn0: f32) -> vec3<f32> {
     let n = u32(G.lut.y);
     let list_at = u32(G.tower2.x) * (n + 1u);
-    let end = layer_index[layer * (n + 1u) + n];
-    let fl = floor(lo);
-    let fh = floor(hi);
-    var acc = vec3<f32>(0.0);
-    let pa = layer_pos(layer, fl);
-    if (pa < end) {
-        let c = ring_at(pa, list_at, turn0);
-        if (c.w == fl) {
-            acc += c.rgb * (min(hi, fl + 1.0) - lo);
-        }
-    }
-    if (fh > fl) {
-        let pb = layer_pos(layer, fh);
-        if (pb < end) {
-            let c = ring_at(pb, list_at, turn0);
-            if (c.w == fh) {
-                acc += c.rgb * (hi - fh);
-            }
-        }
-    }
-    let q0 = layer_pos(layer, fl + 1.0) - list_at;
-    let q1 = layer_pos(layer, fh) - list_at;
+    let a = p0 - list_at;
+    let b = p1 - list_at;
+    let count = b - a;
+    let level = clamp(firstLeadingBit(max((count - 1u) / PYR_TAPS, 1u)) + 1u, 1u, PYRAMID_LEVELS);
     let us = fract(turn0 - G.pyr.x);
-    var a = q0;
-    for (var k = 0u; k < PYR_MAX_STEPS && a < q1; k++) {
-        var level = select(firstTrailingBit(a), PYRAMID_LEVELS, a == 0u);
-        level = min(min(level, PYRAMID_LEVELS), firstLeadingBit(q1 - a));
-        if (level == 0u) {
-            acc += ring_at(a + list_at, list_at, turn0).rgb;
-        } else {
-            acc += pyr_at(level, a >> level, us) * f32(1u << level);
-        }
-        a += 1u << level;
+    var acc = vec3<f32>(0.0);
+    for (var j = a >> level; j <= (b - 1u) >> level; j++) {
+        let overlap = min(b, (j + 1u) << level) - max(a, j << level);
+        acc += pyr_at(level, j, us) * f32(overlap);
     }
-    if (a < q1) {
-        acc *= f32(q1 - q0 + 2u) / f32(a - q0 + 2u);
-    }
+    // Coverage: every ring counts fully except the two at the ends.
+    let first = ring_list[a].z;
+    let last = ring_list[b - 1u].z;
+    let covered = f32(count) - (1.0 - clamp(min(hi, first + 1.0) - max(lo, first), 0.0, 1.0))
+        - select(1.0 - clamp(min(hi, last + 1.0) - max(lo, last), 0.0, 1.0), 0.0, count == 1u);
     // Packed rings cover `fill` of their pitch.
-    return acc * (G.tower2.z / max(hi - lo, 1e-3));
+    return acc * (max(covered, 0.0) / f32(count)) * (G.tower2.z / max(hi - lo, 1e-3));
 }
 
 @fragment
@@ -227,8 +199,10 @@ fn fs_tower(in: TowerOut, @builtin(front_facing) front: bool) -> @location(0) ve
         acc += exact(in, r, turn0, pitch, ds_px, dturn_px, t) * (1.0 - w);
     }
     if (w > 0.0) {
-        if (G.pyr.y > 0.0) {
-            acc += dense_cached(in.layer, r - 0.5 * dr_px, r + 0.5 * dr_px, turn0) * w;
+        // Few rings of this shell under the pixel: visiting each is cheapest
+        // (and exact). Many: the shell image pyramid.
+        if (G.pyr.y > 0.0 && p1 - p0 > u32(G.times2.w)) {
+            acc += dense_cached(in.layer, r - 0.5 * dr_px, r + 0.5 * dr_px, p0, p1, turn0) * w;
         } else {
             let taps = select(max(G.times2.w * 0.5, 1.0), G.times2.w, front || G.tower2.w > 0.99);
             acc += dense(r - 0.5 * dr_px, r + 0.5 * dr_px, p0, p1, turn0, taps) * w;

@@ -26,6 +26,7 @@ struct Globals {
     rct: vec4<f32>,         // ring colour texture rows, bins, atlas texels per bin, upscale sharpness
     tower3: vec4<f32>,      // shell_dim, scan interval s (0 = off), scan duration s, scan brightness
     pyr: vec4<f32>,         // shell rotation (turns, fract), padded ring list length (0 = no pyramid), texture A height, B height
+    post3: vec4<f32>,       // dither (0/1), output levels per channel (255 = 8 bit), shell radius curve, _
 };
 
 @group(0) @binding(0) var<uniform> G: Globals;

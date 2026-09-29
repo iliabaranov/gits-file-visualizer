@@ -152,7 +152,11 @@ pub async fn init(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>
     let mut limits = wgpu::Limits::default();
     limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d.min(16384);
     // Smaller HDR render targets where supported (half the memory and bandwidth).
-    let required_features = adapter.features() & wgpu::Features::RG11B10UFLOAT_RENDERABLE;
+    let mut required_features = adapter.features() & wgpu::Features::RG11B10UFLOAT_RENDERABLE;
+    // `bench` with GITS_GPUPROF: per-pass GPU times and tower draw statistics.
+    if std::env::var_os("GITS_GPUPROF").is_some() {
+        required_features |= adapter.features() & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::PIPELINE_STATISTICS_QUERY);
+    }
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("gits"),

@@ -1289,12 +1289,17 @@ impl World {
         r.phase0 + r.speed * t + r.boost * x * x * (3.0 - 2.0 * x)
     }
 
+    /// Radius of depth shell `layer`; mirrors vs_tower in tower.wgsl.
+    pub fn shell_radius(&self, layer: u32) -> f32 {
+        let tw = &self.cfg.tower;
+        let x = layer.min(tw.depth_layers.max(1) - 1) as f32 / (tw.depth_layers.max(1) - 1).max(1) as f32;
+        tw.inner_radius + (tw.radius - tw.inner_radius) * x.powf(tw.shell_curve.clamp(0.2, 5.0))
+    }
+
     pub fn ring_radius(&self, ring: usize) -> f32 {
         let tw = &self.cfg.tower;
-        // Mirrors vs_tower in tower.wgsl.
-        let layers = tw.depth_layers.max(1);
-        let layer = (self.rings[ring].depth as u32).min(layers - 1);
-        tw.inner_radius + (tw.radius - tw.inner_radius) * layer as f32 / (layers - 1).max(1) as f32
+        let layer = (self.rings[ring].depth as u32).min(tw.depth_layers.max(1) - 1);
+        self.shell_radius(layer)
     }
 
     pub fn y_top(&self) -> f32 {

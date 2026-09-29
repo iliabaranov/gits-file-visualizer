@@ -47,6 +47,7 @@ pub fn run(cfg: Config, opts: Options, collector: Option<std::path::PathBuf>) ->
     let (_instance, g) = gpu::init_headless(!crate::want_discrete(&cfg))?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format, crate::renderer::Quality::for_gpu(g.is_integrated()))?;
+    renderer.min_scene_megapixels = if g.is_integrated() { 0.0 } else { cfg.performance.min_scene_megapixels };
     let mut view = renderer.new_view();
     let (sc, mp) = cfg.performance.resolution(g.is_integrated());
     renderer.resize(&mut view, opts.width, opts.height, sc, mp);
@@ -124,6 +125,7 @@ pub fn bench(
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let (scale, max_mp) = cfg.performance.resolution(g.is_integrated());
     let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format, crate::renderer::Quality::for_gpu(g.is_integrated()))?;
+    renderer.min_scene_megapixels = if g.is_integrated() { 0.0 } else { cfg.performance.min_scene_megapixels };
     let mut view = renderer.new_view();
     renderer.resize(&mut view, width, height, scale, max_mp);
     let mut world = World::new(cfg, renderer.max_rings(), collector);
@@ -158,7 +160,12 @@ pub fn bench(
         if i >= 10 {
             cpu.push((t1 - t0).as_secs_f64() * 1e3);
             total.push((t2 - t0).as_secs_f64() * 1e3);
+        } else if let Some(p) = &mut renderer.prof {
+            p.reset();
         }
+    }
+    if let Some(p) = &renderer.prof {
+        p.print();
     }
     let stats = |v: &mut Vec<f64>| {
         v.sort_by(|a, b| a.total_cmp(b));
@@ -264,6 +271,7 @@ pub fn loadtest(cfg: Config, outputs: Vec<(u32, u32)>, seconds: f64, collector: 
     let (_instance, g) = gpu::init_headless(!crate::want_discrete(&cfg))?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format, crate::renderer::Quality::for_gpu(g.is_integrated()))?;
+    renderer.min_scene_megapixels = if g.is_integrated() { 0.0 } else { cfg.performance.min_scene_megapixels };
     let comps = Composition::auto(&outputs);
     let main = crate::app::main_output(&outputs, &comps);
     if cfg.system_monitor.show != "off" {

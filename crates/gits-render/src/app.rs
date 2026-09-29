@@ -355,6 +355,7 @@ impl App {
         if self.cfg.system_monitor.show != "off" {
             renderer.sysmon = Some(crate::sysmon::SysMon::start(g.adapter.get_info().vendor));
         }
+        renderer.min_scene_megapixels = if integrated { 0.0 } else { self.cfg.performance.min_scene_megapixels };
         let now = Instant::now();
         let mut outputs = Vec::new();
         let compositions = self.compositions();
@@ -458,6 +459,7 @@ impl App {
                 s.world.notice =
                     Some(Notice { text: format!("config reloaded: {}", path.display()), error: false, until: s.world.t + 3.0 });
                 let (scale, max_mp) = scene_scale(&self.cfg.performance, self.opts.wallpaper, s.integrated);
+                s.renderer.min_scene_megapixels = if s.integrated { 0.0 } else { self.cfg.performance.min_scene_megapixels };
                 set_system_monitor(&mut s.outputs, &self.cfg);
                 for o in &mut s.outputs {
                     o.set_coverage(o.coverage, self.cfg.performance.pause_when_covered);

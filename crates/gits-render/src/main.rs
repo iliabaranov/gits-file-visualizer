@@ -245,7 +245,7 @@ fn print_shells(w: &world::World) {
     println!();
     println!("shell  depth  radius  folders  rings  files   collapsed (files inside)  height  starts at");
     for (l, s) in shells.iter().enumerate() {
-        let radius = tw.inner_radius + (tw.radius - tw.inner_radius) * l as f32 / (layers - 1).max(1) as f32;
+        let radius = w.shell_radius(l as u32);
         let depth = if l + 1 == layers { format!("{l}+") } else { format!("{l}") };
         println!(
             "{l:>5}  {depth:>5}  {radius:>6.2}  {:>7}  {:>5}  {:>6}  {:>7} ({:>8})          {:>4.0}%  {:>5.0}%",

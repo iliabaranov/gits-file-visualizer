@@ -117,6 +117,7 @@ pub struct Tower {
     pub height: f32,
     pub radius: f32,
     pub inner_radius: f32,
+    pub shell_curve: f32,
     pub depth_layers: u32,
     pub max_tree_share: f32,
     pub shell_dim: f32,
@@ -194,6 +195,9 @@ pub struct Performance {
     /// 0 = no cap.
     pub max_internal_megapixels: f32,
     pub upscale_sharpness: f32,
+    pub min_scene_megapixels: f32,
+    pub shell_cache: bool,
+    pub dither: bool,
     pub integrated_render_scale: f32,
     pub integrated_max_megapixels: f32,
 }

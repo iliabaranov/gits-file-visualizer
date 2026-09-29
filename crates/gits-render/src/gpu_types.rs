@@ -83,6 +83,8 @@ pub struct Globals {
     /// Shell rotation (turns, fract), padded ring list length (0 = no shell
     /// image pyramid), pyramid texture A height, B height.
     pub pyr: [f32; 4],
+    /// dither (0/1), output levels per channel (255 = 8 bit), shell radius curve, _.
+    pub post3: [f32; 4],
 }
 
 #[repr(C)]

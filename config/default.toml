@@ -69,8 +69,11 @@ height          = 12.0      # world units
 # files sit at a radius set by its depth below the root. The root's own files
 # are nearest the axis, each level down is one shell further out.
 radius          = 3.75      # outermost shell
-inner_radius    = 1.3       # shell of the root folder's files
+inner_radius    = 0.3       # shell of the root folder's files (near the axis: fills the centre)
 depth_layers    = 8         # distinct shells (deeper folders share the outermost)
+shell_curve     = 2.0       # spacing of the shells from inner_radius to radius: 1 = even;
+                            # above 1 packs the (sparse) shallow shells near the axis and spreads
+                            # the (crowded) deep ones over more of the radius
 sectors         = true      # each folder gets its own slice of the circle inside its parent's
                             # (a sunburst, like Filelight): from above a ring chart, from the
                             # side a folder's files on one face. The tower then turns as one.
@@ -144,8 +147,15 @@ gpu          = "auto"       # auto | discrete | integrated. auto: the discrete G
 # 1.0 = native; 0.58 draws a third of the pixels; 0.5 a quarter. Measured on an
 # RTX 2060 (3 monitors incl. 4K, 60 fps): 1.0 ~63 W, 0.67 ~54 W, 0.58 ~36 W.
 render_scale = 0.58
+min_scene_megapixels = 2.1  # ...but never fewer pixels than this per monitor: screens of about
+                            # 1080p or smaller are drawn at full resolution (render_scale only
+                            # lowers large, dense ones like 4K). 0 = off
 max_internal_megapixels = 0 # per-monitor cap on the scene, 0 = none
 upscale_sharpness = 0.3     # 0 = plain bicubic, 1 = strong
+shell_cache  = true         # with [tower] sectors: cached per-shell images for the packed drum
+                            # (about 20% less GPU power; averages rings in blocks)
+dither       = true         # hides colour banding in dark gradients (a fixed, invisible pattern
+                            # of +-1 step before the 8-bit output; nothing moves)
 # Used instead on an integrated GPU, which also draws the desktop: the whole
 # wallpaper (text included) is drawn at this size and GNOME scales it up,
 # which saves the most memory bandwidth.

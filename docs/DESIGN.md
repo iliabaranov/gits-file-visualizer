@@ -633,6 +633,39 @@ caches, ESP-IDF build trees, uv's Pythons, pnpm's store. Changes:
 - From the GPU review: the dense path reads a precomputed per-shell ring list
   (phases in f64), and the upscale uses textureGather: about -27% GPU time.
 
+### Shell cache, full-resolution small screens, dithering, display layout (2026-09-28)
+
+- Shell image pyramid (`pyramid.wgsl`, `[performance] shell_cache`): with
+  sectors the whole tower turns as one, so each shell's packed drum is a
+  fixed image in the shell's frame. Level L of the pyramid averages 2^L
+  consecutive rings of a shell (lists padded to 256-ring blocks); rings start
+  at whole multiples of 1/256 turn, so level 1 is an exact copy of the ring
+  colour rows. Only rows whose rings changed (ring colour rows redrawn,
+  rings easing to a new sector) are rebuilt, about 0.05 ms per frame. The
+  dense path reads one level in at most 4 blocks per pixel instead of up to
+  16 rings, and still visits rings one by one where a pixel covers 16 or fewer.
+  An exact aligned-block decomposition was tried first and was slower (up to
+  24 dependent reads). Measured: tower pass -20..35% at 4K; loadtest power
+  34 -> 27 W at P0/P3; output PSNR 43-46 dB against the per-ring path, same mean.
+- `min_scene_megapixels = 2.1`: `render_scale` no longer lowers screens of
+  about 1080p (the portrait screen was drawn at 626x1113 and looked pixelated);
+  only the 4K screen is upscaled. Net power is about the same as before the
+  pyramid.
+- Dithering at the output (Gjøl, "Banding in Games"): triangular noise of
+  +-1 step per channel in the output's encoding (+-0.5 next to black and
+  white), fixed per pixel. The dark corner of a 4K frame went from 250 to 689
+  distinct colours; no visible grain.
+- Shells: `inner_radius` 0.3 and `shell_curve` 2 (radius ~ depth^2) fill the
+  centre of the dial view.
+- `tools/display-layout.py`: GNOME matches stored monitor layouts by connector
+  name, and the monitors come up on different connectors (Intel vs NVIDIA
+  outputs) or late or without EDID; it then fell back to a default layout
+  (portrait screen at 1024x768). The tool saves the layout by monitor
+  identity and, from a login autostart entry, applies it and re-checks every
+  3 s for 3 minutes (ApplyMonitorsConfig, persistent).
+- `GITS_GPUPROF=1 gits-render bench ...` prints GPU time per pass (from the
+  GPU review).
+
 ### Efficiency backlog
 
 - Tower fragment shader is ~65% of GPU time: cheaper samples in the dense drum,

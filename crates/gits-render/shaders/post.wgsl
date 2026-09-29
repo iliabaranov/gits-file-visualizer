@@ -108,6 +108,37 @@ fn upscale(uv: vec2<f32>) -> vec3<f32> {
     return clamp(c, lo, hi);
 }
 
+fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
+    return select(1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055, c * 12.92, c <= vec3<f32>(0.0031308));
+}
+
+fn srgb_decode(c: vec3<f32>) -> vec3<f32> {
+    return select(pow((c + 0.055) / 1.055, vec3<f32>(2.4)), c / 12.92, c <= vec3<f32>(0.04045));
+}
+
+// Three independent uniform values in [0, 1) per pixel (fixed per pixel:
+// the pattern does not move).
+fn hash32(p: vec2<f32>) -> vec3<f32> {
+    var p3 = fract(vec3<f32>(p.xyx) * vec3<f32>(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yxz + 33.33);
+    return fract((p3.xxy + p3.yzz) * p3.zyx);
+}
+
+// Dither for the output quantisation (Gjøl, "Banding in Games"): triangular
+// noise of +-1 step per channel, in the output's own encoding, shrinking to
+// +-0.5 step next to black and white so they stay exact.
+fn dither_encoded(e: vec3<f32>, px: vec2<f32>) -> vec3<f32> {
+    let levels = G.post3.y;
+    let r0 = hash32(px);
+    let r1 = hash32(px + vec2<f32>(19.19, 73.73));
+    let tri = r0 + r1 - 1.0;
+    let uni = r0 - 0.5;
+    let edge = (e * levels < vec3<f32>(0.5)) | (e * levels > vec3<f32>(levels - 0.5));
+    let n = select(tri, uni, edge);
+    let amp = clamp(min(e, 1.0 - e) * levels, vec3<f32>(0.5), vec3<f32>(1.0));
+    return e + n * amp / levels;
+}
+
 fn finish(base: vec3<f32>, in: FullOut) -> vec4<f32> {
     let bloom = textureSampleLevel(t1, samp, in.uv, 0.0).rgb * G.post2.w;
     var col = tonemap((base + bloom * G.post.y) * G.post.x);
@@ -117,6 +148,16 @@ fn finish(base: vec3<f32>, in: FullOut) -> vec4<f32> {
 
     let v = length((in.uv - 0.5) * vec2<f32>(1.1, 1.0));
     col *= mix(1.0, smoothstep(0.95, 0.2, v), G.post.w);
+    col = max(col, vec3<f32>(0.0));
+    if (G.post3.x > 0.5) {
+        if (G.post2.z > 0.5) {
+            // Encoded here (gamma 2.2): dither the encoded value directly.
+            return vec4<f32>(clamp(dither_encoded(pow(col, vec3<f32>(1.0 / 2.2)), in.pos.xy), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+        }
+        // sRGB target: the hardware encodes, so dither in sRGB and hand back linear.
+        let e = clamp(dither_encoded(srgb_encode(min(col, vec3<f32>(1.0))), in.pos.xy), vec3<f32>(0.0), vec3<f32>(1.0));
+        return vec4<f32>(srgb_decode(e), 1.0);
+    }
     return vec4<f32>(encode_out(col), 1.0);
 }
 

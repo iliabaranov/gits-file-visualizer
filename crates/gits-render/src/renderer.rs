@@ -132,6 +132,95 @@ fn pyramid_heights(r0: u32) -> [u32; 2] {
     h
 }
 
+/// Per-pass GPU times and tower draw statistics (GITS_GPUPROF=1; `bench` only,
+/// since it waits for the GPU after every frame).
+pub struct Prof {
+    timestamps: wgpu::QuerySet,
+    stats: Option<wgpu::QuerySet>,
+    resolve: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    period_ns: f32,
+    acc: std::collections::BTreeMap<String, f64>,
+    frames: u32,
+}
+
+const PROF_PASSES: u32 = 32;
+/// Byte offset of the pipeline statistics in the resolve buffer.
+const PROF_STATS_AT: u64 = PROF_PASSES as u64 * 16;
+
+impl Prof {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
+        if std::env::var_os("GITS_GPUPROF").is_none() || !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return None;
+        }
+        let stats = device.features().contains(wgpu::Features::PIPELINE_STATISTICS_QUERY).then(|| {
+            device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("tower statistics"),
+                ty: wgpu::QueryType::PipelineStatistics(
+                    wgpu::PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS
+                        | wgpu::PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT
+                        | wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS,
+                ),
+                count: 1,
+            })
+        });
+        let size = PROF_STATS_AT + 256;
+        let buffer =
+            |label, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false });
+        Some(Self {
+            timestamps: device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("pass timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: PROF_PASSES * 2,
+            }),
+            stats,
+            resolve: buffer("profile resolve", wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC),
+            readback: buffer("profile readback", wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST),
+            period_ns: queue.get_timestamp_period(),
+            acc: Default::default(),
+            frames: 0,
+        })
+    }
+
+    pub fn reset(&mut self) {
+        self.acc.clear();
+        self.frames = 0;
+    }
+
+    pub fn print(&self) {
+        for (k, v) in &self.acc {
+            println!("gpu {k:<22} {:8.3}", v / self.frames.max(1) as f64);
+        }
+    }
+
+    /// Waits for the frame just submitted and adds its numbers up.
+    fn collect(&mut self, device: &wgpu::Device, labels: &[String], pixels: f64) {
+        let slice = self.readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        {
+            let data = slice.get_mapped_range().expect("profile readback");
+            let q: &[u64] = bytemuck::cast_slice(&data);
+            let mut total = 0.0;
+            for (i, label) in labels.iter().enumerate() {
+                let ms = q[i * 2 + 1].wrapping_sub(q[i * 2]) as f64 * self.period_ns as f64 * 1e-6;
+                let key = if label.starts_with("bloom") { "bloom (all levels)" } else { label.as_str() };
+                *self.acc.entry(format!("{key} ms")).or_default() += ms;
+                total += ms;
+            }
+            *self.acc.entry("~total ms".into()).or_default() += total;
+            if self.stats.is_some() {
+                let s = &q[PROF_STATS_AT as usize / 8..];
+                *self.acc.entry("tower vertices (k)".into()).or_default() += s[0] as f64 * 1e-3;
+                *self.acc.entry("tower triangles (k)".into()).or_default() += s[1] as f64 * 1e-3;
+                *self.acc.entry("tower fragments/pixel".into()).or_default() += s[2] as f64 / pixels.max(1.0);
+            }
+        }
+        self.readback.unmap();
+        self.frames += 1;
+    }
+}
+
 /// GPU-dependent quality settings.
 #[derive(Clone, Copy, Debug)]
 pub struct Quality {
@@ -231,6 +320,11 @@ pub struct Renderer {
     pub atlas: GlyphAtlas,
     /// System readout drawn on views with `system_monitor` set.
     pub sysmon: Option<crate::sysmon::SysMon>,
+    /// Scenes are drawn with at least this many megapixels (up to the output's
+    /// own size), so `render_scale` only lowers the resolution of large,
+    /// dense screens (see `[performance] min_scene_megapixels`).
+    pub min_scene_megapixels: f32,
+    pub prof: Option<Prof>,
 }
 
 /// Per-output state: render targets, cached background, sprite buffers.
@@ -518,7 +612,12 @@ impl Renderer {
         let pyr_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("shell pyramid"),
             layout: Some(&pyr_layout),
-            vertex: wgpu::VertexState { module: &pyr_mod, entry_point: Some("vs_pyr"), compilation_options: Default::default(), buffers: &[] },
+            vertex: wgpu::VertexState {
+                module: &pyr_mod,
+                entry_point: Some("vs_pyr"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
@@ -755,6 +854,7 @@ impl Renderer {
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: ranges_buf.as_entire_binding() }],
         });
         let dummy = Target::new(&device, 1, 1, hdr, "dummy");
+        let prof = Prof::new(&device, &queue);
 
         Ok(Self {
             quality,
@@ -823,6 +923,8 @@ impl Renderer {
             scratch_hud: Vec::new(),
             atlas,
             sysmon: None,
+            min_scene_megapixels: 0.0,
+            prof,
         })
     }
 
@@ -867,6 +969,10 @@ impl Renderer {
     /// with the scene drawn at `render_scale` of that (capped at `max_megapixels`).
     pub fn resize(&self, view: &mut View, out_w: u32, out_h: u32, render_scale: f32, max_megapixels: f32) {
         let mut s = render_scale.clamp(0.2, 1.0);
+        if self.min_scene_megapixels > 0.0 {
+            let floor = (self.min_scene_megapixels as f64 * 1.0e6 / (out_w.max(1) as f64 * out_h.max(1) as f64)).sqrt();
+            s = s.max(floor.min(1.0) as f32);
+        }
         // 0 or less: no cap.
         let max_px = if max_megapixels > 0.0 { (max_megapixels.max(0.1) * 1.0e6) as f64 } else { f64::INFINITY };
         let px = out_w as f64 * out_h as f64 * (s * s) as f64;
@@ -1073,7 +1179,7 @@ impl Renderer {
         let n = w.rings.len();
         let list_at = w.cfg.tower.depth_layers.max(1) as usize * (n + 1);
         let r0 = w.layer_index.len().saturating_sub(list_at) as u32;
-        let speed = w.shell_speed().filter(|_| std::env::var_os("GITS_NO_PYRAMID").is_none());
+        let speed = w.shell_speed().filter(|_| w.cfg.performance.shell_cache);
         let Some(speed) = speed.filter(|_| n > 0 && r0 > 0) else {
             self.pyr.r0 = 0;
             self.pyr.ranges.clear();
@@ -1306,6 +1412,7 @@ impl Renderer {
                 (ATLAS_W / self.quality.ring_bins) as f32,
                 c.performance.upscale_sharpness.clamp(0.0, 1.0),
             ],
+            post3: [if c.performance.dither { 1.0 } else { 0.0 }, 255.0, tw.shell_curve.clamp(0.2, 5.0), 0.0],
             pyr: {
                 let heights = self.pyr.tex.as_ref().map_or([1, 1], |t| t.heights);
                 let phase = w.shell_speed().map_or(0.0, |s| (s as f64 * w.t).rem_euclid(1.0)) as f32;
@@ -1372,8 +1479,23 @@ impl Renderer {
         let tg = view.targets.as_ref().unwrap();
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
 
+        let prof_labels: std::cell::RefCell<Vec<String>> = Default::default();
+        let prof_queries = self.prof.as_ref().map(|p| &p.timestamps);
         let pass = |enc: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, clear: bool, label: &str| -> wgpu::RenderPass<'static> {
+            let timestamp_writes = prof_queries.and_then(|query_set| {
+                let mut labels = prof_labels.borrow_mut();
+                let i = labels.len() as u32;
+                (i < PROF_PASSES).then(|| {
+                    labels.push(label.to_string());
+                    wgpu::RenderPassTimestampWrites {
+                        query_set,
+                        beginning_of_pass_write_index: Some(i * 2),
+                        end_of_pass_write_index: Some(i * 2 + 1),
+                    }
+                })
+            });
             enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                timestamp_writes,
                 label: Some(label),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
@@ -1450,7 +1572,14 @@ impl Renderer {
                 p.set_bind_group(2, self.rct_bg.as_ref().expect("texture groups"), &[]);
                 p.set_vertex_buffer(0, self.tower_vb.slice(..));
                 p.set_index_buffer(self.tower_ib.slice(..), wgpu::IndexFormat::Uint32);
+                let stats = self.prof.as_ref().and_then(|p| p.stats.as_ref());
+                if let Some(qs) = stats {
+                    p.begin_pipeline_statistics_query(qs, 0);
+                }
                 p.draw_indexed(0..self.tower_index_count, 0, 0..self.n_bands);
+                if stats.is_some() {
+                    p.end_pipeline_statistics_query();
+                }
             }
             if view.fx_count > 0 && !skip.contains("sprites") {
                 p.set_pipeline(&self.sprite_pipeline);
@@ -1495,8 +1624,20 @@ impl Renderer {
             p.draw(0..view.hud_count, 0..1);
         }
 
+        let prof_labels = prof_labels.into_inner();
+        if let Some(p) = &self.prof {
+            enc.resolve_query_set(&p.timestamps, 0..prof_labels.len() as u32 * 2, &p.resolve, 0);
+            if let Some(qs) = &p.stats {
+                enc.resolve_query_set(qs, 0..1, &p.resolve, PROF_STATS_AT);
+            }
+            enc.copy_buffer_to_buffer(&p.resolve, 0, &p.readback, 0, p.resolve.size());
+        }
         self.queue.submit([enc.finish()]);
         view.trail_idx = 1 - cur;
         view.frame += 1;
+        if let Some(p) = &mut self.prof {
+            let (iw, ih) = view.internal_size();
+            p.collect(&self.device, &prof_labels, iw as f64 * ih as f64);
+        }
     }
 }
