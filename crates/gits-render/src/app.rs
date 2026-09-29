@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
@@ -30,6 +30,8 @@ const MIN_STEP: Duration = Duration::from_millis(3);
 /// A redraw is requested this long before it is due; the compositor's frame
 /// callback then releases it on the next display refresh (vsync pacing).
 const PACING_SLACK: Duration = Duration::from_millis(3);
+/// X11 wallpaper windows are placed here (well left of every monitor).
+const X11_OFFSCREEN: i32 = -30000;
 /// Exit code asking the extension to restart the renderer (e.g. to switch GPU).
 pub const EXIT_RESTART: i32 = 75;
 /// While nothing can draw (hidden, covered, locked), the simulation still
@@ -38,23 +40,72 @@ pub const EXIT_RESTART: i32 = 75;
 const HIDDEN_STEP: Duration = Duration::from_secs(1);
 /// How often wallpaper mode looks for a collector that was not running at start.
 const COLLECTOR_PROBE: Duration = Duration::from_secs(10);
-/// How often the power source is checked (battery caps the frame rate).
-const POWER_CHECK: Duration = Duration::from_secs(30);
+/// How often the power source is checked (battery caps or pauses drawing).
+const POWER_CHECK: Duration = Duration::from_secs(2);
+/// A paused output keeps drawing until the tower has been settled this long, so
+/// rings that grow in are complete when it freezes.
+const SETTLE_DRAW: Duration = Duration::from_secs(4);
+/// ...but never for longer than this after its surface was set up (no collector).
+const SETTLE_GIVE_UP: Duration = Duration::from_secs(30);
 
-/// True when running on battery: a battery exists and no mains/USB supply is online.
-pub fn on_battery() -> bool {
-    let Ok(rd) = std::fs::read_dir("/sys/class/power_supply") else { return false };
+/// Whether the power state stops all drawing (`[performance] pause_on_battery`).
+fn battery_halts(on_battery: bool, pause_on_battery: bool) -> bool {
+    on_battery && pause_on_battery
+}
+
+/// One entry of /sys/class/power_supply.
+struct Supply {
+    name: String,
+    kind: String,
+    scope: String,
+    online: bool,
+    status: String,
+}
+
+/// On battery: a battery of the machine exists and nothing is supplying it.
+/// Ignored: supplies named `*source*` (a USB-C port powering a device, not the
+/// laptop), and batteries with scope "Device" (a mouse, a headset).
+fn classify_on_battery(supplies: &[Supply]) -> bool {
     let mut battery = false;
-    for e in rd.flatten() {
-        let p = e.path();
-        let kind = std::fs::read_to_string(p.join("type")).unwrap_or_default();
-        match kind.trim() {
-            "Battery" => battery = true,
-            "Mains" | "USB" if std::fs::read_to_string(p.join("online")).is_ok_and(|v| v.trim() == "1") => return false,
+    for p in supplies {
+        if p.name.contains("source") || p.scope == "Device" {
+            continue;
+        }
+        match p.kind.as_str() {
+            "Battery" => {
+                battery = true;
+                if matches!(p.status.as_str(), "Charging" | "Full") {
+                    return false;
+                }
+            }
+            "Mains" | "USB" if p.online => return false,
             _ => {}
         }
     }
     battery
+}
+
+pub fn on_battery() -> bool {
+    // Testing aid: GITS_FORCE_BATTERY=1 (or 0) overrides the power supply.
+    if let Ok(v) = std::env::var("GITS_FORCE_BATTERY") {
+        return v == "1";
+    }
+    let Ok(rd) = std::fs::read_dir("/sys/class/power_supply") else { return false };
+    let read = |p: &std::path::Path, f: &str| std::fs::read_to_string(p.join(f)).unwrap_or_default().trim().to_string();
+    let supplies: Vec<Supply> = rd
+        .flatten()
+        .map(|e| {
+            let p = e.path();
+            Supply {
+                name: e.file_name().to_string_lossy().into_owned(),
+                kind: read(&p, "type"),
+                scope: read(&p, "scope"),
+                online: read(&p, "online") == "1",
+                status: read(&p, "status"),
+            }
+        })
+        .collect();
+    classify_on_battery(&supplies)
 }
 
 pub const APP_ID: &str = "io.github.iliabaranov.GitsFileVisualizer";
@@ -106,7 +157,7 @@ pub struct Options {
 /// with text at full resolution. On an integrated GPU the window itself is
 /// small and GNOME scales it up, which saves the most memory bandwidth.
 pub fn wallpaper_size(width: u32, height: u32, perf: &Performance, integrated: bool) -> (u32, u32) {
-    if !integrated {
+    if !integrated || perf.integrated_native_window {
         return (width, height);
     }
     let (scale, max_megapixels) = perf.resolution(true);
@@ -119,7 +170,7 @@ pub fn wallpaper_size(width: u32, height: u32, perf: &Performance, integrated: b
 pub fn monitor_scale(cfg: &Config, connector: &str, wallpaper: bool, integrated: bool) -> (f32, f32) {
     let (scale, mp) = scene_scale(&cfg.performance, wallpaper, integrated);
     match cfg.monitor(connector).render_scale {
-        Some(s) if !(wallpaper && integrated) => (s.clamp(0.2, 1.0), mp),
+        Some(s) if !small_window(&cfg.performance, wallpaper, integrated) => (s.clamp(0.2, 1.0), mp),
         _ => (scale, mp),
     }
 }
@@ -127,7 +178,12 @@ pub fn monitor_scale(cfg: &Config, connector: &str, wallpaper: bool, integrated:
 /// Scene resolution (scale, megapixel cap) relative to a view's window.
 pub fn scene_scale(perf: &Performance, wallpaper: bool, integrated: bool) -> (f32, f32) {
     // Integrated wallpaper windows are already small (see wallpaper_size).
-    if wallpaper && integrated { (1.0, f32::INFINITY) } else { perf.resolution(integrated) }
+    if small_window(perf, wallpaper, integrated) { (1.0, f32::INFINITY) } else { perf.resolution(integrated) }
+}
+
+/// True when the wallpaper window itself is drawn small and scaled up by the compositor.
+fn small_window(perf: &Performance, wallpaper: bool, integrated: bool) -> bool {
+    wallpaper && integrated && !perf.integrated_native_window
 }
 
 /// The monitor that gets the system readout with `show = "main"`: the largest
@@ -209,11 +265,18 @@ struct Output {
     /// to pause it (`[performance] pause_when_covered`).
     coverage: f32,
     covered: bool,
+    /// A frame has been presented on the current surface. A halted output
+    /// (locked, or unplugged with `pause_on_battery`) still draws one first, so
+    /// its window is never left empty (a black wallpaper) after a restart or resize.
+    drawn: bool,
+    /// When the tower first reflected the data on this surface, and when the surface was set up.
+    settled_at: Option<Instant>,
+    surface_since: Instant,
 }
 
 impl Output {
-    fn paused(&self, locked: bool) -> bool {
-        locked || !self.visible || self.covered
+    fn paused(&self, halted: bool) -> bool {
+        (halted && self.drawn) || !self.visible || self.covered
     }
 
     fn set_coverage(&mut self, coverage: f32, threshold: f32) {
@@ -282,6 +345,17 @@ pub fn run(cfg: Config, opts: Options) -> Result<i32> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn is_x11(el: &ActiveEventLoop) -> bool {
+    use winit::platform::x11::ActiveEventLoopExtX11;
+    el.is_x11()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_x11(_: &ActiveEventLoop) -> bool {
+    false
+}
+
 impl App {
     /// Composition per output: `[monitors."<connector>"]`, then `[monitors."*"]`;
     /// "auto" picks by shape (see `Composition::auto`).
@@ -300,6 +374,11 @@ impl App {
         monitor_scale(&self.cfg, connector, self.opts.wallpaper, integrated)
     }
 
+    /// Nothing is drawn: screen locked, or unplugged with `pause_on_battery`.
+    fn halted(&self) -> bool {
+        self.locked || battery_halts(self.battery, self.cfg.performance.pause_on_battery)
+    }
+
     fn target_fps(&self) -> u32 {
         let p = &self.cfg.performance;
         (if self.battery { p.fps.min(p.fps_battery) } else { p.fps }).max(1)
@@ -312,11 +391,12 @@ impl App {
             let mut attrs = Window::default_attributes();
             if self.opts.wallpaper {
                 let (w, h) = self.wallpaper_size(spec, !want_discrete);
-                attrs = attrs
-                    .with_title(format!("{WALLPAPER_TITLE}{}", spec.index))
-                    .with_decorations(false)
-                    .with_resizable(false)
-                    .with_inner_size(LogicalSize::new(w, h));
+                attrs = attrs.with_title(format!("{WALLPAPER_TITLE}{}", spec.index)).with_decorations(false).with_resizable(false);
+                attrs = if is_x11(el) {
+                    attrs.with_inner_size(PhysicalSize::new(w, h))
+                } else {
+                    attrs.with_inner_size(LogicalSize::new(w, h))
+                };
             } else {
                 attrs = attrs.with_title("gits-file-visualizer").with_inner_size(PhysicalSize::new(spec.width, spec.height));
             }
@@ -324,6 +404,16 @@ impl App {
             {
                 use winit::platform::wayland::WindowAttributesExtWayland;
                 attrs = attrs.with_name(APP_ID, "gits-file-visualizer");
+                // X11: the window manager cannot minimize or hide a window from
+                // the dock and alt-tab reliably, so the window is override-redirect
+                // (invisible to it). The GNOME extension hides its actor and shows
+                // it only through the background clones.
+                if self.opts.wallpaper && is_x11(el) {
+                    use winit::platform::x11::WindowAttributesExtX11;
+                    // Also placed far off-screen, so that even if the actor were
+                    // ever shown it could not cover the desktop or catch input.
+                    attrs = attrs.with_override_redirect(true).with_position(PhysicalPosition::new(X11_OFFSCREEN, 0));
+                }
             }
             let window = el.create_window(attrs)?;
             if self.opts.wallpaper {
@@ -411,9 +501,16 @@ impl App {
                 capture: false,
                 coverage: 0.0,
                 covered: false,
+                drawn: false,
+                settled_at: None,
+                surface_since: now,
             });
         }
 
+        log::info!(
+            "power at start: {}",
+            if self.battery { if self.cfg.performance.pause_on_battery { "battery (drawing pauses once the tower is up)" } else { "battery" } } else { "mains" }
+        );
         set_system_monitor(&mut outputs, &self.cfg);
         let mut world = World::new(self.cfg.clone(), renderer.max_rings(), self.opts.collector.clone());
         if self.opts.fell_back.is_some() && !self.opts.wallpaper {
@@ -529,7 +626,7 @@ impl App {
     }
 
     fn frame(&mut self, id: WindowId) {
-        let locked = self.locked;
+        let locked = self.halted();
         let Some(s) = &mut self.state else { return };
         let Some(i) = s.outputs.iter().position(|o| o.window.id() == id) else { return };
         if s.outputs[i].paused(locked) {
@@ -545,6 +642,7 @@ impl App {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 o.surface.configure(&s.gpu.device, &o.surface_cfg);
+                o.drawn = false;
                 return;
             }
             _ => return,
@@ -571,6 +669,9 @@ impl App {
             o.worst_gap = o.worst_gap.max(frame_dt);
         }
         o.frames += 1;
+        let settled = s.world.is_settled();
+        o.settled_at = if settled { o.settled_at.or(Some(Instant::now())) } else { None };
+        o.drawn = o.settled_at.is_some_and(|t| t.elapsed() >= SETTLE_DRAW) || o.surface_since.elapsed() >= SETTLE_GIVE_UP;
         let elapsed = o.stats_since.elapsed().as_secs_f64();
         if elapsed >= 5.0 {
             log::debug!(
@@ -670,6 +771,7 @@ impl ApplicationHandler<Control> for App {
                     o.surface_cfg.width = size.width;
                     o.surface_cfg.height = size.height;
                     o.surface.configure(&s.gpu.device, &o.surface_cfg);
+                    o.drawn = false;
                     let (scale, max_mp) = monitor_scale(&cfg, &o.spec.name, wallpaper, s.integrated);
                     s.renderer.resize(&mut o.view, size.width, size.height, scale, max_mp);
                     o.view.invalidate_background();
@@ -699,7 +801,8 @@ impl ApplicationHandler<Control> for App {
             self.next_power_check = Instant::now() + POWER_CHECK;
             let b = on_battery();
             if b != self.battery {
-                log::info!("power: {}", if b { "battery (frame rate capped)" } else { "mains" });
+                let on_battery_msg = if battery_halts(b, self.cfg.performance.pause_on_battery) { "battery (drawing paused)" } else { "battery (frame rate capped)" };
+                log::info!("power: {}", if b { on_battery_msg } else { "mains" });
                 self.battery = b;
                 // gpu = "auto": switch between discrete and integrated via a restart.
                 if let Some(s) = &self.state
@@ -715,7 +818,7 @@ impl ApplicationHandler<Control> for App {
             }
         }
         let interval = Duration::from_secs_f64(1.0 / self.target_fps() as f64);
-        let locked = self.locked;
+        let locked = self.halted();
         let Some(s) = &mut self.state else { return };
         let now = Instant::now();
         // Nothing drawn for a while (paused, or the compositor withholds frames).
@@ -756,6 +859,33 @@ impl ApplicationHandler<Control> for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn supply(name: &str, kind: &str, scope: &str, online: bool, status: &str) -> Supply {
+        Supply { name: name.into(), kind: kind.into(), scope: scope.into(), online, status: status.into() }
+    }
+
+    #[test]
+    fn power_detection_ignores_usb_sources_and_device_batteries() {
+        let bat = |status| supply("BAT1", "Battery", "System", false, status);
+        let mouse = supply("hidpp_battery_0", "Battery", "Device", true, "Discharging");
+        let ac = |on| supply("ACAD", "Mains", "System", on, "");
+        let port_source = supply("ucsi-source-psy-USBC000:004", "USB", "System", true, "Not charging");
+        // unplugged, with a device powered from a USB-C port and a mouse: still on battery
+        assert!(classify_on_battery(&[ac(false), bat("Discharging"), mouse, port_source]));
+        // plugged in
+        assert!(!classify_on_battery(&[ac(true), bat("Not charging")]));
+        assert!(!classify_on_battery(&[ac(false), bat("Charging")]));
+        // a desktop has no battery
+        assert!(!classify_on_battery(&[ac(false)]));
+    }
+
+    #[test]
+    fn battery_pause_needs_both_battery_and_the_setting() {
+        assert!(battery_halts(true, true));
+        assert!(!battery_halts(true, false));
+        assert!(!battery_halts(false, true));
+        assert!(!battery_halts(false, false));
+    }
 
     #[test]
     fn output_spec_parses() {

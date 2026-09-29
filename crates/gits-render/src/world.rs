@@ -884,6 +884,13 @@ impl World {
         matches!(self.source, Source::Synthetic { .. })
     }
 
+    /// True once the tower on screen reflects the data: it has arrived, a layout
+    /// is installed and nothing is being rebuilt. A paused output keeps drawing
+    /// until then, so the frame it freezes on is not an empty one.
+    pub fn is_settled(&self) -> bool {
+        self.has_data() && self.layout_version > 0 && !self.building() && !self.needs_relayout
+    }
+
     /// True once there is data to show (always for synthetic data).
     pub fn has_data(&self) -> bool {
         match &self.source {

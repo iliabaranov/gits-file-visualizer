@@ -408,6 +408,47 @@ Sections: `palette`, `events.{read,write,create,delete}`, `age`, `calm`,
   handled as delete + create, and there is no process attribution (needs the
   later fanotify helper).
 
+### M2 GNOME 45+ port — `extension/gnome-45` (2026-09-29)
+
+- Same design as `extension/gnome-42`, as an ES-module extension (GNOME 45–46,
+  tested on 46 in the sandbox). Differences found on Mutter 46:
+  - `hide_from_window_list()` makes `can_minimize()` false, so a hidden window
+    silently ignores `minimize()`. The extension hides the window at creation,
+    then at map time shows it in the list, minimizes it and hides it again.
+  - a minimized renderer window's actor stays visible and paints at its own
+    size over the wallpaper. The extension hides the actor itself (and
+    re-hides it if shown); the clones still paint a hidden source.
+  - X11 sessions: `Meta.WaylandClient` does not exist there, so the extension
+    launches the renderer as a plain subprocess and recognises its windows by
+    pid. The renderer creates override-redirect windows on X11 (invisible to
+    the window manager: no dock or alt-tab entry, no focus, cannot be
+    minimized), physical-pixel sized; the extension hides their actors and shows
+    them only through the background clones. Frames are paced by the renderer's
+    timer (X11 has no frame callbacks; `pre_present_notify` is a no-op).
+    Tested on a nested `gnome-shell --x11` running in a rootful Xwayland (needs
+    DRI3 for Vulkan; Xephyr/Xvfb have none) inside the headless sandbox.
+- `tools/sandbox-shell.sh` picks the extension and test helper by shell version.
+- X11 hardening (after the wallpaper was seen drawn over windows): the
+  extension hides any override-redirect window that looks like the renderer's
+  (title prefix + WM_CLASS), whether or not the pid matches, on creation, on map,
+  at enable and every 3 s, and it no longer skips hiding a window it cannot map
+  to a monitor. The renderer also places its X11 windows at x = -30000, so a
+  visible actor could never cover the desktop or catch input.
+- An output that is halted (locked, or unplugged with `pause_on_battery`) still
+  draws one frame after start, resize or a lost surface (`Output::drawn`), so a
+  renderer restarted on battery (e.g. by unplugging a dock, which also changes
+  the monitors) leaves the last frame up instead of an empty black window. The
+  extension's own restarts (`monitors changed`) no longer count as failures.
+  `GITS_FORCE_BATTERY=1|0` overrides the power supply for testing.
+  A paused output first keeps drawing until the tower reflects the data
+  (`World::is_settled`) plus 4 s for rings to grow in (30 s at most), otherwise a
+  restart on battery froze on a frame drawn before the collector's snapshot had
+  arrived: background only, no rings. Power detection ignores `*source*` USB-C
+  supplies (a port powering a device) and `scope = Device` batteries (a mouse),
+  and is polled every 2 s.
+- `[performance] integrated_native_window` and `pause_on_battery` (see README,
+  quality knobs); the power source is checked every 5 s.
+
 ### M2 — done for GNOME 42–44 (2026-09-27)
 
 - `extension/gnome-42` (legacy `imports`, GJS). The approach follows prior

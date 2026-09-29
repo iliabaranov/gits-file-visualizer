@@ -140,6 +140,7 @@ composition = "auto"        # wide | drum | dial | auto. auto: the largest lands
 # and all motion advances by real elapsed time, so movement is smooth and steady.
 fps          = 60
 fps_battery  = 30           # cap while running on battery
+pause_on_battery = false    # true: draw nothing while unplugged (the last frame stays); resumes on power
 pause_when_covered = 0.8    # a monitor stops drawing once windows cover this share of it
                             # (1.0 = only when completely covered)
 gpu          = "auto"       # auto | discrete | integrated. auto: the discrete GPU
@@ -172,6 +173,10 @@ ring_bins        = 1024     # colour steps around each ring (256 | 512 | 1024): 
 # which saves the most memory bandwidth.
 integrated_render_scale = 0.6
 integrated_max_megapixels = 1.2
+# false: the window itself is small and GNOME scales it up (least memory
+# bandwidth, but text is blurry). true: the window is native size, only the
+# tower is drawn at the two values above, and text stays sharp.
+integrated_native_window = false
 
 [privacy]
 text                   = "paths"   # labels show: paths | dirs (folder names only) | glyphs (hex codes) | none

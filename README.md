@@ -19,10 +19,12 @@ Design: [docs/DESIGN.md](docs/DESIGN.md).
   work session, used for look-dev and reproducible snapshots.
 - **M1 (real data) — done.** `gits-collector` scans your home folder, watches
   it for changes and streams them to the renderer.
-- **M2 (wallpaper) — done for GNOME 42–44** (Ubuntu 22.04). A GNOME Shell
+- **M2 (wallpaper) — done for GNOME 42–44 and 45–46** (Ubuntu 22.04 and
+  24.04; GNOME 46 tested in the headless sandbox). A GNOME Shell
   extension starts the renderer and shows it as the background on every
   monitor, including the overview and workspace switching, and pauses monitors
-  that are covered. GNOME 45+ (Ubuntu 24.04/26.04) follows in M5.
+  that are covered. GNOME 47+ (Ubuntu 26.04) is untested. Both Wayland and X11
+  sessions work (on GNOME 45+; the GNOME 42 extension is Wayland-tested).
 
 ## Build and run
 
@@ -31,7 +33,7 @@ compiler, and rustup installs it automatically. No system `-dev` packages are
 required. At runtime the binary loads the GPU driver (Vulkan) and
 Wayland/X11 libraries that every Ubuntu desktop already has.
 
-### As your wallpaper (Ubuntu 22.04 / GNOME 42)
+### As your wallpaper (Ubuntu 22.04 / GNOME 42, Ubuntu 24.04 / GNOME 46)
 
 ```sh
 tools/install-user.sh              # build; install to ~/.local; start the collector service
@@ -146,6 +148,15 @@ frame on an RTX 2060, default = 1.46 ms in total:
 | `shell_cache` | true | false | (costs +0.3 ms) | slightly sharper drum |
 | `dither` | true | false | ~0.07 ms | banding in dark gradients |
 
+On an integrated GPU (no discrete one, or on battery) the default draws the whole
+wallpaper, text included, in a small window that GNOME scales up, which is soft.
+For a sharp result set `integrated_native_window = true`: the window stays at the
+monitor's size, text stays crisp, and only the tower is drawn at
+`integrated_render_scale`. Frame rate is then the main lever on GPU load
+(Radeon 780M, 2560x1600, renderer process only: 15 fps 7-10%, 20 fps 10-13%,
+30 fps 13-16%, 60 fps 25%). `pause_on_battery = true` draws nothing while
+unplugged.
+
 ### On another machine without building
 
 ```sh
@@ -159,8 +170,8 @@ e.g. Ubuntu 22.04 or newer; no Rust needed):
 tar xzf gits-file-visualizer-linux-x86_64.tar.gz && gits-file-visualizer/install.sh
 ```
 
-On GNOME 42–44 the wallpaper starts after the next login. On GNOME 45+ the
-extension isn't ported yet: run `gits-render window` instead.
+On GNOME 42–46 the wallpaper starts after the next login (on X11, restart the
+shell once instead: Alt+F2, `r`).
 
 ### Keeping the monitor layout after login
 

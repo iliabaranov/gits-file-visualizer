@@ -199,6 +199,8 @@ pub struct Monitor {
 pub struct Performance {
     pub fps: u32,
     pub fps_battery: u32,
+    /// Stop drawing (and sampling the system monitor) while running on battery.
+    pub pause_on_battery: bool,
     pub pause_when_covered: f32,
     /// "auto", "discrete" or "integrated".
     pub gpu: String,
@@ -215,6 +217,10 @@ pub struct Performance {
     pub ring_bins: u32,
     pub integrated_render_scale: f32,
     pub integrated_max_megapixels: f32,
+    /// Integrated GPU: keep the wallpaper window at the monitor's size and draw
+    /// only the tower at the integrated scale (text stays sharp), instead of
+    /// drawing everything small and letting GNOME scale it up.
+    pub integrated_native_window: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
