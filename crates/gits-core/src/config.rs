@@ -21,7 +21,7 @@ pub struct Config {
     pub system_monitor: SystemMonitor,
     pub background: Background,
     pub camera: Camera,
-    pub monitors: BTreeMap<String, Monitor>,
+    pub monitors: BTreeMap<String, MonitorConfig>,
     pub performance: Performance,
     pub privacy: Privacy,
     pub data: Data,
@@ -177,10 +177,21 @@ pub struct Camera {
     pub wide_fill_portrait: f32,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+/// `[monitors."<connector>"]` or `[monitors."*"]` as written: a connector's
+/// section only needs the keys it changes.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct MonitorConfig {
+    pub composition: Option<String>,
+    pub render_scale: Option<f32>,
+}
+
+/// A monitor's settings: its own section merged over `[monitors."*"]`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Monitor {
     pub composition: String,
+    /// Overrides `[performance] render_scale` for this monitor.
+    pub render_scale: Option<f32>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -198,6 +209,10 @@ pub struct Performance {
     pub min_scene_megapixels: f32,
     pub shell_cache: bool,
     pub dither: bool,
+    pub dense_samples: u32,
+    pub cache_blocks: u32,
+    pub back_face_detail: f32,
+    pub ring_bins: u32,
     pub integrated_render_scale: f32,
     pub integrated_max_megapixels: f32,
 }
@@ -333,7 +348,12 @@ impl Config {
     }
 
     pub fn monitor(&self, connector: &str) -> Monitor {
-        self.monitors.get(connector).or_else(|| self.monitors.get("*")).cloned().unwrap_or(Monitor { composition: "wide".into() })
+        let (own, all) = (self.monitors.get(connector), self.monitors.get("*"));
+        let pick = |f: fn(&MonitorConfig) -> Option<String>| own.and_then(f).or_else(|| all.and_then(f));
+        Monitor {
+            composition: pick(|m| m.composition.clone()).unwrap_or_else(|| "auto".into()),
+            render_scale: own.and_then(|m| m.render_scale).or_else(|| all.and_then(|m| m.render_scale)),
+        }
     }
 
     /// Resolves a palette name or hex string to linear RGB.

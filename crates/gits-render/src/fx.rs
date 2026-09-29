@@ -82,7 +82,7 @@ impl Fx {
         if ring >= w.rings.len() {
             return;
         }
-        let phase = w.ring_phase(ring, w.t as f32);
+        let phase = w.ring_phase(ring, w.gnow());
         self.falls.push(Fall {
             y: w.y_top() - w.ring_s[ring],
             radius: w.ring_radius(ring),

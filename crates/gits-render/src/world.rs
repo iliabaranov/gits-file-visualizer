@@ -39,6 +39,10 @@ pub const BOOST_TAU: f32 = 12.0;
 /// Max tilt of an unwound ring, in ring pitches (mirrors TILT in tower.wgsl).
 pub const TILT: f32 = 0.3;
 const RELAYOUT_MIN_INTERVAL: f64 = 0.5;
+/// GPU times are rebased this often (at 4 h a 32-bit time still resolves 1 ms).
+const REBASE_S: f64 = 4.0 * 3600.0;
+/// GPU times at or below this are "never" (-1e9) and are not shifted.
+const NEVER_GPU: f32 = -1.0e8;
 /// Fixed step of the synthetic work session.
 const SESSION_DT: f64 = 1.0 / 24.0;
 /// Folder activity (decay, which folders are open) is updated this often.
@@ -120,6 +124,10 @@ pub struct World {
     /// Files before this index already have their arc length.
     arcs_assigned: usize,
     pub t: f64,
+    /// Times on the GPU (32-bit) are relative to this, which moves forward
+    /// every REBASE_S so they keep millisecond precision however long the
+    /// renderer runs (see `rebase`).
+    pub t_base: f64,
     pub layout: Layout,
     pub layout_version: u64,
     layout_t: f64,
@@ -223,6 +231,7 @@ impl World {
         let initial_model = model.clone();
         let initial_files = initial_model.files.len();
         let mut w = Self {
+            t_base: 0.0,
             session_accum: 0.0,
             session_t: 0.0,
             activity_dt: 0.0,
@@ -349,7 +358,7 @@ impl World {
 
     /// Applies the configured spin speed to existing rings without making them jump.
     fn sync_spin(&mut self) {
-        let t = self.t as f32;
+        let t = self.gnow();
         for i in 0..self.rings.len() {
             let new = self.ring_speed(&self.layout.rings[i]);
             let r = &mut self.rings[i];
@@ -378,6 +387,7 @@ impl World {
             hot,
             prev_layout_t: self.layout_t,
             t: self.t,
+            t_base: self.t_base,
         }
     }
 
@@ -488,7 +498,7 @@ impl World {
             if let Some(p) = persist.get(&r.key()) {
                 let mut g = p.gpu;
                 if self.cfg.tower.sectors {
-                    ease_to_sector(&mut g, quantize_turn(r.turn0), self.t as f32);
+                    ease_to_sector(&mut g, quantize_turn(r.turn0) + self.shell_offset(), self.gnow());
                 }
                 g.depth = depth;
                 g.first_seg = first_seg[i];
@@ -501,7 +511,11 @@ impl World {
                 self.rings.push(RingGpu {
                     depth,
                     speed: self.ring_speed(r),
-                    phase0: if self.cfg.tower.sectors { quantize_turn(r.turn0) } else { hash01(h ^ 0x1234) + dir_hash * 0.3 },
+                    phase0: if self.cfg.tower.sectors {
+                        quantize_turn(r.turn0) + self.shell_offset()
+                    } else {
+                        hash01(h ^ 0x1234) + dir_hash * 0.3
+                    },
                     boost: 0.0,
                     boost_t0: -1.0e9,
                     hash: hash01(h ^ 0x77),
@@ -545,7 +559,7 @@ impl World {
             if self.restored {
                 for (i, seg) in self.layout.segments.iter().enumerate() {
                     if matches!(seg.source, SegSource::File(f) if (f as usize) >= self.initial_files) {
-                        self.segs[i].t_retract = self.t as f32 - 10.0;
+                        self.segs[i].t_retract = self.gnow() - 10.0;
                     }
                 }
             }
@@ -587,7 +601,7 @@ impl World {
             Source::Collector(_) => self.poll_collector(t),
         }
         self.t = t;
-        let tf = t as f32;
+        let tf = (t - self.t_base) as f32;
 
         // While a layout is being built the model is shared and unchanged (collector
         // updates wait in their channel), so there is nothing to drain.
@@ -740,6 +754,9 @@ impl World {
                 }
             }
         }
+        if !self.building() && self.t - self.t_base > REBASE_S {
+            self.rebase();
+        }
         let min_interval = if self.is_synthetic() { RELAYOUT_MIN_INTERVAL } else { RELAYOUT_LIVE_INTERVAL };
         if self.needs_relayout && !self.hidden && !self.building() && t - self.layout_t >= min_interval {
             self.start_relayout();
@@ -822,8 +839,9 @@ impl World {
 
     /// Keeps ring `ring`'s colour-texture row updated every frame until `until`.
     fn mark_hot(&mut self, ring: u32, until: f32) {
+        let now = self.gnow();
         let Some(h) = self.hot_until.get_mut(ring as usize) else { return };
-        if *h < self.t as f32 {
+        if *h < now {
             self.hot.push(ring);
         }
         *h = h.max(until);
@@ -831,7 +849,7 @@ impl World {
 
     /// Rows with growth/retract animations still to play (after a relayout or restore).
     fn mark_animated_rows(&mut self) {
-        let t = self.t as f32;
+        let t = self.gnow();
         let grow = self.cfg.events.create.grow.0;
         for i in 0..self.segs.len() {
             let (s, ring) = (&self.segs[i], self.segs[i].ring);
@@ -844,7 +862,7 @@ impl World {
 
     /// Rows of the ring colour texture that must be redrawn this frame.
     pub fn take_hot_rows(&mut self) -> Vec<u32> {
-        let t = self.t as f32;
+        let t = self.gnow();
         let hot_until = &self.hot_until;
         self.hot.retain(|&r| hot_until.get(r as usize).is_some_and(|&u| u >= t));
         self.hot.clone()
@@ -988,7 +1006,7 @@ impl World {
     /// Highlights have faded out: shrink away files created during the loop,
     /// grow deleted files back, and ease changed ages back to their originals.
     fn loop_restore(&mut self) {
-        let t = self.t as f32;
+        let t = self.gnow();
         let mut rng = Rng::new(0x100B ^ self.loop_count);
         let epoch = self.initial_model.epoch_unix;
         for f in 0..self.initial_files {
@@ -1125,7 +1143,7 @@ impl World {
         }
         self.animating = changed;
         // Opening changes a ring's colours ("scanned" arcs, wider gaps).
-        let until = self.t as f32 + 0.5;
+        let until = self.gnow() + 0.5;
         for r in opened {
             self.mark_hot(r, until);
         }
@@ -1282,6 +1300,55 @@ impl World {
         self.layer_index_dirty = true;
     }
 
+    /// World time `t` as a GPU time (relative to `t_base`).
+    pub fn gt(&self, t: f64) -> f32 {
+        (t - self.t_base) as f32
+    }
+
+    /// The current time as a GPU time.
+    pub fn gnow(&self) -> f32 {
+        self.gt(self.t)
+    }
+
+    /// With sectors, the shell's rotation at `t_base`: added to every ring's
+    /// sector start, since ring phases count from `t_base`.
+    fn shell_offset(&self) -> f32 {
+        self.shell_speed().map_or(0.0, |s| (s as f64 * self.t_base).rem_euclid(1.0) as f32)
+    }
+
+    /// Moves `t_base` to now and shifts every stored GPU time by the same
+    /// amount (and ring phases by their rotation over it), so nothing on
+    /// screen changes. Runs every REBASE_S, never during a layout build
+    /// (whose results are made against the old base).
+    fn rebase(&mut self) {
+        let delta = self.t - self.t_base;
+        let d = delta as f32;
+        let shift = |x: &mut f32| {
+            if *x > NEVER_GPU {
+                *x -= d;
+            }
+        };
+        for g in &mut self.segs {
+            for x in [&mut g.t_create, &mut g.t_read, &mut g.t_write, &mut g.t_delete, &mut g.t_retract, &mut g.t_age] {
+                shift(x);
+            }
+        }
+        for r in &mut self.rings {
+            shift(&mut r.boost_t0);
+            r.phase0 = (r.phase0 as f64 + r.speed as f64 * delta).rem_euclid(1.0) as f32;
+        }
+        for h in &mut self.hot_until {
+            if *h > f32::MIN {
+                *h -= d;
+            }
+        }
+        self.t_base = self.t;
+        self.dirty_segs.extend(0..self.segs.len() as u32);
+        self.dirty_rings.extend(0..self.rings.len() as u32);
+        self.rct_full = true;
+        log::debug!("GPU time base moved forward by {delta:.0} s");
+    }
+
     /// Ring rotation (turns) at time `t`; mirrors `ring_phase` in tower.wgsl.
     pub fn ring_phase(&self, ring: usize, t: f32) -> f32 {
         let r = &self.rings[ring];
@@ -1315,7 +1382,7 @@ impl World {
         }
         let r = self.ring_radius(ring);
         let turn = s.a0 + (s.a1 - s.a0) * u;
-        let theta = std::f32::consts::TAU * (turn + self.ring_phase(ring, self.t as f32) - 0.5);
+        let theta = std::f32::consts::TAU * (turn + self.ring_phase(ring, self.gnow()) - 0.5);
         let turn0 = theta / std::f32::consts::TAU + 0.5;
         let tilt = TILT * self.ring_open[ring] * (turn0 * std::f32::consts::TAU - self.rings[ring].hash * std::f32::consts::TAU).sin();
         let y = self.y_top() - self.ring_s[ring] - tilt * self.ring_pitch[ring];
@@ -1392,6 +1459,8 @@ struct LayoutJob {
     now_unix: f64,
     prev_layout_t: f64,
     t: f64,
+    /// GPU times are made relative to this (`World::t_base`).
+    t_base: f64,
 }
 
 struct LayoutResult {
@@ -1407,8 +1476,9 @@ struct LayoutResult {
     t_atlas: f64,
 }
 
-fn tf(t: f64) -> f32 {
-    if t <= NEVER * 0.5 { -1.0e9 } else { t as f32 }
+/// World time `t` as a GPU time relative to `base` (-1e9 = never).
+fn tf(t: f64, base: f64) -> f32 {
+    if t <= NEVER * 0.5 { -1.0e9 } else { (t - base) as f32 }
 }
 
 /// Builds the layout, the GPU segment records and the segment atlas. Pure: runs
@@ -1439,15 +1509,15 @@ fn run_layout_job(job: LayoutJob) -> LayoutResult {
                 let file = &m.files[f as usize];
                 g.age_days = ((job.now_unix - file.mtime as f64) / 86400.0).max(0.0) as f32;
                 g.size_f = ((file.size as f64 + 1.0).log2() / 34.0).clamp(0.0, 1.0) as f32;
-                g.t_read = tf(file.t_read);
-                g.t_write = tf(file.t_write);
+                g.t_read = tf(file.t_read, job.t_base);
+                g.t_write = tf(file.t_write, job.t_base);
                 if file.t_create != NEVER {
                     // Files created since the previous layout grow in now.
-                    g.t_create = if file.t_create > job.prev_layout_t { job.t as f32 } else { file.t_create as f32 };
+                    g.t_create = tf(if file.t_create > job.prev_layout_t { job.t } else { file.t_create }, job.t_base);
                 }
                 if file.t_delete != NEVER {
                     g.flags |= SEG_DELETED;
-                    g.t_delete = file.t_delete as f32;
+                    g.t_delete = tf(file.t_delete, job.t_base);
                 }
                 g.hash = hash01(f as u64);
             }
@@ -1515,6 +1585,35 @@ pub fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moving_the_time_base_changes_nothing_on_screen() {
+        for sectors in [false, true] {
+            let mut cfg = Config::default();
+            cfg.synthetic.scale = 0.05;
+            cfg.tower.sectors = sectors;
+            let mut w = World::new(cfg, 4096, None);
+            for _ in 0..48 {
+                w.step(1.0 / 24.0);
+            }
+            // Three days in: 32-bit times would resolve only ~31 ms.
+            w.t += 3.0 * 86400.0;
+            w.rebase();
+            w.segs[0].t_read = w.gnow() - 2.5;
+            let (read, t) = (w.t_base + w.segs[0].t_read as f64, w.gnow());
+            let phases: Vec<f32> = (0..w.rings.len().min(50)).map(|i| w.ring_phase(i, t)).collect();
+            w.t += 5000.0;
+            let later: Vec<f32> = (0..phases.len()).map(|i| w.ring_phase(i, w.gnow())).collect();
+            w.rebase();
+            assert_eq!(w.t_base, w.t);
+            assert!((w.t_base + w.segs[0].t_read as f64 - read).abs() < 1e-3);
+            for (i, p) in later.iter().enumerate() {
+                let d = w.ring_phase(i, w.gnow()) - p;
+                assert!((d - d.round()).abs() < 1e-4, "ring {i} jumped by {d} turns (sectors {sectors})");
+            }
+            let _ = phases;
+        }
+    }
 
     #[test]
     fn layer_index_lists_each_layers_rings() {

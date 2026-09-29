@@ -131,21 +131,18 @@ fn pyr_at(level: u32, row: u32, us: f32) -> vec3<f32> {
     return textureSampleLevel(pyr_b, pyr_samp, vec2<f32>(x, y / G.pyr.w), 0.0).rgb;
 }
 
-// Blocks read per pixel and shell by dense_cached.
-const PYR_TAPS: u32 = 3u;
-
 // The same box filter as `dense`, cheaper when the whole tower turns as one:
 // the shell's rings under the pixel (list positions p0..p1) are read from one
-// level of the shell image pyramid, in at most PYR_TAPS + 1 blocks of 2^L
+// level of the shell image pyramid, in at most `blocks` + 1 blocks of 2^L
 // rings, each weighted by how many of its rings are under the pixel. The two
 // end rings' partial coverage is applied to the total.
-fn dense_cached(layer: u32, lo: f32, hi: f32, p0: u32, p1: u32, turn0: f32) -> vec3<f32> {
+fn dense_cached(layer: u32, lo: f32, hi: f32, p0: u32, p1: u32, turn0: f32, blocks: u32) -> vec3<f32> {
     let n = u32(G.lut.y);
     let list_at = u32(G.tower2.x) * (n + 1u);
     let a = p0 - list_at;
     let b = p1 - list_at;
     let count = b - a;
-    let level = clamp(firstLeadingBit(max((count - 1u) / PYR_TAPS, 1u)) + 1u, 1u, PYRAMID_LEVELS);
+    let level = clamp(firstLeadingBit(max((count - 1u) / blocks, 1u)) + 1u, 1u, PYRAMID_LEVELS);
     let us = fract(turn0 - G.pyr.x);
     var acc = vec3<f32>(0.0);
     for (var j = a >> level; j <= (b - 1u) >> level; j++) {
@@ -199,12 +196,16 @@ fn fs_tower(in: TowerOut, @builtin(front_facing) front: bool) -> @location(0) ve
         acc += exact(in, r, turn0, pitch, ds_px, dturn_px, t) * (1.0 - w);
     }
     if (w > 0.0) {
+        // The far side (dimmed, seen through the near side) gets fewer
+        // samples; not in the dial, which looks at the inside of the shells.
+        let detail = select(G.qual.x, 1.0, front || G.tower2.w > 0.99);
+        let taps = max(floor(G.times2.w * detail + 0.5), 1.0);
         // Few rings of this shell under the pixel: visiting each is cheapest
         // (and exact). Many: the shell image pyramid.
-        if (G.pyr.y > 0.0 && p1 - p0 > u32(G.times2.w)) {
-            acc += dense_cached(in.layer, r - 0.5 * dr_px, r + 0.5 * dr_px, p0, p1, turn0) * w;
+        if (G.pyr.y > 0.0 && p1 - p0 > u32(taps)) {
+            let blocks = u32(max(floor(G.post3.w * detail + 0.5), 1.0));
+            acc += dense_cached(in.layer, r - 0.5 * dr_px, r + 0.5 * dr_px, p0, p1, turn0, blocks) * w;
         } else {
-            let taps = select(max(G.times2.w * 0.5, 1.0), G.times2.w, front || G.tower2.w > 0.99);
             acc += dense(r - 0.5 * dr_px, r + 0.5 * dr_px, p0, p1, turn0, taps) * w;
         }
     }

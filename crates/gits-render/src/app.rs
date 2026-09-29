@@ -115,6 +115,15 @@ pub fn wallpaper_size(width: u32, height: u32, perf: &Performance, integrated: b
     (((width as f64 * s).round() as u32).max(16), ((height as f64 * s).round() as u32).max(16))
 }
 
+/// `scene_scale` with the monitor's own `render_scale`, if it has one.
+pub fn monitor_scale(cfg: &Config, connector: &str, wallpaper: bool, integrated: bool) -> (f32, f32) {
+    let (scale, mp) = scene_scale(&cfg.performance, wallpaper, integrated);
+    match cfg.monitor(connector).render_scale {
+        Some(s) if !(wallpaper && integrated) => (s.clamp(0.2, 1.0), mp),
+        _ => (scale, mp),
+    }
+}
+
 /// Scene resolution (scale, megapixel cap) relative to a view's window.
 pub fn scene_scale(perf: &Performance, wallpaper: bool, integrated: bool) -> (f32, f32) {
     // Integrated wallpaper windows are already small (see wallpaper_size).
@@ -287,8 +296,8 @@ impl App {
     }
 
     /// Scene render scale for a view.
-    fn render_scale(&self, integrated: bool) -> (f32, f32) {
-        scene_scale(&self.cfg.performance, self.opts.wallpaper, integrated)
+    fn render_scale(&self, integrated: bool, connector: &str) -> (f32, f32) {
+        monitor_scale(&self.cfg, connector, self.opts.wallpaper, integrated)
     }
 
     fn target_fps(&self) -> u32 {
@@ -359,8 +368,8 @@ impl App {
         let now = Instant::now();
         let mut outputs = Vec::new();
         let compositions = self.compositions();
-        let (scale, max_mp) = self.render_scale(integrated);
         for ((spec, window, surface), composition) in windows.into_iter().zip(compositions) {
+            let (scale, max_mp) = self.render_scale(integrated, &spec.name);
             log::info!("{}: composition {composition:?}", spec.name);
             if self.opts.wallpaper && integrated == want_discrete {
                 // The GPU differs from the one the window was sized for.
@@ -458,7 +467,6 @@ impl App {
                 s.world.set_config(cfg);
                 s.world.notice =
                     Some(Notice { text: format!("config reloaded: {}", path.display()), error: false, until: s.world.t + 3.0 });
-                let (scale, max_mp) = scene_scale(&self.cfg.performance, self.opts.wallpaper, s.integrated);
                 s.renderer.min_scene_megapixels = if s.integrated { 0.0 } else { self.cfg.performance.min_scene_megapixels };
                 set_system_monitor(&mut s.outputs, &self.cfg);
                 for o in &mut s.outputs {
@@ -468,6 +476,7 @@ impl App {
                     s.renderer.sysmon = Some(crate::sysmon::SysMon::start(s.gpu.adapter.get_info().vendor));
                 }
                 for o in &mut s.outputs {
+                    let (scale, max_mp) = monitor_scale(&self.cfg, &o.spec.name, self.opts.wallpaper, s.integrated);
                     o.view.invalidate_background();
                     s.renderer.resize(&mut o.view, o.surface_cfg.width, o.surface_cfg.height, scale, max_mp);
                 }
@@ -651,7 +660,7 @@ impl ApplicationHandler<Control> for App {
             }
             WindowEvent::Resized(size) => {
                 let wallpaper = self.opts.wallpaper;
-                let perf = self.cfg.performance.clone();
+                let cfg = self.cfg.clone();
                 if let Some(s) = &mut self.state
                     && let Some(o) = s.outputs.iter_mut().find(|o| o.window.id() == id)
                     && size.width > 0
@@ -661,7 +670,7 @@ impl ApplicationHandler<Control> for App {
                     o.surface_cfg.width = size.width;
                     o.surface_cfg.height = size.height;
                     o.surface.configure(&s.gpu.device, &o.surface_cfg);
-                    let (scale, max_mp) = scene_scale(&perf, wallpaper, s.integrated);
+                    let (scale, max_mp) = monitor_scale(&cfg, &o.spec.name, wallpaper, s.integrated);
                     s.renderer.resize(&mut o.view, size.width, size.height, scale, max_mp);
                     o.view.invalidate_background();
                     o.window.request_redraw();

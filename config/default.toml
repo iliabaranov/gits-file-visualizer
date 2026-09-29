@@ -130,6 +130,10 @@ rotate_compositions = "off" # or a duration such as "3h"
 [monitors."*"]
 composition = "auto"        # wide | drum | dial | auto. auto: the largest landscape screen and
                             # portrait screens get the whole tower (wide), others the dial
+# Per monitor (connector names as in Settings > Displays or `gits-render gpu-check`),
+# only the keys to change, e.g.:
+# [monitors."DP-6"]
+# render_scale = 0.5        # this monitor's tower resolution (overrides [performance] render_scale)
 
 [performance]
 # Frames are paced by the compositor (one per display refresh, up to `fps`),
@@ -156,6 +160,13 @@ shell_cache  = true         # with [tower] sectors: cached per-shell images for 
                             # (about 20% less GPU power; averages rings in blocks)
 dither       = true         # hides colour banding in dark gradients (a fixed, invisible pattern
                             # of +-1 step before the 8-bit output; nothing moves)
+# Quality of the packed drum, where many rings share a pixel (the tower's main
+# GPU cost). Lower values are faster; judge them by eye (see README "Quality knobs").
+dense_samples    = 16       # rings averaged per pixel (4-16): fewer = grainier striations
+cache_blocks     = 3        # with shell_cache: blocks read per pixel (1-8): fewer = softer
+back_face_detail = 0.25     # share of the above used for the far side of the tower (0.1-1)
+ring_bins        = 1024     # colour steps around each ring (256 | 512 | 1024): fewer = softer
+                            # arcs. Integrated GPUs use at most 4 samples and 256 steps
 # Used instead on an integrated GPU, which also draws the desktop: the whole
 # wallpaper (text included) is drawn at this size and GNOME scales it up,
 # which saves the most memory bandwidth.

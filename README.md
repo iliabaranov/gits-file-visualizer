@@ -128,6 +128,24 @@ cargo run --release -p gits-render -- stats --minutes 15
 cargo run --release -p gits-render -- default-config > my-config.toml
 ```
 
+### Quality knobs
+
+The tower's packed drum (where many rings share a pixel) is most of the GPU
+work. These `[performance]` settings trade its detail for speed; the grain or
+softness shows mostly while the rings turn, so judge them on the live
+wallpaper, which reloads a second after you save the config. GPU time per 4K
+frame on an RTX 2060, default = 1.46 ms in total:
+
+| Setting | Default | Lower | Saves | Looks |
+|---|---|---|---|---|
+| `render_scale` (or per monitor, `[monitors."DP-6"] render_scale`) | 0.58 | 0.5 | ~0.1 ms at 4K | softer tower on that screen |
+| `ring_bins` | 1024 | 512 / 256 | ~0.05 ms | softer, blurrier arcs |
+| `dense_samples` | 16 | 8 | ~0.1 ms | grainier striations where the cache is not used |
+| `cache_blocks` | 3 | 1–2 | a few % | softer, blurrier bands in the packed drum |
+| `back_face_detail` | 0.25 | 0.1 | little (the far side is cheap now) | grainier far side |
+| `shell_cache` | true | false | (costs +0.3 ms) | slightly sharper drum |
+| `dither` | true | false | ~0.07 ms | banding in dark gradients |
+
 ### Keeping the monitor layout after login
 
 GNOME sometimes restores the wrong monitor layout after login (the monitors

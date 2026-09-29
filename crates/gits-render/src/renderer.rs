@@ -46,7 +46,7 @@ const ADDITIVE: wgpu::BlendState = wgpu::BlendState {
 
 struct Target {
     view: wgpu::TextureView,
-    _tex: wgpu::Texture,
+    tex: wgpu::Texture,
 }
 
 impl Target {
@@ -58,11 +58,14 @@ impl Target {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        Self { view, _tex: tex }
+        Self { view, tex }
     }
 }
 
@@ -82,6 +85,10 @@ struct Targets {
     down_bg: Vec<wgpu::BindGroup>,
     up_bg: Vec<wgpu::BindGroup>,
     final_bg: [wgpu::BindGroup; 2],
+    /// Without motion trails: bloom and the final pass read the scene target
+    /// directly (it starts as a copy of the background; no combine pass).
+    down0_scene_bg: wgpu::BindGroup,
+    final_scene_bg: wgpu::BindGroup,
 }
 
 /// The shell image pyramid: textures, the rows to redraw, and bookkeeping.
@@ -221,18 +228,38 @@ impl Prof {
     }
 }
 
-/// GPU-dependent quality settings.
-#[derive(Clone, Copy, Debug)]
+/// Quality of the tower's dense path (`[performance]` dense_samples,
+/// cache_blocks, back_face_detail, ring_bins), capped on integrated GPUs.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Quality {
+    pub integrated: bool,
     /// Angle bins per ring in the ring colour texture (tower dense path).
     pub ring_bins: u32,
     /// Most rings averaged per pixel where rings are packed (dense path).
     pub dense_taps: u32,
+    /// Shell image pyramid blocks read per pixel.
+    pub cache_blocks: u32,
+    /// Share of the samples used for the far side of the tower.
+    pub back_detail: f32,
 }
 
 impl Quality {
     pub fn for_gpu(integrated: bool) -> Self {
-        if integrated { Self { ring_bins: 256, dense_taps: 4 } } else { Self { ring_bins: ATLAS_W, dense_taps: 16 } }
+        Self::from_config(&gits_core::config::Config::default().performance, integrated)
+    }
+
+    pub fn from_config(p: &gits_core::config::Performance, integrated: bool) -> Self {
+        // A power of two dividing the atlas width, and no finer than the
+        // sector phase quantum (1/256 turn) so shell images stay exact copies.
+        let bins = p.ring_bins.clamp(256, ATLAS_W).next_power_of_two().min(ATLAS_W);
+        let taps = p.dense_samples.clamp(1, 32);
+        Self {
+            integrated,
+            ring_bins: if integrated { bins.min(256) } else { bins },
+            dense_taps: if integrated { taps.min(4) } else { taps },
+            cache_blocks: p.cache_blocks.clamp(1, 16),
+            back_detail: p.back_face_detail.clamp(0.05, 1.0),
+        }
     }
 }
 
@@ -1001,8 +1028,26 @@ impl Renderer {
             self.post_group("final a", &trail[0].view, &bloom[0].view, dm),
             self.post_group("final b", &trail[1].view, &bloom[0].view, dm),
         ];
+        let down0_scene_bg = self.post_group("down0 scene", &scene.view, dm, dm);
+        let final_scene_bg = self.post_group("final scene", &scene.view, &bloom[0].view, dm);
         log::debug!("output {out_w}x{out_h}: scene {w}x{h}");
-        view.targets = Some(Targets { w, h, out_w, out_h, bg, scene, trail, bloom, combine_bg, down0_bg, down_bg, up_bg, final_bg });
+        view.targets = Some(Targets {
+            w,
+            h,
+            out_w,
+            out_h,
+            bg,
+            scene,
+            trail,
+            bloom,
+            combine_bg,
+            down0_bg,
+            down_bg,
+            up_bg,
+            final_bg,
+            down0_scene_bg,
+            final_scene_bg,
+        });
         view.bg_dirty = true;
     }
 
@@ -1017,6 +1062,20 @@ impl Renderer {
     }
 
     fn upload_world_inner(&mut self, w: &mut World) {
+        // Quality settings apply live; a new ring_bins needs new textures.
+        let want = Quality::from_config(&w.cfg.performance, self.quality.integrated);
+        if want != self.quality {
+            if want.ring_bins != self.quality.ring_bins {
+                let (tex, view) = rct_texture(&self.device, want.ring_bins, self.atlas_rows, self.hdr);
+                (self._rct_tex, self.rct_view) = (tex, view);
+                self.rct_bg = None;
+                self.pyr.tex = None;
+                self.pyr.bg = None;
+                w.rct_full = true;
+            }
+            log::info!("quality: {want:?}");
+            self.quality = want;
+        }
         let q = &self.queue;
         if w.layout_version != self.layout_version {
             let n_segs = w.segs.len().max(1);
@@ -1307,7 +1366,8 @@ impl Renderer {
             self.pyr.bg = None;
         }
         let rows = self.atlas_rows as f32;
-        let t = w.t;
+        // Ring phases count from the GPU time base (see World::rebase).
+        let t = w.t - w.t_base;
         self.ring_list.clear();
         self.pyr.pos_of_slot.clear();
         self.pyr.pos_of_slot.resize(self.atlas_rows as usize, u32::MAX);
@@ -1386,7 +1446,7 @@ impl Renderer {
         let smear_decay = if smear > 1e-3 { (-frame_dt.max(0.0) / smear).exp() } else { 0.0 };
         Globals {
             view_proj: cam.view_proj().to_cols_array_2d(),
-            cam_pos: [cam.eye.x, cam.eye.y, cam.eye.z, w.t as f32],
+            cam_pos: [cam.eye.x, cam.eye.y, cam.eye.z, w.gnow()],
             tower: [tw.height, tw.radius, tw.inner_radius, w.y_top()],
             tower2: [tw.depth_layers.max(1) as f32, tw.ribbon, tw.fill, if cam.inside { 1.0 } else { tw.back_face }],
             lut: [LUT_BINS as f32, w.rings.len() as f32, ATLAS_W as f32, BOOST_TAU],
@@ -1412,7 +1472,8 @@ impl Renderer {
                 (ATLAS_W / self.quality.ring_bins) as f32,
                 c.performance.upscale_sharpness.clamp(0.0, 1.0),
             ],
-            post3: [if c.performance.dither { 1.0 } else { 0.0 }, 255.0, tw.shell_curve.clamp(0.2, 5.0), 0.0],
+            post3: [if c.performance.dither { 1.0 } else { 0.0 }, 255.0, tw.shell_curve.clamp(0.2, 5.0), self.quality.cache_blocks as f32],
+            qual: [self.quality.back_detail, 0.0, 0.0, 0.0],
             pyr: {
                 let heights = self.pyr.tex.as_ref().map_or([1, 1], |t| t.heights);
                 let phase = w.shell_speed().map_or(0.0, |s| (s as f64 * w.t).rem_euclid(1.0)) as f32;
@@ -1563,8 +1624,15 @@ impl Renderer {
 
         // Profiling aid: GITS_SKIP=tower,sprites,bloom skips passes.
         let skip = std::env::var("GITS_SKIP").unwrap_or_default();
+        // Without motion trails the frame doesn't depend on the previous one:
+        // the scene is drawn straight over a copy of the cached background.
+        let trails = w.cfg.palette.smear.0 > 1e-3;
+        if !trails {
+            let size = wgpu::Extent3d { width: tg.w, height: tg.h, depth_or_array_layers: 1 };
+            enc.copy_texture_to_texture(tg.bg.tex.as_image_copy(), tg.scene.tex.as_image_copy(), size);
+        }
         {
-            let mut p = pass(&mut enc, &tg.scene.view, true, "scene");
+            let mut p = pass(&mut enc, &tg.scene.view, trails, "scene");
             p.set_bind_group(0, &self.globals_bg, &[]);
             if let Some(tbg) = self.tower_bg.as_ref().filter(|_| !skip.contains("tower")) {
                 p.set_pipeline(&self.tower_pipeline);
@@ -1602,9 +1670,12 @@ impl Renderer {
             p.set_bind_group(1, group, &[]);
             p.draw(0..3, 0..1);
         };
-        fullscreen(&mut enc, &self.combine_pipeline, &tg.trail[cur].view, &tg.combine_bg[cur], true, "combine");
+        if trails {
+            fullscreen(&mut enc, &self.combine_pipeline, &tg.trail[cur].view, &tg.combine_bg[cur], true, "combine");
+        }
         if !skip.contains("bloom") {
-            fullscreen(&mut enc, &self.down_pipeline, &tg.bloom[0].view, &tg.down0_bg[cur], true, "bloom down 0");
+            let down0 = if trails { &tg.down0_bg[cur] } else { &tg.down0_scene_bg };
+            fullscreen(&mut enc, &self.down_pipeline, &tg.bloom[0].view, down0, true, "bloom down 0");
             for i in 1..BLOOM_LEVELS {
                 fullscreen(&mut enc, &self.down_pipeline, &tg.bloom[i].view, &tg.down_bg[i - 1], true, "bloom down");
             }
@@ -1614,7 +1685,7 @@ impl Renderer {
         }
         let upscaling = (tg.w, tg.h) != (tg.out_w, tg.out_h);
         let final_pipeline = if upscaling { &self.final_up_pipeline } else { &self.final_pipeline };
-        fullscreen(&mut enc, final_pipeline, out, &tg.final_bg[cur], true, "final");
+        fullscreen(&mut enc, final_pipeline, out, if trails { &tg.final_bg[cur] } else { &tg.final_scene_bg }, true, "final");
         if view.hud_count > 0 {
             let mut p = pass(&mut enc, out, false, "overlay");
             p.set_pipeline(&self.hud_pipeline);

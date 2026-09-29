@@ -666,6 +666,28 @@ caches, ESP-IDF build trees, uv's Pythons, pnpm's store. Changes:
 - `GITS_GPUPROF=1 gits-render bench ...` prints GPU time per pass (from the
   GPU review).
 
+### Far side, no combine pass, time base, quality knobs (2026-09-28)
+
+- Far side of the tower: `back_face_detail` (0.25) of the dense samples and
+  cache blocks (not in the dial, which is made of the shells' inside).
+- No combine pass while motion trails are off: the scene pass starts from a
+  copy of the cached background, and bloom and the final pass read the scene
+  (identical output, PSNR 57-66 dB against the old path).
+- GPU time base: shader times were `world.t as f32`, which after a day of
+  uptime resolves only 7.8 ms (31 ms after three days), so fades and ring
+  rotation would step unevenly. All GPU times are now relative to `t_base`,
+  moved forward every 4 h (`World::rebase` shifts every stored event time
+  and ring phase by the same amount; tested to change nothing on screen).
+- Dithering rewritten with a PCG hash and a gamma-2 estimate of the output
+  step: +0.4 ms -> +0.07 ms at 4K, same effect (915 vs 250 distinct colours
+  in a dark corner).
+- Quality knobs (`[performance]` dense_samples, cache_blocks,
+  back_face_detail, ring_bins; `[monitors."<connector>"] render_scale`),
+  applied live. With the shell cache the tower costs 0.6-0.8 ms at 4K, so
+  each knob now saves at most ~0.1 ms; see README "Quality knobs".
+- Measured (3 monitors, 60 fps, headless, real data): 22-33 W, renderer
+  11-12% of one core. Was 28-36 W.
+
 ### Efficiency backlog
 
 - Tower fragment shader is ~65% of GPU time: cheaper samples in the dense drum,
