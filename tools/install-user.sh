@@ -11,9 +11,11 @@
 # In a prebuilt bundle (tools/make-bundle.sh) the binaries are in bin/ and
 # nothing is compiled: no Rust toolchain needed.
 #
-# The wallpaper itself is the GNOME extension; the script enables it. On
-# Wayland, GNOME only discovers a newly installed extension when you log in, so
-# the first time it appears after the next login.
+# The wallpaper itself is the GNOME extension (extension/gnome-42 for GNOME
+# 42-44, extension/gnome-45 for GNOME 45+); the script enables it. On Wayland,
+# GNOME only discovers a newly installed extension when you log in, so the first
+# time it appears after the next login. On X11, restart the shell once (Alt+F2,
+# r, Enter) or log in again. Both Wayland and X11 sessions are supported.
 set -euo pipefail
 cd "$(dirname "$0")"
 [[ -d bin ]] || cd ..   # in the source tree this script lives in tools/
@@ -40,9 +42,9 @@ major=$(shell_major)
 if [[ -z "$major" ]]; then
   echo "note: gnome-shell not found; installing the collector and renderer only"
 elif (( major >= 45 )); then
-  echo "note: GNOME $major: the wallpaper extension supports GNOME 42-44 only so far;"
-  echo "      installing the collector and renderer (run it in a window: gits-render window)"
-  major=""
+  EXT_SRC=extension/gnome-45
+else
+  EXT_SRC=extension/gnome-42
 fi
 
 if [[ -x bin/gits-render && -x bin/gits-collector ]]; then
@@ -74,7 +76,7 @@ enable_extension() {
 
 if [[ -n "$major" ]]; then
   mkdir -p "$EXT_DIR"
-  install -m 644 extension/gnome-42/metadata.json extension/gnome-42/extension.js "$EXT_DIR/"
+  install -m 644 "$EXT_SRC/metadata.json" "$EXT_SRC/extension.js" "$EXT_DIR/"
   enable_extension
 fi
 
@@ -87,8 +89,13 @@ if [[ -n "$major" ]]; then
     echo "the wallpaper extension is enabled. To pick up a new version: disable, then enable:"
     echo "  gnome-extensions disable $UUID; gnome-extensions enable $UUID"
   else
-    echo "the wallpaper extension is enabled and starts at your next login"
-    echo "(GNOME on Wayland only discovers new extensions when you log in)."
+    if [[ "${XDG_SESSION_TYPE:-}" == "x11" ]]; then
+      echo "the wallpaper extension is enabled; restart the shell once to load it"
+      echo "(Alt+F2, type r, Enter) or log in again."
+    else
+      echo "the wallpaper extension is enabled and starts at your next login"
+      echo "(GNOME on Wayland only discovers new extensions when you log in)."
+    fi
   fi
   echo "wallpaper off:  gnome-extensions disable $UUID"
   echo "extension/renderer logs: journalctl --user -f -o cat /usr/bin/gnome-shell | grep -E 'gits'"

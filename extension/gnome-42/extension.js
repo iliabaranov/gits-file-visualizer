@@ -410,7 +410,8 @@ class Extension {
         this._sources.clear();
         this._refill();
         this._sent.clear();
-        if (!this._enabled || status === 'exit 0')
+        // 'restart' is our own deliberate restart (see _restartRenderer), not a failure.
+        if (!this._enabled || status === 'exit 0' || status === 'restart')
             return;
         if (status === `exit ${EXIT_RESTART}`) {
             // Requested restart (e.g. power source changed, switch GPU): not a failure.

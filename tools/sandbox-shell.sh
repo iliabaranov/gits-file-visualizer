@@ -27,6 +27,7 @@ bus() { cat "$SB/bus"; }
 call() { DBUS_SESSION_BUS_ADDRESS=$(bus) gdbus call --session "$@"; }
 
 shell_major() { gnome-shell --version | sed -E 's/[^0-9]*([0-9]+).*/\1/'; }
+helper_dir() { if [[ $(shell_major) -ge 45 ]]; then echo tools/sandbox/gits-sandbox-helper-esm@test; else echo tools/sandbox/$HELPER; fi; }
 ext_dir() { if [[ $(shell_major) -ge 45 ]]; then echo extension/gnome-45; else echo extension/gnome-42; fi; }
 
 case "${1:-}" in
@@ -41,7 +42,7 @@ start)
   else
     ln -s "$REPO/$(ext_dir)" "$SB/home/.local/share/gnome-shell/extensions/$UUID"
   fi
-  ln -s "$REPO/tools/sandbox/$HELPER" "$SB/home/.local/share/gnome-shell/extensions/$HELPER"
+  ln -s "$REPO/$(helper_dir)" "$SB/home/.local/share/gnome-shell/extensions/$HELPER"
   # Like a real install: the extension finds the renderer in ~/.local/bin.
   mkdir -p "$SB/home/.local/bin"; ln -s "$REPO/target/release/gits-render" "$SB/home/.local/bin/gits-render"
   if [[ -n "${GITS_COLLECTOR_SOCKET:-}" ]]; then

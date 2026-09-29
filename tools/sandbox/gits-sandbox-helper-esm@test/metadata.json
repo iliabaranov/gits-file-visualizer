@@ -1,0 +1,7 @@
+{
+  "uuid": "gits-sandbox-helper@test",
+  "name": "gits sandbox helper",
+  "description": "Test-only: enables unsafe mode (Eval/Screenshot over D-Bus) inside the sandbox shell. Never install in a real session.",
+  "session-modes": ["user", "unlock-dialog"],
+  "shell-version": ["42", "43", "44", "45", "46", "47", "48", "49", "50"]
+}
