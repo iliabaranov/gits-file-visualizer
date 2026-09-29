@@ -295,7 +295,17 @@ impl App {
                 use winit::platform::wayland::WindowAttributesExtWayland;
                 attrs = attrs.with_name(APP_ID, "gits-file-visualizer");
             }
-            windows.push((spec.clone(), Arc::new(el.create_window(attrs)?)));
+            let window = el.create_window(attrs)?;
+            if self.opts.wallpaper {
+                // Clicks go through to whatever is below (the desktop icons, the
+                // background menu): an empty input region. The extension keeps
+                // these windows minimized, but if one is ever shown it must not
+                // behave like a fullscreen app.
+                if let Err(e) = window.set_cursor_hittest(false) {
+                    log::warn!("{}: could not make the window click-through: {e}", spec.name);
+                }
+            }
+            windows.push((spec.clone(), Arc::new(window)));
         }
         // Vulkan first; OpenGL only if Vulkan finds nothing usable.
         let mut chosen = None;
@@ -622,6 +632,17 @@ impl ApplicationHandler<Control> for App {
                 }
             }
             WindowEvent::RedrawRequested => self.frame(id),
+            WindowEvent::Focused(true) if self.opts.wallpaper => {
+                // A wallpaper window only gets focus if it is on screen as a
+                // normal window: ask to be minimized again (the wallpaper is
+                // shown through the extension's copies).
+                if let Some(s) = &self.state
+                    && let Some(o) = s.outputs.iter().find(|o| o.window.id() == id)
+                {
+                    log::info!("{}: wallpaper window got focus; minimizing it", o.spec.name);
+                    o.window.set_minimized(true);
+                }
+            }
             _ => {}
         }
     }

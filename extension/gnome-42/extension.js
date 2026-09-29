@@ -367,8 +367,7 @@ class Extension {
         this._renderer.hideFromWindowList(window);
         window.stick();
         window.move_to_monitor(monitor);
-        // The window is smaller than the monitor (the renderer's internal
-        // resolution); the clones below scale it up.
+        // Shown only through the clones below (scaled to each background).
         Main.wm.skipNextEffect(actor);
         window.minimize();
         const ids = [
@@ -377,6 +376,12 @@ class Extension {
                     Main.wm.skipNextEffect(actor);
                     window.minimize();
                 }
+            }),
+            // Never a focus target (e.g. something activating the top window).
+            window.connect('focus', () => {
+                info(`renderer window for monitor ${monitor} was focused; minimizing it`);
+                Main.wm.skipNextEffect(actor);
+                window.minimize();
             }),
             window.connect('unmanaged', () => this._forgetWindow(window, monitor)),
         ];
