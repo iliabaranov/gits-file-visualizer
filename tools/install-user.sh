@@ -8,11 +8,15 @@
 #   tools/install-user.sh              build (release), install, start the collector
 #   tools/install-user.sh uninstall    stop, disable, remove everything above
 #
+# In a prebuilt bundle (tools/make-bundle.sh) the binaries are in bin/ and
+# nothing is compiled: no Rust toolchain needed.
+#
 # The wallpaper itself is the GNOME extension; the script enables it. On
 # Wayland, GNOME only discovers a newly installed extension when you log in, so
 # the first time it appears after the next login.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")"
+[[ -d bin ]] || cd ..   # in the source tree this script lives in tools/
 
 BIN="$HOME/.local/bin"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
@@ -36,14 +40,20 @@ major=$(shell_major)
 if [[ -z "$major" ]]; then
   echo "note: gnome-shell not found; installing the collector and renderer only"
 elif (( major >= 45 )); then
-  echo "GNOME $major is not supported yet (the extension for GNOME 45+ is planned in milestone M5)" >&2
-  exit 1
+  echo "note: GNOME $major: the wallpaper extension supports GNOME 42-44 only so far;"
+  echo "      installing the collector and renderer (run it in a window: gits-render window)"
+  major=""
 fi
 
-# Lowest CPU priority, so the desktop stays responsive while it compiles.
-nice -n 19 cargo build --release --locked -p gits-collector -p gits-render
+if [[ -x bin/gits-render && -x bin/gits-collector ]]; then
+  SRC=bin   # prebuilt bundle
+else
+  # Lowest CPU priority, so the desktop stays responsive while it compiles.
+  nice -n 19 cargo build --release --locked -p gits-collector -p gits-render
+  SRC=target/release
+fi
 mkdir -p "$BIN" "$UNIT_DIR"
-install -m 755 target/release/gits-collector target/release/gits-render "$BIN/"
+install -m 755 "$SRC/gits-collector" "$SRC/gits-render" "$BIN/"
 install -m 644 "packaging/systemd/$UNIT" "$UNIT_DIR/$UNIT"
 systemctl --user daemon-reload
 systemctl --user enable --now "$UNIT"

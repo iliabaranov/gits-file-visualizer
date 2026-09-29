@@ -146,6 +146,22 @@ frame on an RTX 2060, default = 1.46 ms in total:
 | `shell_cache` | true | false | (costs +0.3 ms) | slightly sharper drum |
 | `dither` | true | false | ~0.07 ms | banding in dark gradients |
 
+### On another machine without building
+
+```sh
+tools/make-bundle.sh      # -> out/gits-file-visualizer-linux-x86_64.tar.gz (~6 MB)
+```
+
+Copy the file over, then on the other machine (x86_64 Linux with glibc 2.34+,
+e.g. Ubuntu 22.04 or newer; no Rust needed):
+
+```sh
+tar xzf gits-file-visualizer-linux-x86_64.tar.gz && gits-file-visualizer/install.sh
+```
+
+On GNOME 42–44 the wallpaper starts after the next login. On GNOME 45+ the
+extension isn't ported yet: run `gits-render window` instead.
+
 ### Keeping the monitor layout after login
 
 GNOME sometimes restores the wrong monitor layout after login (the monitors
