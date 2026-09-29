@@ -118,6 +118,7 @@ pub struct Tower {
     pub radius: f32,
     pub inner_radius: f32,
     pub depth_layers: u32,
+    pub max_tree_share: f32,
     pub min_arc: f32,
     pub max_arc: f32,
     pub gap: f32,

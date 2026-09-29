@@ -5,7 +5,7 @@
 //! by priority (current activity first, then how recently anything below them
 //! changed) until the budget is used. A directory that is not expanded appears
 //! as a single dashed "aggregate" segment in its parent's band, standing for
-//! its whole subtree.
+//! its whole subtree. No subtree may take more than `max_tree_rings`.
 
 use crate::model::{DirId, FileId, Model};
 use crate::rng::mix64;
@@ -31,6 +31,9 @@ pub struct LayoutParams {
     pub dir_marks: bool,
     pub dir_mark_arc: f32,
     pub max_rings: usize,
+    /// Most rings one directory's subtree may take (0 = no limit), so a single
+    /// deep tree (a build tree, a browser profile) cannot fill the tower.
+    pub max_tree_rings: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -203,6 +206,9 @@ fn choose_expanded(model: &Model, p: &LayoutParams, hot: &[f32]) -> Vec<bool> {
     arc_of[root] = band_arc(root);
     let mut total = rings_for(arc_of[root]);
     let budget = p.max_rings.max(1);
+    let cap = if p.max_tree_rings > 0 { p.max_tree_rings as isize } else { isize::MAX };
+    // Rings of each expanded directory's subtree.
+    let mut tree = vec![0isize; n];
     let mut heap: BinaryHeap<Cand> = BinaryHeap::new();
     for &c in &model.dirs[root].dirs {
         if !model.dirs[c as usize].purged {
@@ -216,9 +222,19 @@ fn choose_expanded(model: &Model, p: &LayoutParams, hot: &[f32]) -> Vec<bool> {
         let child_arc = band_arc(c);
         let delta = rings_for(child_arc) as isize + rings_for(new_parent_arc) as isize - rings_for(arc_of[pa]) as isize;
         // The top level is always shown in full.
-        if total as isize + delta > budget as isize && model.dirs[c].depth > 1 {
+        let top_level = model.dirs[c].depth <= 1;
+        if total as isize + delta > budget as isize && !top_level {
             continue;
         }
+        // Neither this subtree nor any enclosing one (below ~) may exceed the cap.
+        let ancestors = || std::iter::successors(Some(pa), |&a| model.dirs[a].parent.map(|x| x as usize)).take_while(|&a| a != root);
+        if !top_level && (rings_for(child_arc) as isize > cap || ancestors().any(|a| tree[a] + delta > cap)) {
+            continue;
+        }
+        for a in ancestors() {
+            tree[a] += delta;
+        }
+        tree[c] = rings_for(child_arc) as isize;
         expanded[c] = true;
         arc_of[pa] = new_parent_arc;
         arc_of[c] = child_arc;
@@ -365,7 +381,7 @@ mod tests {
     use super::*;
 
     fn params(max_rings: usize) -> LayoutParams {
-        LayoutParams { min_arc: 0.02, max_arc: 0.2, gap: 0.006, dir_marks: true, dir_mark_arc: 0.03, max_rings }
+        LayoutParams { min_arc: 0.02, max_arc: 0.2, gap: 0.006, dir_marks: true, dir_mark_arc: 0.03, max_rings, max_tree_rings: 0 }
     }
 
     fn sample() -> Model {
@@ -413,5 +429,36 @@ mod tests {
         hot[3] = 5.0;
         let l = build(&m, &params(full - 4), &hot);
         assert!(l.is_expanded(3) && !l.is_expanded(2));
+    }
+
+    #[test]
+    fn no_subtree_exceeds_the_cap() {
+        // Two top-level trees of 30 folders x 30 files; plenty of budget.
+        let mut m = Model::new("~", 0);
+        for top in ["build", "docs"] {
+            let t = m.add_dir(0, top);
+            for i in 0..30 {
+                let d = m.add_dir(t, format!("d{i}"));
+                for j in 0..30 {
+                    m.add_existing_file(d, format!("f{j}"), 5000, if top == "build" { 100 + i } else { i });
+                }
+            }
+        }
+        let mut p = params(100_000);
+        assign_arcs(&mut m, &p, 0);
+        let rings_under = |l: &Layout, top: u32| {
+            l.rings.iter().filter(|r| std::iter::successors(Some(r.dir), |&d| m.dirs[d as usize].parent).any(|d| d == top)).count()
+        };
+        let full = build(&m, &p, &[]);
+        assert!(rings_under(&full, 1) > 60 && full.collapsed == 0);
+        p.max_tree_rings = 40;
+        let l = build(&m, &p, &[]);
+        for top in [1, 32] {
+            let n = rings_under(&l, top);
+            assert!(n <= 40 && n > 10, "tree {top}: {n} rings");
+        }
+        // The most recently changed folders are the ones kept.
+        assert!(l.is_expanded(31) && !l.is_expanded(2));
+        assert!(l.seg_of_file.iter().all(|&s| s != NONE));
     }
 }

@@ -592,6 +592,25 @@ agrees (and also lists flicker and rotation).
   right of the main monitor with one-minute sparklines scrolling smoothly
   (~2 px/s), callout rows avoid it.
 
+### Balance: excludes and per-tree cap (2026-09-28)
+
+`gits-render --source collector stats --shells` showed the outermost shell
+(depth 7+) holding 10.5k of 15.7k rings and 67% of the tower's height, mostly
+generated trees: opencode's snapshot store, Chrome extensions and Service Worker
+caches, ESP-IDF build trees, uv's Pythons, pnpm's store. Changes:
+
+- Default excludes for stores programs manage for themselves (opencode
+  snapshots, uv, pnpm, browser and editor extensions, Service Worker caches).
+  Build folders stay: build activity is worth seeing.
+- `[tower] max_tree_share = 0.1`: no directory's subtree may take more than 10%
+  of the ring budget (checked for the subtree and every enclosing one below ~;
+  folders directly in ~ are always shown). Beyond it the least recently
+  changed subfolders stay collapsed as dashed aggregates, which still flash on
+  activity; active folders are expanded first.
+- Result on this home: outermost shell 51% of the height, no single tree above
+  ~1.6k rings. Deep folders are simply the majority of any home, so the
+  outermost shell stays the largest.
+
 ### Efficiency backlog
 
 - Tower fragment shader is ~65% of GPU time: cheaper samples in the dense drum,

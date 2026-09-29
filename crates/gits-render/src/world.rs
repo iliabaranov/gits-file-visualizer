@@ -287,6 +287,11 @@ impl World {
             dir_marks: t.dir_marks,
             dir_mark_arc: 0.03,
             max_rings: self.max_rings,
+            max_tree_rings: if t.max_tree_share >= 1.0 {
+                0
+            } else {
+                (t.max_tree_share.max(0.0) * self.max_rings as f32).ceil().max(1.0) as usize
+            },
         }
     }
 
