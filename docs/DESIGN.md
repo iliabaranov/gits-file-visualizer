@@ -25,7 +25,7 @@ motion coming from the data, not from the camera.
 | Alerts | ✅ Escalation only raises intensity, then everything simply fades back. Nothing latches, no acknowledgement |
 | Calligraphy | ✅ Zeami verse columns as a dim background layer (on by default, configurable) |
 | Monitors | ✅ One view per monitor: shared data, own composition per monitor |
-| Text | ✅ Real paths; auto-obfuscated while screen sharing |
+| Text | ✅ Real paths; optionally obfuscated while screen sharing (`obfuscate_when_sharing`, off by default) |
 | Performance | ✅ Up to 24 fps (film rate), much lower when calm, ≈0 when hidden, iGPU preferred |
 | Interaction | ✅ Passive only |
 | Desktops | ✅ GNOME first, behind a small surface-backend interface; layer-shell backend optional later (§4.1) |

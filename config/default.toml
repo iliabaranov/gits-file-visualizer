@@ -130,8 +130,9 @@ integrated_render_scale = 0.6
 integrated_max_megapixels = 1.2
 
 [privacy]
-text                   = "paths"   # paths | dirs | glyphs | none
-obfuscate_when_sharing = true
+text                   = "paths"   # labels show: paths | dirs (folder names only) | glyphs (hex codes) | none
+obfuscate_when_sharing = false     # true: while a screencast or screen share runs, labels
+                                   # switch to hex codes (as text = "glyphs")
 
 [data]
 source = "auto"             # auto | collector | synthetic. "auto" uses the collector

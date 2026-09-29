@@ -8,7 +8,7 @@
  *
  * It also tells the renderer, over its stdin, which monitors are covered by
  * windows (so it stops drawing them), when the screen is locked, and when a
- * screencast or screen share is running (so file names get obfuscated).
+ * screencast or screen share is running (file names can be obfuscated then).
  */
 'use strict';
 

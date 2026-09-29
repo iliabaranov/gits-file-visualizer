@@ -53,8 +53,8 @@ and back in once; the script says when that is needed. The extension:
 - picks a view per monitor (`[monitors]`, default `auto`): the portrait screen
   gets the drum close-up, the largest landscape screen the wide tower, others the
   top-down dial;
-- switches file names to obfuscated glyphs while a screencast or screen share is
-  running (`[privacy] obfuscate_when_sharing`);
+- can switch file names to hex codes while a screencast or screen share is
+  running (`[privacy] obfuscate_when_sharing = true`; off by default);
 - restarts the renderer if it crashes (at most 5 times in 5 minutes) and when
   monitors change; if the renderer is missing, the normal wallpaper stays.
 
