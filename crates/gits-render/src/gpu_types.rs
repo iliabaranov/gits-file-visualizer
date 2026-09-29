@@ -80,6 +80,9 @@ pub struct Globals {
     pub rct: [f32; 4],
     /// shell_dim, scan interval (s, 0 = off), scan duration (s), scan brightness.
     pub tower3: [f32; 4],
+    /// Shell rotation (turns, fract), padded ring list length (0 = no shell
+    /// image pyramid), pyramid texture A height, B height.
+    pub pyr: [f32; 4],
 }
 
 #[repr(C)]

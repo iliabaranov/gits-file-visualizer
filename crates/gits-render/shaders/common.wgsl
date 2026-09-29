@@ -25,6 +25,7 @@ struct Globals {
     post2: vec4<f32>,       // smear decay, seed, manual gamma, 1/bloom levels
     rct: vec4<f32>,         // ring colour texture rows, bins, atlas texels per bin, upscale sharpness
     tower3: vec4<f32>,      // shell_dim, scan interval s (0 = off), scan duration s, scan brightness
+    pyr: vec4<f32>,         // shell rotation (turns, fract), padded ring list length (0 = no pyramid), texture A height, B height
 };
 
 @group(0) @binding(0) var<uniform> G: Globals;
@@ -70,6 +71,19 @@ fn encode_out(c: vec3<f32>) -> vec3<f32> {
 fn finite(c: vec3<f32>) -> vec3<f32> {
     let bits = bitcast<vec3<u32>>(c) & vec3<u32>(0x7fffffffu);
     return select(c, vec3<f32>(0.0), bits >= vec3<u32>(0x7f800000u));
+}
+
+// Levels of the shell image pyramid (world.rs PYRAMID_LEVELS).
+const PYRAMID_LEVELS: u32 = 8u;
+
+// First texture row of pyramid level `level` (odd levels in texture A, even in
+// B, stacked in order) for a padded ring list of `r0` entries.
+fn pyr_y0(level: u32, r0: u32) -> u32 {
+    var y = 0u;
+    for (var k = 2u - (level & 1u); k < level; k += 2u) {
+        y += r0 >> k;
+    }
+    return y;
 }
 
 fn hash12(p: vec2<f32>) -> f32 {

@@ -14,7 +14,7 @@ use crate::camera::Camera;
 use crate::fx;
 use crate::gpu_types::{Globals, RingGpu, SegmentGpu, SpriteVertex};
 use crate::text::GlyphAtlas;
-use crate::world::{ATLAS_W, BOOST_TAU, LUT_BINS, LUT_LEN, World};
+use crate::world::{ATLAS_W, BOOST_TAU, LUT_BINS, LUT_LEN, PYRAMID_LEVELS, World};
 use anyhow::Result;
 use wgpu::util::DeviceExt;
 
@@ -25,6 +25,7 @@ const COMMON_WGSL: &str = include_str!("../shaders/common.wgsl");
 const TOWER_COMMON_WGSL: &str = include_str!("../shaders/tower_common.wgsl");
 const TOWER_WGSL: &str = include_str!("../shaders/tower.wgsl");
 const RINGCOLOR_WGSL: &str = include_str!("../shaders/ringcolor.wgsl");
+const PYRAMID_WGSL: &str = include_str!("../shaders/pyramid.wgsl");
 /// The whole ring colour texture is refreshed over this many (simulated) seconds.
 const RCT_REFRESH_S: f64 = 2.0;
 const SPRITE_WGSL: &str = include_str!("../shaders/sprite.wgsl");
@@ -81,6 +82,54 @@ struct Targets {
     down_bg: Vec<wgpu::BindGroup>,
     up_bg: Vec<wgpu::BindGroup>,
     final_bg: [wgpu::BindGroup; 2],
+}
+
+/// The shell image pyramid: textures, the rows to redraw, and bookkeeping.
+struct Pyramid {
+    pipeline: wgpu::RenderPipeline,
+    bgl: wgpu::BindGroupLayout,
+    /// Odd levels (A) and even levels (B), with their heights; None = not
+    /// allocated (disabled, or too tall for this GPU).
+    tex: Option<PyramidTextures>,
+    /// [draws into A (reads B), draws into B (reads A)], rebuilt lazily.
+    bg: Option<[wgpu::BindGroup; 2]>,
+    ranges_buf: wgpu::Buffer,
+    ranges_cap: usize,
+    /// Rows to redraw with the next encoded frame: (first, end, level, 0),
+    /// grouped by level, and each level's instance range.
+    ranges: Vec<[u32; 4]>,
+    spans: [(u32, u32); PYRAMID_LEVELS as usize + 1],
+    /// Padded ring list length in use (0 = pyramid off).
+    r0: u32,
+    /// Everything that forces a full rebuild when it changes.
+    key: (u64, u32, u32, u64),
+    /// World time last planned for.
+    t: f64,
+    /// Texture (re)allocations, part of `key`.
+    generation: u64,
+    /// List position of each ring colour texture slot, and the positions of
+    /// rings easing to a new angle (their shell images change every frame).
+    pos_of_slot: Vec<u32>,
+    easing: Vec<u32>,
+}
+
+struct PyramidTextures {
+    a: wgpu::TextureView,
+    b: wgpu::TextureView,
+    _tex: [wgpu::Texture; 2],
+    heights: [u32; 2],
+    /// Padded ring list length the textures were sized for.
+    r0_cap: u32,
+}
+
+/// Rows of the pyramid textures for a padded list of `r0` entries: odd
+/// levels (A) and even levels (B), stacked.
+fn pyramid_heights(r0: u32) -> [u32; 2] {
+    let mut h = [0u32; 2];
+    for level in 1..=PYRAMID_LEVELS {
+        h[(level as usize + 1) % 2] += r0 >> level;
+    }
+    h
 }
 
 /// GPU-dependent quality settings.
@@ -147,7 +196,10 @@ pub struct Renderer {
     rct_view: wgpu::TextureView,
     _rct_tex: wgpu::Texture,
     rct_bgl: wgpu::BindGroupLayout,
-    rct_bg: wgpu::BindGroup,
+    /// Tower group 2: ring colour texture + shell image pyramid (rebuilt lazily).
+    rct_bg: Option<wgpu::BindGroup>,
+    /// Shell image pyramid (pyramid.wgsl), used when the tower turns as one.
+    pyr: Pyramid,
     rct_sampler: wgpu::Sampler,
     ring_pipeline: wgpu::RenderPipeline,
     ranges_bgl: wgpu::BindGroupLayout,
@@ -336,6 +388,7 @@ impl Renderer {
         };
         let tower_mod = module("tower.wgsl", &format!("{TOWER_COMMON_WGSL}\n{TOWER_WGSL}"));
         let ring_mod = module("ringcolor.wgsl", &format!("{TOWER_COMMON_WGSL}\n{RINGCOLOR_WGSL}"));
+        let pyr_mod = module("pyramid.wgsl", PYRAMID_WGSL);
         let sprite_mod = module("sprite.wgsl", SPRITE_WGSL);
         let post_mod = module("post.wgsl", POST_WGSL);
 
@@ -401,9 +454,29 @@ impl Renderer {
                 immediate_size: 0,
             })
         };
+        let float_f = wgpu::TextureSampleType::Float { filterable: true };
         let rct_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("ring colours"),
-            entries: &[texture_entry(0, wgpu::TextureSampleType::Float { filterable: true }), sampler_entry(1)],
+            label: Some("ring colours + shell pyramid"),
+            entries: &[texture_entry(0, float_f), sampler_entry(1), texture_entry(2, float_f), texture_entry(3, float_f), sampler_entry(4)],
+        });
+        let pyr_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shell pyramid pass"),
+            entries: &[
+                texture_entry(0, float_f),
+                sampler_entry(1),
+                storage_entry(2),
+                texture_entry(3, float_f),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
         let ranges_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ring colour ranges"),
@@ -435,6 +508,23 @@ impl Renderer {
             fragment: Some(wgpu::FragmentState {
                 module: &ring_mod,
                 entry_point: Some("fs_rows"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: hdr, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let pyr_layout = layout("shell pyramid", &[&globals_bgl, &pyr_bgl]);
+        let pyr_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shell pyramid"),
+            layout: Some(&pyr_layout),
+            vertex: wgpu::VertexState { module: &pyr_mod, entry_point: Some("vs_pyr"), compilation_options: Default::default(), buffers: &[] },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &pyr_mod,
+                entry_point: Some("fs_pyr"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState { format: hdr, blend: None, write_mask: wgpu::ColorWrites::ALL })],
             }),
@@ -641,14 +731,22 @@ impl Renderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let rct_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ring colours"),
-            layout: &rct_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&rct_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&rct_sampler) },
-            ],
-        });
+        let pyr = Pyramid {
+            pipeline: pyr_pipeline,
+            bgl: pyr_bgl,
+            tex: None,
+            bg: None,
+            ranges_buf: storage_buffer(&device, "shell pyramid ranges", 64 * 16),
+            ranges_cap: 64,
+            ranges: vec![],
+            spans: [(0, 0); PYRAMID_LEVELS as usize + 1],
+            r0: 0,
+            key: (u64::MAX, 0, 0, 0),
+            t: f64::NAN,
+            generation: 0,
+            pos_of_slot: vec![],
+            easing: vec![],
+        };
         let ranges_cap = 1024;
         let ranges_buf = ranges_buffer(&device, ranges_cap);
         let ranges_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -684,7 +782,8 @@ impl Renderer {
             rct_view,
             _rct_tex: rct_tex,
             rct_bgl,
-            rct_bg,
+            rct_bg: None,
+            pyr,
             rct_sampler,
             ring_pipeline,
             ranges_bgl,
@@ -834,15 +933,9 @@ impl Renderer {
                 (self.atlas_tex, self.atlas_view) = atlas_texture(&self.device, rows);
                 self.atlas_rows = rows;
                 let (tex, view) = rct_texture(&self.device, self.quality.ring_bins, rows, self.hdr);
-                self.rct_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("ring colours"),
-                    layout: &self.rct_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.rct_sampler) },
-                    ],
-                });
                 (self._rct_tex, self.rct_view) = (tex, view);
+                self.rct_bg = None;
+                self.pyr.bg = None;
                 w.rct_full = true;
                 w.slots_full = true;
                 rebind = true;
@@ -969,6 +1062,124 @@ impl Renderer {
             }));
         }
         self.plan_ring_colours(w);
+        self.plan_pyramid(w);
+        self.ensure_texture_groups();
+    }
+
+    /// Chooses the shell image pyramid rows to redraw for world time `w.t`:
+    /// everything after a relayout, otherwise the blocks holding rings whose
+    /// ring colour rows are being redrawn or that are easing to a new angle.
+    fn plan_pyramid(&mut self, w: &World) {
+        let n = w.rings.len();
+        let list_at = w.cfg.tower.depth_layers.max(1) as usize * (n + 1);
+        let r0 = w.layer_index.len().saturating_sub(list_at) as u32;
+        let speed = w.shell_speed().filter(|_| std::env::var_os("GITS_NO_PYRAMID").is_none());
+        let Some(speed) = speed.filter(|_| n > 0 && r0 > 0) else {
+            self.pyr.r0 = 0;
+            self.pyr.ranges.clear();
+            return;
+        };
+        // (Re)allocate for this list length, with headroom.
+        if self.pyr.tex.as_ref().is_none_or(|t| r0 > t.r0_cap) {
+            let r0_cap = (r0 * 5 / 4).div_ceil(1 << PYRAMID_LEVELS) << PYRAMID_LEVELS;
+            let heights = pyramid_heights(r0_cap);
+            if heights[0] > self.max_atlas_rows {
+                log::warn!("shell pyramid would need {} rows; using the slower dense path", heights[0]);
+                self.pyr.r0 = 0;
+                return;
+            }
+            let make = |label: &str, h: u32| {
+                self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d { width: self.quality.ring_bins + 2, height: h.max(1), depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.hdr,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+            };
+            let (ta, tb) = (make("shell pyramid A", heights[0]), make("shell pyramid B", heights[1]));
+            let (a, b) = (ta.create_view(&Default::default()), tb.create_view(&Default::default()));
+            log::debug!("shell pyramid: {r0_cap} list entries, {}+{} rows", heights[0], heights[1]);
+            self.pyr.tex = Some(PyramidTextures { a, b, _tex: [ta, tb], heights, r0_cap });
+            self.pyr.generation += 1;
+            self.pyr.bg = None;
+            self.rct_bg = None;
+        }
+        self.pyr.r0 = r0;
+        let key = (self.layout_version, speed.to_bits(), r0, self.pyr.generation);
+        let full = key != self.pyr.key || self.ranges.first() == Some(&[0, w.n_slots.min(self.atlas_rows)]);
+        if !full && w.t == self.pyr.t {
+            return;
+        }
+        self.pyr.key = key;
+        self.pyr.t = w.t;
+        self.pyr.ranges.clear();
+        let mut pos: Vec<u32> = vec![];
+        if !full {
+            for r in &self.ranges {
+                pos.extend((r[0]..r[1]).filter_map(|s| self.pyr.pos_of_slot.get(s as usize).copied()).filter(|&p| p != u32::MAX));
+            }
+            pos.extend_from_slice(&self.pyr.easing);
+            pos.sort_unstable();
+            pos.dedup();
+        }
+        for level in 1..=PYRAMID_LEVELS {
+            let start = self.pyr.ranges.len() as u32;
+            if full {
+                self.pyr.ranges.push([0, r0 >> level, level, 0]);
+            } else {
+                let mut rows: Vec<u32> = pos.iter().map(|p| p >> level).collect();
+                rows.dedup();
+                self.pyr.ranges.extend(coalesce(&mut rows).into_iter().map(|[a, b]| [a, b, level, 0]));
+            }
+            self.pyr.spans[level as usize] = (start, self.pyr.ranges.len() as u32);
+        }
+        if self.pyr.ranges.len() > self.pyr.ranges_cap {
+            self.pyr.ranges_cap = self.pyr.ranges.len() * 2;
+            self.pyr.ranges_buf = storage_buffer(&self.device, "shell pyramid ranges", (self.pyr.ranges_cap * 16) as u64);
+            self.pyr.bg = None;
+        }
+    }
+
+    /// Rebuilds the bind groups that hold the ring colour texture and the
+    /// shell image pyramid after any of them was reallocated.
+    fn ensure_texture_groups(&mut self) {
+        let dummy = &self.dummy.view;
+        let (pa, pb) = self.pyr.tex.as_ref().map_or((dummy, dummy), |t| (&t.a, &t.b));
+        if self.rct_bg.is_none() {
+            self.rct_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ring colours + shell pyramid"),
+                layout: &self.rct_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.rct_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.rct_sampler) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(pa) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(pb) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            }));
+        }
+        if self.pyr.bg.is_none()
+            && let Some(t) = &self.pyr.tex
+        {
+            let group = |label: &str, src: &wgpu::TextureView| {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(label),
+                    layout: &self.pyr.bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.rct_view) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.rct_sampler) },
+                        wgpu::BindGroupEntry { binding: 2, resource: self.ring_list_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(src) },
+                        wgpu::BindGroupEntry { binding: 4, resource: self.pyr.ranges_buf.as_entire_binding() },
+                    ],
+                })
+            };
+            self.pyr.bg = Some([group("shell pyramid: into A", &t.b), group("shell pyramid: into B", &t.a)]);
+        }
     }
 
     /// Refreshes `ring_list_buf` for world time `w.t` (once per world time,
@@ -981,20 +1192,35 @@ impl Renderer {
             return;
         }
         self.ring_list_key = (w.t, self.layout_version);
-        if n > self.ring_list_cap {
-            self.ring_list_cap = n * 5 / 4 + 64;
+        // Each shell's list is padded to aligned blocks (world.rs layer_index).
+        let len = w.layer_index.len() - list_at;
+        if len > self.ring_list_cap {
+            self.ring_list_cap = len * 5 / 4 + 64;
             self.ring_list_buf = storage_buffer(&self.device, "ring list", (self.ring_list_cap * 16) as u64);
             self.tower_bg = None;
+            self.pyr.bg = None;
         }
         let rows = self.atlas_rows as f32;
         let t = w.t;
         self.ring_list.clear();
-        for &ri in &w.layer_index[list_at..list_at + n] {
-            let r = &w.rings[ri as usize];
+        self.pyr.pos_of_slot.clear();
+        self.pyr.pos_of_slot.resize(self.atlas_rows as usize, u32::MAX);
+        self.pyr.easing.clear();
+        for (p, &ri) in w.layer_index[list_at..].iter().enumerate() {
+            let Some(r) = w.rings.get(ri as usize) else {
+                self.ring_list.push([0.0, 0.0, -1.0, 0.0]);
+                continue;
+            };
             // Mirrors ring_phase in tower_common.wgsl.
             let x = ((t as f32 - r.boost_t0) / BOOST_TAU).clamp(0.0, 1.0);
             let phase = r.phase0 as f64 + r.speed as f64 * t + (r.boost * x * x * (3.0 - 2.0 * x)) as f64;
             self.ring_list.push([(r.row as f32 + 0.5) / rows, phase.rem_euclid(1.0) as f32, ri as f32, 0.0]);
+            if let Some(s) = self.pyr.pos_of_slot.get_mut(r.row as usize) {
+                *s = p as u32;
+            }
+            if r.boost != 0.0 && (t as f32 - r.boost_t0) < BOOST_TAU + 0.5 {
+                self.pyr.easing.push(p as u32);
+            }
         }
         self.queue.write_buffer(&self.ring_list_buf, 0, bytemuck::cast_slice(&self.ring_list));
     }
@@ -1080,6 +1306,11 @@ impl Renderer {
                 (ATLAS_W / self.quality.ring_bins) as f32,
                 c.performance.upscale_sharpness.clamp(0.0, 1.0),
             ],
+            pyr: {
+                let heights = self.pyr.tex.as_ref().map_or([1, 1], |t| t.heights);
+                let phase = w.shell_speed().map_or(0.0, |s| (s as f64 * w.t).rem_euclid(1.0)) as f32;
+                [phase, self.pyr.r0 as f32, heights[0] as f32, heights[1] as f32]
+            },
             tower3: [
                 tw.shell_dim.clamp(0.0, 1.0),
                 tw.scan_every.0.max(0.0),
@@ -1187,6 +1418,26 @@ impl Renderer {
             drop(p);
             self.ranges.clear();
         }
+        // Shell image pyramid, level by level (each reads the one before).
+        if !self.pyr.ranges.is_empty()
+            && self.pyr.r0 > 0
+            && let (Some(t), Some(bgs)) = (&self.pyr.tex, &self.pyr.bg)
+        {
+            self.queue.write_buffer(&self.pyr.ranges_buf, 0, bytemuck::cast_slice(&self.pyr.ranges));
+            for level in 1..=PYRAMID_LEVELS {
+                let (a, b) = self.pyr.spans[level as usize];
+                if a == b {
+                    continue;
+                }
+                let odd = level % 2 == 1;
+                let mut p = pass(&mut enc, if odd { &t.a } else { &t.b }, false, "shell pyramid");
+                p.set_pipeline(&self.pyr.pipeline);
+                p.set_bind_group(0, &self.globals_bg, &[]);
+                p.set_bind_group(1, &bgs[if odd { 0 } else { 1 }], &[]);
+                p.draw(0..4, a..b);
+            }
+            self.pyr.ranges.clear();
+        }
 
         // Profiling aid: GITS_SKIP=tower,sprites,bloom skips passes.
         let skip = std::env::var("GITS_SKIP").unwrap_or_default();
@@ -1196,7 +1447,7 @@ impl Renderer {
             if let Some(tbg) = self.tower_bg.as_ref().filter(|_| !skip.contains("tower")) {
                 p.set_pipeline(&self.tower_pipeline);
                 p.set_bind_group(1, tbg, &[]);
-                p.set_bind_group(2, &self.rct_bg, &[]);
+                p.set_bind_group(2, self.rct_bg.as_ref().expect("texture groups"), &[]);
                 p.set_vertex_buffer(0, self.tower_vb.slice(..));
                 p.set_index_buffer(self.tower_ib.slice(..), wgpu::IndexFormat::Uint32);
                 p.draw_indexed(0..self.tower_index_count, 0, 0..self.n_bands);

@@ -22,6 +22,14 @@ const BAND_MERGE: f32 = 0.04;
 /// At most this many bands per layer (the merge distance grows until it fits).
 const MAX_BANDS_PER_LAYER: usize = 128;
 pub const LUT_BINS: usize = 16384;
+/// Levels of the shell image pyramid (renderer.rs): level L averages 2^L
+/// consecutive rings of a shell. Each shell's ring list starts at a multiple
+/// of 2^PYRAMID_LEVELS, so the pyramid's blocks never mix two shells.
+pub const PYRAMID_LEVELS: u32 = 8;
+/// With sectors, rings start at whole multiples of this fraction of a turn:
+/// a whole number of ring colour texture bins (256 or 1024 per turn), so the
+/// shell images are exact copies of the ring colour rows.
+pub const PHASE_QUANTUM: f32 = 1.0 / 256.0;
 /// The LUT buffer: LUT_BINS + 1 ring coordinates, then per height bin a bit
 /// mask of the depth shells that have rings there (as exact small floats).
 pub const LUT_LEN: usize = 2 * LUT_BINS + 1;
@@ -151,6 +159,8 @@ pub struct World {
     /// the layer it is drawing: for layer L and ring index i,
     /// `layer_index[L * (n + 1) + i]` is the position in the list (stored after
     /// the table, from `layers * (n + 1)`) of L's first ring at or after i.
+    /// Each layer's part of the list starts at a multiple of
+    /// 2^PYRAMID_LEVELS; the gaps hold u32::MAX.
     pub layer_index: Vec<u32>,
     pub layer_index_dirty: bool,
 
@@ -322,10 +332,15 @@ impl World {
         relayout
     }
 
+    /// With sectors, every ring's spin speed (turns per second); None without.
+    pub fn shell_speed(&self) -> Option<f32> {
+        self.cfg.tower.sectors.then(|| self.cfg.calm.spin_speed / 60.0)
+    }
+
     fn ring_speed(&self, ring: &layout::Ring) -> f32 {
-        if self.cfg.tower.sectors {
+        if let Some(s) = self.shell_speed() {
             // Sectors only line up if the whole tower turns as one.
-            return self.cfg.calm.spin_speed / 60.0;
+            return s;
         }
         let h = ring.hash();
         let sign = if hash01(h ^ 0xAB) < 0.5 { -1.0 } else { 1.0 };
@@ -473,7 +488,7 @@ impl World {
             if let Some(p) = persist.get(&r.key()) {
                 let mut g = p.gpu;
                 if self.cfg.tower.sectors {
-                    ease_to_sector(&mut g, r.turn0, self.t as f32);
+                    ease_to_sector(&mut g, quantize_turn(r.turn0), self.t as f32);
                 }
                 g.depth = depth;
                 g.first_seg = first_seg[i];
@@ -486,7 +501,7 @@ impl World {
                 self.rings.push(RingGpu {
                     depth,
                     speed: self.ring_speed(r),
-                    phase0: if self.cfg.tower.sectors { r.turn0 } else { hash01(h ^ 0x1234) + dir_hash * 0.3 },
+                    phase0: if self.cfg.tower.sectors { quantize_turn(r.turn0) } else { hash01(h ^ 0x1234) + dir_hash * 0.3 },
                     boost: 0.0,
                     boost_t0: -1.0e9,
                     hash: hash01(h ^ 0x77),
@@ -1257,7 +1272,12 @@ impl World {
     /// order and depths).
     fn update_layer_index(&mut self) {
         let layers = self.cfg.tower.depth_layers.max(1) as usize;
-        let idx = layer_index(self.layout.rings.iter().map(|r| (r.depth as usize).min(layers - 1)), self.layout.rings.len(), layers);
+        let idx = layer_index(
+            self.layout.rings.iter().map(|r| (r.depth as usize).min(layers - 1)),
+            self.layout.rings.len(),
+            layers,
+            1 << PYRAMID_LEVELS,
+        );
         self.layer_index = idx;
         self.layer_index_dirty = true;
     }
@@ -1315,6 +1335,10 @@ impl World {
     }
 }
 
+fn quantize_turn(x: f32) -> f32 {
+    (x / PHASE_QUANTUM).round() * PHASE_QUANTUM
+}
+
 /// Turns a ring (with sectors) toward its directory's sector start `turn0`:
 /// if the sector moved since the ring's last layout, the difference is eased
 /// in over BOOST_TAU with the spin-boost mechanism instead of jumping.
@@ -1331,16 +1355,16 @@ fn ease_to_sector(g: &mut RingGpu, turn0: f32, t: f32) {
 }
 
 /// See `World::layer_index`. `ring_layers` gives each ring's layer, in order.
-fn layer_index(ring_layers: impl Iterator<Item = usize> + Clone, n: usize, layers: usize) -> Vec<u32> {
+fn layer_index(ring_layers: impl Iterator<Item = usize> + Clone, n: usize, layers: usize, align: u32) -> Vec<u32> {
     let mut start = vec![0u32; layers + 1];
     for l in ring_layers.clone() {
         start[l + 1] += 1;
     }
     for l in 0..layers {
-        start[l + 1] += start[l];
+        start[l + 1] = (start[l] + start[l + 1]).div_ceil(align) * align;
     }
     let list_at = (layers * (n + 1)) as u32;
-    let mut idx = vec![0u32; layers * (n + 1) + n];
+    let mut idx = vec![u32::MAX; layers * (n + 1) + start[layers] as usize];
     let mut next: Vec<u32> = start[..layers].to_vec();
     for (i, l) in ring_layers.enumerate() {
         for (k, nx) in next.iter().enumerate() {
@@ -1492,7 +1516,7 @@ mod tests {
         // Rings 0..6 in layers 0 1 1 0 2 1 (3 layers).
         let ring_layers = [0usize, 1, 1, 0, 2, 1];
         let (n, layers) = (ring_layers.len(), 3);
-        let idx = layer_index(ring_layers.iter().copied(), n, layers);
+        let idx = layer_index(ring_layers.iter().copied(), n, layers, 4);
         let list_at = layers * (n + 1);
         // The rings of `layer` from ring index a up to (not including) b.
         let rings = |layer: usize, a: usize, b: usize| -> Vec<u32> {
@@ -1506,5 +1530,9 @@ mod tests {
         assert_eq!(rings(1, 2, 5), [2]);
         assert_eq!(rings(0, 1, 3), Vec::<u32>::new());
         assert_eq!(rings(2, 4, 5), [4]);
+        // Each layer's list starts at a multiple of the alignment.
+        for l in 0..layers {
+            assert_eq!((idx[l * (n + 1)] as usize - list_at) % 4, 0);
+        }
     }
 }

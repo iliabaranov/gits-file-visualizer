@@ -9,6 +9,10 @@
 
 @group(2) @binding(0) var ring_tex: texture_2d<f32>;
 @group(2) @binding(1) var ring_samp: sampler;
+// Shell image pyramid (pyramid.wgsl): odd levels in A, even levels in B.
+@group(2) @binding(2) var pyr_a: texture_2d<f32>;
+@group(2) @binding(3) var pyr_b: texture_2d<f32>;
+@group(2) @binding(4) var pyr_samp: sampler;
 
 // Rings closer than this many per pixel start using the dense path.
 const DENSE_FROM: f32 = 0.7;
@@ -115,6 +119,76 @@ fn dense(lo: f32, hi: f32, p0: u32, p1: u32, turn0: f32, max_taps: f32) -> vec3<
     return acc * (G.tower2.z * f32(stride) / max(dr, 1e-3));
 }
 
+// Colour of the ring at list position `p` (absolute index into layer_index)
+// at world angle `turn0`, and in w its ring index.
+fn ring_at(p: u32, list_at: u32, turn0: f32) -> vec4<f32> {
+    let e = ring_list[p - list_at];
+    return vec4<f32>(textureSampleLevel(ring_tex, ring_samp, vec2<f32>(fract(turn0 - e.y), e.x), 0.0).rgb, e.z);
+}
+
+// Average colour of `2^level` rings starting at list block `row`, at shell angle `us`.
+fn pyr_at(level: u32, row: u32, us: f32) -> vec3<f32> {
+    let bins = G.rct.y;
+    let x = (1.0 + us * bins) / (bins + 2.0);
+    let y = f32(pyr_y0(level, u32(G.pyr.y)) + row) + 0.5;
+    if ((level & 1u) == 1u) {
+        return textureSampleLevel(pyr_a, pyr_samp, vec2<f32>(x, y / G.pyr.z), 0.0).rgb;
+    }
+    return textureSampleLevel(pyr_b, pyr_samp, vec2<f32>(x, y / G.pyr.w), 0.0).rgb;
+}
+
+// Most blocks read per pixel and shell by dense_cached (enough for footprints
+// of ~2000 rings; beyond, the rest is extrapolated).
+const PYR_MAX_STEPS: u32 = 24u;
+
+// The same box filter as `dense`, exact and cheaper when the whole tower
+// turns as one: the two partly covered rings at the ends come from the ring
+// colour texture, the fully covered ones in between from the shell image
+// pyramid, as aligned blocks of 1, 2, 4 … 256 rings.
+fn dense_cached(layer: u32, lo: f32, hi: f32, turn0: f32) -> vec3<f32> {
+    let n = u32(G.lut.y);
+    let list_at = u32(G.tower2.x) * (n + 1u);
+    let end = layer_index[layer * (n + 1u) + n];
+    let fl = floor(lo);
+    let fh = floor(hi);
+    var acc = vec3<f32>(0.0);
+    let pa = layer_pos(layer, fl);
+    if (pa < end) {
+        let c = ring_at(pa, list_at, turn0);
+        if (c.w == fl) {
+            acc += c.rgb * (min(hi, fl + 1.0) - lo);
+        }
+    }
+    if (fh > fl) {
+        let pb = layer_pos(layer, fh);
+        if (pb < end) {
+            let c = ring_at(pb, list_at, turn0);
+            if (c.w == fh) {
+                acc += c.rgb * (hi - fh);
+            }
+        }
+    }
+    let q0 = layer_pos(layer, fl + 1.0) - list_at;
+    let q1 = layer_pos(layer, fh) - list_at;
+    let us = fract(turn0 - G.pyr.x);
+    var a = q0;
+    for (var k = 0u; k < PYR_MAX_STEPS && a < q1; k++) {
+        var level = select(firstTrailingBit(a), PYRAMID_LEVELS, a == 0u);
+        level = min(min(level, PYRAMID_LEVELS), firstLeadingBit(q1 - a));
+        if (level == 0u) {
+            acc += ring_at(a + list_at, list_at, turn0).rgb;
+        } else {
+            acc += pyr_at(level, a >> level, us) * f32(1u << level);
+        }
+        a += 1u << level;
+    }
+    if (a < q1) {
+        acc *= f32(q1 - q0 + 2u) / f32(a - q0 + 2u);
+    }
+    // Packed rings cover `fill` of their pitch.
+    return acc * (G.tower2.z / max(hi - lo, 1e-3));
+}
+
 @fragment
 fn fs_tower(in: TowerOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     let h = G.tower.x;
@@ -153,8 +227,12 @@ fn fs_tower(in: TowerOut, @builtin(front_facing) front: bool) -> @location(0) ve
         acc += exact(in, r, turn0, pitch, ds_px, dturn_px, t) * (1.0 - w);
     }
     if (w > 0.0) {
-        let taps = select(max(G.times2.w * 0.5, 1.0), G.times2.w, front || G.tower2.w > 0.99);
-        acc += dense(r - 0.5 * dr_px, r + 0.5 * dr_px, p0, p1, turn0, taps) * w;
+        if (G.pyr.y > 0.0) {
+            acc += dense_cached(in.layer, r - 0.5 * dr_px, r + 0.5 * dr_px, turn0) * w;
+        } else {
+            let taps = select(max(G.times2.w * 0.5, 1.0), G.times2.w, front || G.tower2.w > 0.99);
+            acc += dense(r - 0.5 * dr_px, r + 0.5 * dr_px, p0, p1, turn0, taps) * w;
+        }
     }
     if (!front) {
         acc *= G.tower2.w;
