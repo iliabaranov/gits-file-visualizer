@@ -116,6 +116,9 @@ enum Cmd {
         /// Print every phase change of the work session.
         #[arg(long)]
         timeline: bool,
+        /// Break the tower down by depth shell (what each shell holds) and exit.
+        #[arg(long)]
+        shells: bool,
     },
     /// Print the built-in default configuration.
     DefaultConfig,
@@ -178,14 +181,99 @@ fn main() -> Result<()> {
                 .collect::<Result<Vec<(u32, u32)>>>()?;
             snapshot::loadtest(cfg, sizes, seconds, collector)
         }
-        Cmd::Stats { minutes, timeline } => {
-            stats(cfg, minutes, timeline, collector);
+        Cmd::Stats { minutes, timeline, shells } => {
+            stats(cfg, minutes, timeline, shells, collector);
             Ok(())
         }
         Cmd::GpuCheck => gpu::check(),
         Cmd::DefaultConfig => {
             print!("{}", gits_core::config::DEFAULT_TOML);
             Ok(())
+        }
+    }
+}
+
+/// What each depth shell of the tower holds: rings, files, collapsed folders,
+/// share of the tower's height, and the folders contributing most.
+fn print_shells(w: &world::World) {
+    use gits_core::layout::SegSource;
+    let m = &w.model;
+    let tw = &w.cfg.tower;
+    let layers = tw.depth_layers.max(1) as usize;
+    let h = tw.height;
+    // Files below a folder, including subfolders.
+    fn subtree_files(m: &gits_core::model::Model, d: u32) -> usize {
+        let dir = &m.dirs[d as usize];
+        dir.files.iter().filter(|&&f| m.is_live(f)).count() + dir.dirs.iter().map(|&c| subtree_files(m, c)).sum::<usize>()
+    }
+    // A folder's path cut to its first `n` components below ~.
+    let prefix = |d: u32, n: usize| -> String { m.dir_path(d).split('/').take(n + 1).collect::<Vec<_>>().join("/") };
+    #[derive(Default)]
+    struct Shell {
+        rings: usize,
+        dirs: std::collections::BTreeSet<u32>,
+        files: usize,
+        aggs: usize,
+        agg_files: usize,
+        height: f32,
+        top: f32,
+        by_prefix: std::collections::HashMap<String, usize>,
+        by_deep: std::collections::HashMap<String, usize>,
+    }
+    let mut shells: Vec<Shell> = (0..layers).map(|_| Shell { top: f32::MAX, ..Default::default() }).collect();
+    for (i, r) in w.layout.rings.iter().enumerate() {
+        let s = &mut shells[(r.depth as usize).min(layers - 1)];
+        s.rings += 1;
+        s.dirs.insert(r.dir);
+        s.height += w.ring_pitch.get(i).copied().unwrap_or(0.0);
+        s.top = s.top.min(w.ring_s.get(i).copied().unwrap_or(0.0));
+        *s.by_prefix.entry(prefix(r.dir, 2)).or_default() += 1;
+        *s.by_deep.entry(prefix(r.dir, 5)).or_default() += 1;
+    }
+    for seg in &w.layout.segments {
+        let Some(r) = w.layout.rings.get(seg.ring as usize) else { continue };
+        let s = &mut shells[(r.depth as usize).min(layers - 1)];
+        match seg.source {
+            SegSource::File(_) => s.files += 1,
+            SegSource::Agg(d) => {
+                s.aggs += 1;
+                s.agg_files += subtree_files(m, d);
+            }
+            SegSource::Dir(_) => {}
+        }
+    }
+    println!();
+    println!("shell  depth  radius  folders  rings  files   collapsed (files inside)  height  starts at");
+    for (l, s) in shells.iter().enumerate() {
+        let radius = tw.inner_radius + (tw.radius - tw.inner_radius) * l as f32 / (layers - 1).max(1) as f32;
+        let depth = if l + 1 == layers { format!("{l}+") } else { format!("{l}") };
+        println!(
+            "{l:>5}  {depth:>5}  {radius:>6.2}  {:>7}  {:>5}  {:>6}  {:>7} ({:>8})          {:>4.0}%  {:>5.0}%",
+            s.dirs.len(),
+            s.rings,
+            s.files,
+            s.aggs,
+            s.agg_files,
+            s.height / h * 100.0,
+            if s.top == f32::MAX { 0.0 } else { s.top / h * 100.0 },
+        );
+    }
+    for (l, s) in shells.iter().enumerate().rev().take(2) {
+        let mut top: Vec<(&String, &usize)> = s.by_prefix.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1));
+        println!();
+        println!("shell {l}: rings by folder");
+        for (p, n) in top.iter().take(12) {
+            println!("  {n:>5}  {p}");
+        }
+    }
+    if let Some(s) = shells.last() {
+        let mut top: Vec<(&String, &usize)> = s.by_deep.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1));
+        println!();
+        println!("shell {}: rings by folder, 5 levels down", layers - 1);
+        for (p, n) in top.iter().take(20) {
+            println!("  {n:>5}  {p}");
         }
     }
 }
@@ -214,7 +302,7 @@ fn resolve_source(requested: &str, socket: &std::path::Path) -> Result<(Option<P
     }
 }
 
-fn stats(cfg: Config, minutes: f64, timeline: bool, collector: Option<PathBuf>) {
+fn stats(cfg: Config, minutes: f64, timeline: bool, shells: bool, collector: Option<PathBuf>) {
     let live = collector.is_some();
     let mut w = world::World::new(cfg, 16384, collector);
     if live {
@@ -228,6 +316,11 @@ fn stats(cfg: Config, minutes: f64, timeline: bool, collector: Option<PathBuf>) 
     println!("files:       {}", w.model.live_file_count());
     println!("rings:       {}", w.rings.len());
     println!("segments:    {}", w.segs.len());
+    if shells {
+        w.step(0.5);
+        print_shells(&w);
+        return;
+    }
     let mut phases = std::collections::BTreeMap::<&str, f64>::new();
     let dt = 1.0 / 24.0;
     let steps = (minutes * 60.0 / dt) as usize;
