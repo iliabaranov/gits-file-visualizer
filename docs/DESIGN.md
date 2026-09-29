@@ -67,8 +67,9 @@ still of the ship sequence.
    following the probe.
 8. **Calligraphy walls** (`ship-sequence-zeami-verse.jpg`, from the ship
    interior, not the hack itself). Gold vertical columns of Zeami's verse
-   生死去来 棚頭傀儡 一線断時 落落磊磊, "…puppets on a shelf; when the one string
-   is cut, they collapse and scatter". Possible optional backdrop.
+   生死去来 棚頭傀儡 一線断時 落落磊磊: "Life and death come and go / like
+   marionettes dancing on a table. / Once their strings are cut, / they easily
+   collapse". Possible optional backdrop.
 
 **Palette:** warm black; amber-gold (main); cream-white (hottest); orange;
 crimson (alarm/infected); teal/cyan (environment only). Heavy bloom/halation,
