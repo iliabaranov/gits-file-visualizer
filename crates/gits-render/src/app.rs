@@ -132,8 +132,12 @@ pub fn main_output(sizes: &[(u32, u32)], compositions: &[Composition]) -> usize 
 /// Control lines from the GNOME extension (wallpaper mode, stdin).
 #[derive(Debug)]
 pub enum Control {
-    /// `visible INDEX 0|1`: whether the monitor's wallpaper can be seen.
+    /// `visible INDEX 0|1`: whether the monitor's wallpaper can be seen
+    /// (older extensions).
     Visible(i32, bool),
+    /// `coverage INDEX FRACTION`: share of the monitor's work area covered by
+    /// windows (0 in the overview). Paused at `[performance] pause_when_covered`.
+    Coverage(i32, f32),
     /// `locked 0|1`: screen locked (nothing drawn).
     Locked(bool),
     /// `sharing 0|1`: a screencast or screen share is running.
@@ -147,6 +151,7 @@ fn parse_control(line: &str) -> Option<Control> {
     let flag = |s: Option<&str>| s.map(|v| v == "1");
     match it.next()? {
         "visible" => Some(Control::Visible(it.next()?.parse().ok()?, flag(it.next())?)),
+        "coverage" => Some(Control::Coverage(it.next()?.parse().ok()?, it.next()?.parse::<f32>().ok()?.clamp(0.0, 1.0))),
         "locked" => Some(Control::Locked(flag(it.next())?)),
         "sharing" => Some(Control::Sharing(flag(it.next())?)),
         "quit" => Some(Control::Quit),
@@ -191,11 +196,27 @@ struct Output {
     worst_gap: Duration,
     /// Save the next presented frame (see `capture_request`).
     capture: bool,
+    /// Share of the monitor covered by windows, and whether that is enough
+    /// to pause it (`[performance] pause_when_covered`).
+    coverage: f32,
+    covered: bool,
 }
 
 impl Output {
     fn paused(&self, locked: bool) -> bool {
-        locked || !self.visible
+        locked || !self.visible || self.covered
+    }
+
+    fn set_coverage(&mut self, coverage: f32, threshold: f32) {
+        self.coverage = coverage;
+        let covered = coverage >= threshold.clamp(0.05, 1.0) - 1e-4;
+        if covered != self.covered {
+            log::info!("{}: {} ({:.0}% covered by windows)", self.spec.name, if covered { "paused" } else { "resumed" }, coverage * 100.0);
+            self.covered = covered;
+            if !covered {
+                self.next_frame = Instant::now();
+            }
+        }
     }
 }
 
@@ -378,6 +399,8 @@ impl App {
                 stats_since: now,
                 worst_gap: Duration::ZERO,
                 capture: false,
+                coverage: 0.0,
+                covered: false,
             });
         }
 
@@ -436,6 +459,9 @@ impl App {
                     Some(Notice { text: format!("config reloaded: {}", path.display()), error: false, until: s.world.t + 3.0 });
                 let (scale, max_mp) = scene_scale(&self.cfg.performance, self.opts.wallpaper, s.integrated);
                 set_system_monitor(&mut s.outputs, &self.cfg);
+                for o in &mut s.outputs {
+                    o.set_coverage(o.coverage, self.cfg.performance.pause_when_covered);
+                }
                 if self.cfg.system_monitor.show != "off" && s.renderer.sysmon.is_none() {
                     s.renderer.sysmon = Some(crate::sysmon::SysMon::start(s.gpu.adapter.get_info().vendor));
                 }
@@ -514,7 +540,7 @@ impl App {
         };
         let out = tex.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let aspect = o.surface_cfg.width as f32 / o.surface_cfg.height.max(1) as f32;
-        let cam = Camera::new(o.composition, aspect, &s.world.cfg.tower, s.world.y_top(), s.world.cfg.camera.drift, s.world.t as f32);
+        let cam = Camera::new(o.composition, aspect, &s.world.cfg, s.world.y_top(), s.world.t as f32);
         let _ = real_dt;
         s.renderer.render(&mut o.view, &mut s.world, &cam, &out, frame_dt.as_secs_f32());
         if std::mem::take(&mut o.capture) {
@@ -599,6 +625,14 @@ impl ApplicationHandler<Control> for App {
                     if v {
                         o.next_frame = Instant::now();
                     }
+                }
+            }
+            Control::Coverage(index, f) => {
+                let threshold = self.cfg.performance.pause_when_covered;
+                if let Some(s) = &mut self.state
+                    && let Some(o) = s.outputs.iter_mut().find(|o| o.spec.index == index)
+                {
+                    o.set_coverage(f, threshold);
                 }
             }
         }
@@ -724,6 +758,7 @@ mod tests {
     #[test]
     fn control_lines_parse() {
         assert!(matches!(parse_control("visible 1 0"), Some(Control::Visible(1, false))));
+        assert!(matches!(parse_control("coverage 2 0.87"), Some(Control::Coverage(2, f)) if (f - 0.87).abs() < 1e-6));
         assert!(matches!(parse_control("locked 1"), Some(Control::Locked(true))));
         assert!(matches!(parse_control("sharing 0"), Some(Control::Sharing(false))));
         assert!(parse_control("bogus").is_none());

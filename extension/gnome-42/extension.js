@@ -6,9 +6,10 @@
  * actor for its monitor: desktop, overview workspaces and workspace-switch
  * animations. The lock screen keeps its normal wallpaper.
  *
- * It also tells the renderer, over its stdin, which monitors are covered by
- * windows (so it stops drawing them), when the screen is locked, and when a
- * screencast or screen share is running (file names can be obfuscated then).
+ * It also tells the renderer, over its stdin, how much of each monitor is
+ * covered by windows (it stops drawing mostly covered ones), when the screen
+ * is locked, and when a screencast or screen share is running (file names can
+ * be obfuscated then).
  */
 'use strict';
 
@@ -28,9 +29,9 @@ const EXIT_RESTART = 75;
 const RESPAWN_WINDOW_US = 5 * 60 * 1000000;
 const VISIBILITY_DEBOUNCE_MS = 150;
 const VISIBILITY_POLL_S = 3;
-// Sample grid used to decide whether a monitor's work area is fully covered.
-const GRID_X = 16;
-const GRID_Y = 10;
+// Sample grid used to measure how much of a monitor's work area is covered.
+const GRID_X = 32;
+const GRID_Y = 18;
 
 function info(msg) {
     log(`[gits] ${msg}`);
@@ -491,18 +492,20 @@ class Extension {
             .map(w => w.get_frame_rect());
     }
 
-    _covered(monitorIndex, rects) {
+    /* Share (0..1) of the monitor's work area under the given window rects. */
+    _coverage(monitorIndex, rects) {
         const a = Main.layoutManager.getWorkAreaForMonitor(monitorIndex);
         const inside = (x, y) => rects.some(r => x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height);
+        let covered = 0;
         for (let j = 0; j < GRID_Y; j++) {
             for (let i = 0; i < GRID_X; i++) {
                 const x = a.x + Math.floor((i + 0.5) * a.width / GRID_X);
                 const y = a.y + Math.floor((j + 0.5) * a.height / GRID_Y);
-                if (!inside(x, y))
-                    return false;
+                if (inside(x, y))
+                    covered++;
             }
         }
-        return true;
+        return covered / (GRID_X * GRID_Y);
     }
 
     _send(key, line) {
@@ -521,12 +524,9 @@ class Extension {
         const overview = Main.overview.visible;
         const rects = overview ? [] : this._occluders();
         for (const m of Main.layoutManager.monitors) {
-            const visible = overview || !this._covered(m.index, rects);
-            const key = `visible ${m.index}`;
-            const line = `${key} ${visible ? 1 : 0}`;
-            if (this._sent.has(key) && this._sent.get(key) !== line)
-                info(`monitor ${m.index} ${visible ? 'visible' : 'covered'} (${rects.length} windows)`);
-            this._send(key, line);
+            // The renderer decides what counts as mostly covered (its config).
+            const coverage = overview ? 0 : this._coverage(m.index, rects);
+            this._send(`coverage ${m.index}`, `coverage ${m.index} ${coverage.toFixed(2)}`);
         }
     }
 

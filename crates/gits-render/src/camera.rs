@@ -1,7 +1,7 @@
 //! Fixed per-monitor compositions. The camera is deliberately still: all motion
 //! comes from the data (see docs/DESIGN.md §5.4).
 
-use gits_core::config::Tower;
+use gits_core::config::{Config, Tower};
 use glam::{Mat4, Vec3};
 
 /// A camera framing taken from the film's shots.
@@ -30,24 +30,16 @@ impl Composition {
         }
     }
 
-    /// "auto" for a set of outputs `(width, height)`: portrait screens get the
-    /// drum close-up, the largest landscape screen the wide shot, and other
-    /// landscape screens the dial.
+    /// "auto" for a set of outputs `(width, height)`: portrait screens (a tall
+    /// frame suits the tall tower) and the largest landscape screen get the
+    /// wide shot of the whole tower; other landscape screens the dial.
     pub fn auto(outputs: &[(u32, u32)]) -> Vec<Self> {
         let largest =
             outputs.iter().enumerate().filter(|(_, (w, h))| w >= h).max_by_key(|(_, (w, h))| *w as u64 * *h as u64).map(|(i, _)| i);
         outputs
             .iter()
             .enumerate()
-            .map(|(i, (w, h))| {
-                if h > w {
-                    Self::Drum
-                } else if Some(i) == largest || outputs.len() == 1 {
-                    Self::Wide
-                } else {
-                    Self::Dial
-                }
-            })
+            .map(|(i, (w, h))| if h > w || Some(i) == largest || outputs.len() == 1 { Self::Wide } else { Self::Dial })
             .collect()
     }
 }
@@ -55,18 +47,16 @@ impl Composition {
 const WIDE_FOV: f32 = 43.0;
 /// From the target toward the wide camera: 23° above the horizontal.
 const WIDE_DIR: Vec3 = Vec3::new(0.0, 0.3907, 0.9205);
-/// Largest |NDC| the tower may reach in the wide shot (the rest is margin).
-const WIDE_FILL: [f32; 2] = [0.9, 0.92];
-
 /// Distance and target height at which the whole tower (and the floor lights
-/// around its foot) fills the wide shot, centred. Cached: it depends only on
-/// the screen shape and the tower's size.
-fn wide_fit(aspect: f32, tower: &Tower, y_top: f32) -> (f32, f32) {
-    type Key = [u32; 4];
+/// around its foot) fills the wide shot, centred, reaching at most `fill`
+/// (x, y) of the screen in NDC. Cached: it depends only on the screen shape,
+/// the tower's size and `fill`.
+fn wide_fit(aspect: f32, tower: &Tower, y_top: f32, fill: [f32; 2]) -> (f32, f32) {
+    type Key = [u32; 6];
     thread_local! {
         static CACHE: std::cell::RefCell<Vec<(Key, (f32, f32))>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    let key = [aspect.to_bits(), tower.radius.to_bits(), tower.height.to_bits(), y_top.to_bits()];
+    let key = [aspect.to_bits(), tower.radius.to_bits(), tower.height.to_bits(), y_top.to_bits(), fill[0].to_bits(), fill[1].to_bits()];
     if let Some(v) = CACHE.with(|c| c.borrow().iter().find(|(k, _)| *k == key).map(|e| e.1)) {
         return v;
     }
@@ -96,7 +86,7 @@ fn wide_fit(aspect: f32, tower: &Tower, y_top: f32) -> (f32, f32) {
         let (mut lo, mut hi) = (f32::MAX, f32::MIN);
         for p in &points {
             let q = vp * p.extend(1.0);
-            if q.w <= 1e-3 || (q.x / q.w).abs() > WIDE_FILL[0] {
+            if q.w <= 1e-3 || (q.x / q.w).abs() > fill[0] {
                 return None;
             }
             lo = lo.min(q.y / q.w);
@@ -112,7 +102,7 @@ fn wide_fit(aspect: f32, tower: &Tower, y_top: f32) -> (f32, f32) {
         for _ in 0..28 {
             let mid = 0.5 * (near + far);
             match extent(&cam(mid, target_y)) {
-                Some((lo, hi)) if lo >= -WIDE_FILL[1] && hi <= WIDE_FILL[1] => far = mid,
+                Some((lo, hi)) if lo >= -fill[1] && hi <= fill[1] => far = mid,
                 _ => near = mid,
             }
         }
@@ -143,9 +133,17 @@ pub struct Camera {
 }
 
 impl Camera {
-    pub fn new(c: Composition, aspect: f32, tower: &Tower, y_top: f32, drift: f32, t: f32) -> Self {
+    pub fn new(c: Composition, aspect: f32, cfg: &Config, y_top: f32, t: f32) -> Self {
+        let (tower, drift) = (&cfg.tower, cfg.camera.drift);
         match c {
-            Composition::Wide => Self::wide(aspect, tower, y_top, drift, t),
+            Composition::Wide => {
+                let fill = if aspect < 1.0 {
+                    [cfg.camera.wide_fill_portrait.clamp(0.2, 1.0), cfg.camera.wide_fill.clamp(0.2, 1.0)]
+                } else {
+                    [0.9, cfg.camera.wide_fill.clamp(0.2, 1.0)]
+                };
+                Self::wide(aspect, tower, fill, y_top, drift, t)
+            }
             Composition::Drum => Self::drum(aspect, tower, y_top, drift, t),
             Composition::Dial => Self::dial(aspect, tower, y_top, drift, t),
         }
@@ -159,8 +157,8 @@ impl Camera {
     /// The "wide tower" composition from the film's establishing shot: the
     /// whole tower, top to floor lights, looking down on it (~23°) so the rings
     /// read as ellipses. The distance is fitted to the screen's shape.
-    pub fn wide(aspect: f32, tower: &Tower, y_top: f32, drift: f32, t: f32) -> Self {
-        let (dist, target_y) = wide_fit(aspect, tower, y_top);
+    pub fn wide(aspect: f32, tower: &Tower, fill: [f32; 2], y_top: f32, drift: f32, t: f32) -> Self {
+        let (dist, target_y) = wide_fit(aspect, tower, y_top, fill);
         let a = Self::drift_angle(drift, t);
         let eye = Vec3::new(a.sin(), 0.0, a.cos()) * (dist * WIDE_DIR.z) + Vec3::Y * (target_y + dist * WIDE_DIR.y);
         Self { eye, target: Vec3::new(0.0, target_y, 0.0), up: Vec3::Y, fov_y: WIDE_FOV.to_radians(), aspect, inside: false }
@@ -229,7 +227,7 @@ mod tests {
     fn auto_assignment() {
         // This machine: 1920x1200, 3840x2160, 1440x2560 (portrait).
         let c = Composition::auto(&[(1920, 1200), (3840, 2160), (1440, 2560)]);
-        assert_eq!(c, vec![Composition::Dial, Composition::Wide, Composition::Drum]);
+        assert_eq!(c, vec![Composition::Dial, Composition::Wide, Composition::Wide]);
         assert_eq!(Composition::auto(&[(1920, 1080)]), vec![Composition::Wide]);
     }
 
@@ -239,7 +237,7 @@ mod tests {
         let tower = &cfg.tower;
         let y_top = tower.height - 3.2;
         for (w, h) in [(3840.0, 2160.0), (1920.0, 1200.0), (1080.0, 1920.0), (5120.0, 1440.0)] {
-            let cam = Camera::wide(w / h, tower, y_top, 0.0, 0.0);
+            let cam = Camera::new(Composition::Wide, w / h, &cfg, y_top, 0.0);
             let (mut lo, mut hi) = (f32::MAX, f32::MIN);
             for i in 0..64 {
                 let a = std::f32::consts::TAU * i as f32 / 64.0;

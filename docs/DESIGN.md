@@ -611,6 +611,28 @@ caches, ESP-IDF build trees, uv's Pythons, pnpm's store. Changes:
   ~1.6k rings. Deep folders are simply the majority of any home, so the
   outermost shell stays the largest.
 
+### Look pass: folder slices, gold resting colours, portrait framing (2026-09-28)
+
+- Folder slices (`[tower] sectors`): each expanded folder gets an angular
+  sector inside its parent's (∝ content^`sector_weight`, at least
+  `min_sector`), like a sunburst. Only one folder shows at any height (the
+  height→ring lookup), so strict slices leave the tower mostly dark; each
+  folder's rings therefore cover at least `sector_fill` (0.6) of the circle,
+  centred on its slice. A true sunburst needs siblings side by side at the
+  same height (several rings per height per shell), which the renderer can't
+  draw yet. With sectors the tower turns as one (sectors must stay aligned);
+  rings ease to a moved sector over 12 s; write spin boosts are off.
+- Resting colours: old = deep gold, stale = dim bronze (was orange / brown).
+- Portrait screens get the whole tower (`auto`); `[camera] wide_fill`,
+  `wide_fill_portrait` set how much of the screen it fills.
+- `shell_dim`: an outer shell's near side is dimmed where inner shells are
+  behind it (per-height shell mask appended to the LUT buffer).
+- Optional scan band (`scan_every`, off by default).
+- Pausing: the extension reports each monitor's covered share; the renderer
+  pauses at `[performance] pause_when_covered` (0.8).
+- From the GPU review: the dense path reads a precomputed per-shell ring list
+  (phases in f64), and the upscale uses textureGather: about -27% GPU time.
+
 ### Efficiency backlog
 
 - Tower fragment shader is ~65% of GPU time: cheaper samples in the dense drum,

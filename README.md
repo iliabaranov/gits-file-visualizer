@@ -50,9 +50,10 @@ and back in once; the script says when that is needed. The extension:
 - keeps the renderer's windows out of the dock, alt-tab and the overview;
 - pauses a monitor while windows cover it, and everything while the screen is
   locked;
-- picks a view per monitor (`[monitors]`, default `auto`): the portrait screen
-  gets the drum close-up, the largest landscape screen the wide tower, others the
-  top-down dial;
+- picks a view per monitor (`[monitors]`, default `auto`): the largest landscape
+  screen and portrait screens get the whole tower, others the top-down dial;
+- pauses a monitor once windows cover most of it (`[performance]
+  pause_when_covered`, 80%);
 - can switch file names to hex codes while a screencast or screen share is
   running (`[privacy] obfuscate_when_sharing = true`; off by default);
 - restarts the renderer if it crashes (at most 5 times in 5 minutes) and when

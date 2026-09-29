@@ -48,8 +48,9 @@ ghost_hours = 3.0           # faint crimson ghost left in the gap
 
 [age]                       # idle colour by modification age
 fresh      = "gold"
-old        = "orange"
-stale      = "#5a3a14"
+old        = "#e0961c"      # deep gold (was "orange": most files are old, so the tower
+                            # looked orange; the film's is gold, with colour for activity)
+stale      = "#6a4818"      # dim bronze
 fresh_days = 1.0
 old_days   = 30.0
 stale_days = 365.0
@@ -70,6 +71,15 @@ height          = 12.0      # world units
 radius          = 3.75      # outermost shell
 inner_radius    = 1.3       # shell of the root folder's files
 depth_layers    = 8         # distinct shells (deeper folders share the outermost)
+sectors         = true      # each folder gets its own slice of the circle inside its parent's
+                            # (a sunburst, like Filelight): from above a ring chart, from the
+                            # side a folder's files on one face. The tower then turns as one.
+sector_weight   = 0.5       # slice size ~ (how much the folder holds)^this: 0 = equal slices,
+                            # 1 = proportional (big folders dominate)
+min_sector      = 0.04      # narrowest slice, in turns (0.04 = 14°)
+sector_fill     = 0.6       # each folder's rings still cover at least this share of the circle,
+                            # centred on its slice (only one folder shows at any height, so thin
+                            # slices leave the tower dark). 0 = strict slices, 1 = full rings
 max_tree_share  = 0.1       # no folder (with everything inside it) takes more than this share
                             # of the ring budget; beyond it, its least recently changed
                             # subfolders show as dashed arcs (they still flash when used).
@@ -85,6 +95,11 @@ fill_open       = 0.22      # ribbon thickness as a fraction of pitch, when unwo
 idle_wound      = 0.62      # idle brightness inside the packed drum
 idle_open       = 0.95      # idle brightness of an unwound ring
 back_face       = 0.38      # brightness of the far side of the tower
+shell_dim       = 0.7       # brightness of an outer shell's near side where inner shells are
+                            # behind it, so the nesting reads (1.0 = no dimming)
+scan_every      = "0"       # a soft band of light travels up the tower this often, e.g. "2m" (0 = off)
+scan_duration   = "20s"     # time for the band to travel from bottom to top
+scan_brightness = 0.6       # how much the band brightens the rings it passes
 
 [labels]                    # callouts naming the files being touched
 max        = 36             # at most this many at once
@@ -105,17 +120,21 @@ floor_lights           = true
 
 [camera]
 drift               = 0.0   # 0 = perfectly still; 1 = maximum gentle drift
+wide_fill           = 0.92  # wide shot: share of the screen height the whole tower fills
+wide_fill_portrait  = 0.66  # wide shot on portrait screens: share of the width (room for labels)
 rotate_compositions = "off" # or a duration such as "3h"
 
 [monitors."*"]
-composition = "auto"        # wide | drum | dial | auto. auto: portrait screens get the drum
-                            # close-up, the largest landscape screen the wide shot, others the dial
+composition = "auto"        # wide | drum | dial | auto. auto: the largest landscape screen and
+                            # portrait screens get the whole tower (wide), others the dial
 
 [performance]
 # Frames are paced by the compositor (one per display refresh, up to `fps`),
 # and all motion advances by real elapsed time, so movement is smooth and steady.
 fps          = 60
 fps_battery  = 30           # cap while running on battery
+pause_when_covered = 0.8    # a monitor stops drawing once windows cover this share of it
+                            # (1.0 = only when completely covered)
 gpu          = "auto"       # auto | discrete | integrated. auto: the discrete GPU
                             # (e.g. NVIDIA) when on mains power, otherwise integrated
 # The tower and chamber are drawn at `render_scale` of each monitor's resolution

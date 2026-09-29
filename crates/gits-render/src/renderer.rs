@@ -14,7 +14,7 @@ use crate::camera::Camera;
 use crate::fx;
 use crate::gpu_types::{Globals, RingGpu, SegmentGpu, SpriteVertex};
 use crate::text::GlyphAtlas;
-use crate::world::{ATLAS_W, BOOST_TAU, LUT_BINS, World};
+use crate::world::{ATLAS_W, BOOST_TAU, LUT_BINS, LUT_LEN, World};
 use anyhow::Result;
 use wgpu::util::DeviceExt;
 
@@ -663,7 +663,7 @@ impl Renderer {
             seg_buf: storage_buffer(&device, "segments", (seg_cap * std::mem::size_of::<SegmentGpu>()) as u64),
             ring_buf: storage_buffer(&device, "rings", (ring_cap * std::mem::size_of::<RingGpu>()) as u64),
             open_buf: storage_buffer(&device, "ring open", (ring_cap * 4) as u64),
-            lut_buf: storage_buffer(&device, "lut", ((LUT_BINS + 1) * 4) as u64),
+            lut_buf: storage_buffer(&device, "lut", (LUT_LEN * 4) as u64),
             bands_buf: storage_buffer(&device, "layer bands", 16 * 16),
             layer_index_buf: storage_buffer(&device, "layer index", 16),
             layer_index_cap: 4,
@@ -1079,6 +1079,12 @@ impl Renderer {
                 self.quality.ring_bins as f32,
                 (ATLAS_W / self.quality.ring_bins) as f32,
                 c.performance.upscale_sharpness.clamp(0.0, 1.0),
+            ],
+            tower3: [
+                tw.shell_dim.clamp(0.0, 1.0),
+                tw.scan_every.0.max(0.0),
+                tw.scan_duration.0.max(0.5).min(tw.scan_every.0.max(0.5)),
+                tw.scan_brightness.max(0.0),
             ],
         }
     }

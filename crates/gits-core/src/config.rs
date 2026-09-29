@@ -119,6 +119,14 @@ pub struct Tower {
     pub inner_radius: f32,
     pub depth_layers: u32,
     pub max_tree_share: f32,
+    pub shell_dim: f32,
+    pub sectors: bool,
+    pub sector_weight: f32,
+    pub min_sector: f32,
+    pub sector_fill: f32,
+    pub scan_every: Dur,
+    pub scan_duration: Dur,
+    pub scan_brightness: f32,
     pub min_arc: f32,
     pub max_arc: f32,
     pub gap: f32,
@@ -164,6 +172,8 @@ pub struct Background {
 pub struct Camera {
     pub drift: f32,
     pub rotate_compositions: String,
+    pub wide_fill: f32,
+    pub wide_fill_portrait: f32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -177,6 +187,7 @@ pub struct Monitor {
 pub struct Performance {
     pub fps: u32,
     pub fps_battery: u32,
+    pub pause_when_covered: f32,
     /// "auto", "discrete" or "integrated".
     pub gpu: String,
     pub render_scale: f32,

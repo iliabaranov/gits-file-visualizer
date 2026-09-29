@@ -6,6 +6,12 @@
 //! changed) until the budget is used. A directory that is not expanded appears
 //! as a single dashed "aggregate" segment in its parent's band, standing for
 //! its whole subtree. No subtree may take more than `max_tree_rings`.
+//!
+//! With `sectors`, each expanded directory also gets an angular sector inside
+//! its parent's, like a sunburst chart (Filelight, Disk Usage Analyzer): its
+//! rings only fill that sector (in ring-local turns `[0, width)`, with the
+//! ring's `turn0` giving the sector's start), so from above the tower reads
+//! as a ring chart and a folder's files sit on one face of the tower.
 
 use crate::model::{DirId, FileId, Model};
 use crate::rng::mix64;
@@ -34,6 +40,18 @@ pub struct LayoutParams {
     /// Most rings one directory's subtree may take (0 = no limit), so a single
     /// deep tree (a build tree, a browser profile) cannot fill the tower.
     pub max_tree_rings: usize,
+    /// Angular sectors per directory (see the module docs).
+    pub sectors: bool,
+    /// Sector share ∝ (subtree content)^sector_weight: 0 = equal shares,
+    /// 1 = proportional to how much each subtree holds.
+    pub sector_weight: f32,
+    /// Narrowest sector (turns); crowded folders' sectors spill past the
+    /// parent's rather than shrink below it.
+    pub min_sector: f32,
+    /// Each folder's rings cover at least this share of the circle, centred
+    /// on its sector (only one folder shows at any height, so narrow sectors
+    /// leave most of the tower dark).
+    pub sector_fill: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -43,6 +61,8 @@ pub struct Ring {
     pub index_in_dir: u16,
     /// The directory's path-derived key (see `Dir::key`).
     pub dir_key: u64,
+    /// Start of the directory's sector (turns); 0 without sectors.
+    pub turn0: f32,
 }
 
 impl Ring {
@@ -257,10 +277,15 @@ struct Placer<'a> {
     cur_key: u64,
     ring_in_dir: u16,
     have_ring: bool,
+    /// Current directory's sector start and width (turns).
+    turn0: f32,
+    width: f32,
 }
 
 impl Placer<'_> {
-    fn begin_dir(&mut self, dir: DirId, depth: u16, key: u64) {
+    fn begin_dir(&mut self, dir: DirId, depth: u16, key: u64, sector: [f32; 2]) {
+        self.turn0 = sector[0];
+        self.width = sector[1];
         self.cur_dir = dir;
         self.cur_depth = depth;
         self.cur_key = key;
@@ -277,7 +302,13 @@ impl Placer<'_> {
         if self.ring_in_dir == 0 {
             self.layout.dir_first_ring[self.cur_dir as usize] = idx;
         }
-        self.layout.rings.push(Ring { dir: self.cur_dir, depth: self.cur_depth, index_in_dir: self.ring_in_dir, dir_key: self.cur_key });
+        self.layout.rings.push(Ring {
+            dir: self.cur_dir,
+            depth: self.cur_depth,
+            index_in_dir: self.ring_in_dir,
+            dir_key: self.cur_key,
+            turn0: self.turn0,
+        });
         self.have_ring = true;
         self.cursor = 0.0;
     }
@@ -286,8 +317,11 @@ impl Placer<'_> {
         if !self.have_ring || (self.cursor > 0.0 && self.cursor + arc > 1.0 - 1e-4) {
             self.new_ring();
         }
-        let g = self.p.gap * 0.5;
-        let seg = Segment { source, ring: self.layout.rings.len() as u32 - 1, a0: self.cursor + g, a1: self.cursor + arc - g, flags };
+        // Placed in local units (a full ring = 1), then squeezed into the sector.
+        let w = self.width;
+        let g = (self.p.gap * 0.5).min(0.25 * arc * w);
+        let seg =
+            Segment { source, ring: self.layout.rings.len() as u32 - 1, a0: self.cursor * w + g, a1: (self.cursor + arc) * w - g, flags };
         self.cursor += arc;
         self.layout.segments.push(seg);
         self.layout.segments.len() as u32 - 1
@@ -297,6 +331,9 @@ impl Placer<'_> {
 fn place(model: &Model, p: &LayoutParams, expanded: &[bool]) -> Layout {
     let sizes = subtree_sizes(model);
     let n = model.dirs.len();
+    let content = if p.sectors { subtree_content(model, p) } else { vec![] };
+    // (start, width) in turns, per expanded directory.
+    let mut sector = vec![[0.0f32, 1.0f32]; n];
     let mut placer = Placer {
         p,
         layout: Layout {
@@ -311,13 +348,17 @@ fn place(model: &Model, p: &LayoutParams, expanded: &[bool]) -> Layout {
         cur_key: 0,
         ring_in_dir: 0,
         have_ring: false,
+        turn0: 0.0,
+        width: 1.0,
     };
 
     let mut stack = vec![model.root];
     while let Some(d) = stack.pop() {
         let dir = &model.dirs[d as usize];
         placer.layout.expanded += 1;
-        placer.begin_dir(d, dir.depth, dir.key);
+        let [s0, w] = sector[d as usize];
+        let fill = w.max(p.sector_fill.clamp(0.0, 1.0));
+        placer.begin_dir(d, dir.depth, dir.key, [(s0 + 0.5 * (w - fill)).rem_euclid(1.0), fill]);
         if p.dir_marks {
             placer.place(SegSource::Dir(d), p.dir_mark_arc, SEG_DIR);
         }
@@ -345,13 +386,58 @@ fn place(model: &Model, p: &LayoutParams, expanded: &[bool]) -> Layout {
             placer.layout.collapsed += 1;
             assign_subtree(model, c, s, &mut placer.layout.seg_of_file);
         }
-        for &c in dir.dirs.iter().rev() {
-            if !model.dirs[c as usize].purged && expanded[c as usize] {
-                stack.push(c);
+        let kids: Vec<DirId> = dir.dirs.iter().copied().filter(|&c| !model.dirs[c as usize].purged && expanded[c as usize]).collect();
+        if p.sectors && !kids.is_empty() {
+            let [s0, w] = sector[d as usize];
+            for (c, s) in kids.iter().zip(child_sectors(s0, w, kids.iter().map(|&c| content[c as usize]), p)) {
+                sector[*c as usize] = s;
             }
         }
+        stack.extend(kids.iter().rev());
     }
     placer.layout
+}
+
+/// Splits the sector (`s0`, `w`) among children with the given contents, in
+/// order. Each gets at least `min_sector`; if they need more than `w`
+/// together, they spread symmetrically past it (never beyond a full turn).
+fn child_sectors(s0: f32, w: f32, contents: impl Iterator<Item = f32>, p: &LayoutParams) -> Vec<[f32; 2]> {
+    let weights: Vec<f32> = contents.map(|c| c.max(1e-6).powf(p.sector_weight.max(0.0))).collect();
+    let total: f32 = weights.iter().sum::<f32>().max(1e-9);
+    let min = p.min_sector.clamp(0.0, 1.0).min(1.0 / weights.len() as f32);
+    let widths: Vec<f32> = weights.iter().map(|x| (w * x / total).max(min)).collect();
+    let sum: f32 = widths.iter().sum::<f32>().max(1e-9);
+    let (start, scale) = if sum <= w {
+        (s0, w / sum)
+    } else {
+        let span = sum.min(1.0);
+        (s0 + 0.5 * w - 0.5 * span, span / sum)
+    };
+    let mut a = start;
+    widths
+        .iter()
+        .map(|wd| {
+            let s = [a.rem_euclid(1.0), wd * scale];
+            a += wd * scale;
+            s
+        })
+        .collect()
+}
+
+/// How much each directory's subtree holds, in local turns of arc (the files'
+/// frozen arcs): stable while files are only read or written.
+fn subtree_content(model: &Model, p: &LayoutParams) -> Vec<f32> {
+    let mut c: Vec<f32> = model
+        .dirs
+        .iter()
+        .map(|d| d.files.iter().map(|&f| &model.files[f as usize]).filter(|f| !f.purged).map(|f| f.arc.max(p.min_arc)).sum::<f32>())
+        .collect();
+    for d in (0..model.dirs.len()).rev() {
+        if let Some(parent) = model.dirs[d].parent {
+            c[parent as usize] += c[d];
+        }
+    }
+    c
 }
 
 fn assign_subtree(model: &Model, d: DirId, seg: u32, seg_of_file: &mut [u32]) {
@@ -381,7 +467,19 @@ mod tests {
     use super::*;
 
     fn params(max_rings: usize) -> LayoutParams {
-        LayoutParams { min_arc: 0.02, max_arc: 0.2, gap: 0.006, dir_marks: true, dir_mark_arc: 0.03, max_rings, max_tree_rings: 0 }
+        LayoutParams {
+            min_arc: 0.02,
+            max_arc: 0.2,
+            gap: 0.006,
+            dir_marks: true,
+            dir_mark_arc: 0.03,
+            max_rings,
+            max_tree_rings: 0,
+            sectors: false,
+            sector_weight: 0.5,
+            min_sector: 0.04,
+            sector_fill: 0.0,
+        }
     }
 
     fn sample() -> Model {
@@ -429,6 +527,40 @@ mod tests {
         hot[3] = 5.0;
         let l = build(&m, &params(full - 4), &hot);
         assert!(l.is_expanded(3) && !l.is_expanded(2));
+    }
+
+    #[test]
+    fn sectors_nest_like_a_sunburst() {
+        let mut m = sample();
+        let mut p = params(10_000);
+        p.sectors = true;
+        assign_arcs(&mut m, &p, 0);
+        let l = build(&m, &p, &[]);
+        let sector_of = |d: u32| {
+            let r = l.rings.iter().position(|r| r.dir == d).unwrap();
+            let w = l.segments.iter().filter(|s| s.ring as usize == r).map(|s| s.a1).fold(0.0f32, f32::max);
+            (l.rings[r].turn0, w)
+        };
+        // a (the only top folder) spans the circle; b and c split it.
+        let (a0, _) = sector_of(1);
+        let (b0, bw) = sector_of(2);
+        let (c0, cw) = sector_of(3);
+        assert_eq!(a0, 0.0);
+        assert!(b0 >= 0.0 && bw > 0.1 && bw <= 1.0);
+        assert!((c0 - (b0 + bw)).abs() < 0.2 && c0 + cw <= 1.0 + 1e-4, "b {b0}+{bw}, c {c0}+{cw}");
+        // Segments stay inside [0, 1) in ring-local turns.
+        assert!(l.segments.iter().all(|s| s.a0 >= 0.0 && s.a1 <= 1.0 && s.a0 < s.a1));
+    }
+
+    #[test]
+    fn crowded_children_spill_symmetrically() {
+        let p = LayoutParams { sectors: true, min_sector: 0.1, ..params(100) };
+        let s = child_sectors(0.4, 0.2, [1.0f32; 5].into_iter(), &p);
+        let total: f32 = s.iter().map(|x| x[1]).sum();
+        assert!((total - 0.5).abs() < 1e-5);
+        assert!((s[0][0] - 0.25).abs() < 1e-5, "{s:?}");
+        let s = child_sectors(0.0, 1.0, [4.0f32, 1.0].into_iter(), &LayoutParams { sector_weight: 1.0, ..p });
+        assert!((s[0][1] - 0.8).abs() < 1e-5 && (s[1][0] - 0.8).abs() < 1e-5);
     }
 
     #[test]

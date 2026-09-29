@@ -21,7 +21,7 @@ pub struct Options {
 
 fn composition_for(cfg: &Config, requested: Option<&str>, width: u32, height: u32) -> Composition {
     let name = requested.map(str::to_string).unwrap_or_else(|| cfg.monitor("*").composition);
-    Composition::parse(&name).unwrap_or(if height > width { Composition::Drum } else { Composition::Wide })
+    Composition::parse(&name).unwrap_or_else(|| Composition::auto(&[(width, height)])[0])
 }
 
 const DT: f64 = 1.0 / 24.0;
@@ -91,7 +91,7 @@ pub fn run(cfg: Config, opts: Options, collector: Option<std::path::PathBuf>) ->
             if live {
                 std::thread::sleep(std::time::Duration::from_secs_f64(DT));
             }
-            let cam = Camera::new(composition, aspect, &world.cfg.tower, world.y_top(), world.cfg.camera.drift, world.t as f32);
+            let cam = Camera::new(composition, aspect, &world.cfg, world.y_top(), world.t as f32);
             renderer.render(&mut view, &mut world, &cam, &out_view, DT as f32);
             let _ = g.device.poll(wgpu::PollType::Poll);
         }
@@ -150,7 +150,7 @@ pub fn bench(
     for i in 0..frames + 10 {
         let t0 = std::time::Instant::now();
         world.step(DT);
-        let cam = Camera::new(composition, aspect, &world.cfg.tower, world.y_top(), world.cfg.camera.drift, world.t as f32);
+        let cam = Camera::new(composition, aspect, &world.cfg, world.y_top(), world.t as f32);
         renderer.render(&mut view, &mut world, &cam, &out_view, DT as f32);
         let t1 = std::time::Instant::now();
         g.device.poll(wgpu::PollType::wait_indefinitely()).context("waiting for GPU")?;
@@ -343,7 +343,7 @@ pub fn loadtest(cfg: Config, outputs: Vec<(u32, u32)>, seconds: f64, collector: 
         }
         for o in &mut outs {
             if now >= o.next {
-                let cam = Camera::new(o.comp, o.size.0 as f32 / o.size.1 as f32, &world.cfg.tower, world.y_top(), 0.0, world.t as f32);
+                let cam = Camera::new(o.comp, o.size.0 as f32 / o.size.1 as f32, &world.cfg, world.y_top(), world.t as f32);
                 let tr = std::time::Instant::now();
                 renderer.render(&mut o.view, &mut world, &cam, &o.tex, interval.as_secs_f32());
                 t_render += tr.elapsed().as_secs_f64();

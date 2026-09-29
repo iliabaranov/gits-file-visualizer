@@ -22,6 +22,9 @@ const BAND_MERGE: f32 = 0.04;
 /// At most this many bands per layer (the merge distance grows until it fits).
 const MAX_BANDS_PER_LAYER: usize = 128;
 pub const LUT_BINS: usize = 16384;
+/// The LUT buffer: LUT_BINS + 1 ring coordinates, then per height bin a bit
+/// mask of the depth shells that have rings there (as exact small floats).
+pub const LUT_LEN: usize = 2 * LUT_BINS + 1;
 /// Duration of a write's spin boost. The extra rotation eases in and out
 /// (smoothstep), so the ring never jumps in speed.
 pub const BOOST_TAU: f32 = 12.0;
@@ -253,7 +256,7 @@ impl World {
             slot_free: vec![],
             dirty_slots: vec![],
             slots_full: true,
-            lut: vec![0.0; LUT_BINS + 1],
+            lut: vec![0.0; LUT_LEN],
             ring_s: vec![],
             ring_pitch: vec![],
             layer_bands: vec![],
@@ -287,6 +290,10 @@ impl World {
             dir_marks: t.dir_marks,
             dir_mark_arc: 0.03,
             max_rings: self.max_rings,
+            sectors: t.sectors,
+            sector_weight: t.sector_weight,
+            min_sector: t.min_sector,
+            sector_fill: t.sector_fill,
             max_tree_rings: if t.max_tree_share >= 1.0 {
                 0
             } else {
@@ -316,6 +323,10 @@ impl World {
     }
 
     fn ring_speed(&self, ring: &layout::Ring) -> f32 {
+        if self.cfg.tower.sectors {
+            // Sectors only line up if the whole tower turns as one.
+            return self.cfg.calm.spin_speed / 60.0;
+        }
         let h = ring.hash();
         let sign = if hash01(h ^ 0xAB) < 0.5 { -1.0 } else { 1.0 };
         self.cfg.calm.spin_speed / 60.0 * sign * (0.35 + 1.3 * hash01(h))
@@ -461,6 +472,9 @@ impl World {
             let depth = r.depth as f32;
             if let Some(p) = persist.get(&r.key()) {
                 let mut g = p.gpu;
+                if self.cfg.tower.sectors {
+                    ease_to_sector(&mut g, r.turn0, self.t as f32);
+                }
                 g.depth = depth;
                 g.first_seg = first_seg[i];
                 g.row = self.ring_slot[i];
@@ -472,7 +486,7 @@ impl World {
                 self.rings.push(RingGpu {
                     depth,
                     speed: self.ring_speed(r),
-                    phase0: hash01(h ^ 0x1234) + dir_hash * 0.3,
+                    phase0: if self.cfg.tower.sectors { r.turn0 } else { hash01(h ^ 0x1234) + dir_hash * 0.3 },
                     boost: 0.0,
                     boost_t0: -1.0e9,
                     hash: hash01(h ^ 0x77),
@@ -618,7 +632,7 @@ impl World {
                     }
                     s.age_days = 0.0;
                     s.age_from = 0.0;
-                    let spin_up = self.cfg.events.write.spin_up;
+                    let spin_up = if self.cfg.tower.sectors { 0.0 } else { self.cfg.events.write.spin_up };
                     if spin_up > 0.0 && (ring as usize) < self.rings.len() {
                         let r = &mut self.rings[ring as usize];
                         // Only one boost at a time: restarting a boost midway
@@ -1161,6 +1175,25 @@ impl World {
                 if p <= 1e-9 { ri as f32 } else { ri as f32 + ((s - ys[ri]) / p).clamp(0.0, 0.9999) }
             };
         }
+        // Which shells have rings at each height (for dimming an outer shell's
+        // near side where inner shells show through; see tower.wgsl).
+        let layers = self.cfg.tower.depth_layers.clamp(1, 24) as usize;
+        let mut mask = vec![0u32; LUT_BINS];
+        let k = LUT_BINS as f32 / h.max(1e-3);
+        for i in 0..n {
+            if self.ring_pitch[i] <= 0.0 {
+                continue;
+            }
+            let layer = (self.layout.rings[i].depth as usize).min(layers - 1);
+            let b0 = ((ys[i] - BAND_MERGE) * k).max(0.0) as usize;
+            let b1 = (((ys[i + 1] + BAND_MERGE) * k).max(0.0) as usize).min(LUT_BINS - 1);
+            for m in mask.iter_mut().take(b1 + 1).skip(b0) {
+                *m |= 1 << layer;
+            }
+        }
+        for (dst, m) in self.lut[LUT_BINS + 1..].iter_mut().zip(mask) {
+            *dst = m as f32;
+        }
         let tb = std::time::Instant::now();
         self.update_layer_bands();
         if PROFILE.with(|p| p.get()) {
@@ -1280,6 +1313,21 @@ impl World {
             _ => Some(f.name.clone()),
         }
     }
+}
+
+/// Turns a ring (with sectors) toward its directory's sector start `turn0`:
+/// if the sector moved since the ring's last layout, the difference is eased
+/// in over BOOST_TAU with the spin-boost mechanism instead of jumping.
+fn ease_to_sector(g: &mut RingGpu, turn0: f32, t: f32) {
+    let wrap = |x: f32| x - x.round();
+    let x = ((t - g.boost_t0) / BOOST_TAU).clamp(0.0, 1.0);
+    let now = g.phase0 + g.boost * x * x * (3.0 - 2.0 * x);
+    if wrap(turn0 - (g.phase0 + g.boost)).abs() < 1e-4 {
+        return; // already there, or on the way
+    }
+    g.phase0 = now;
+    g.boost = wrap(turn0 - now);
+    g.boost_t0 = t;
 }
 
 /// See `World::layer_index`. `ring_layers` gives each ring's layer, in order.

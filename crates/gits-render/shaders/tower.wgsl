@@ -158,6 +158,22 @@ fn fs_tower(in: TowerOut, @builtin(front_facing) front: bool) -> @location(0) ve
     }
     if (!front) {
         acc *= G.tower2.w;
+    } else if (G.tower3.x < 0.999 && G.tower2.w < 0.99) {
+        // An outer shell's near side is dimmed where inner shells are behind
+        // it, so the nested shells read as nested (not in the dial, which
+        // looks at the shells from inside).
+        let mask = u32(lut[u32(bins) + 1u + b]);
+        if ((mask & ((1u << in.layer) - 1u)) != 0u) {
+            acc *= G.tower3.x;
+        }
+    }
+    // Optional scan: a soft band of light travelling up the tower now and then.
+    if (G.tower3.y > 0.0) {
+        let p = (t % G.tower3.y) / G.tower3.z;
+        if (p < 1.0) {
+            let band = exp(-pow((s - h * (1.0 - p)) / (0.03 * h), 2.0));
+            acc *= 1.0 + G.tower3.w * band * smoothstep(0.0, 0.06, p) * smoothstep(1.0, 0.94, p);
+        }
     }
     let ends = smoothstep(0.0, 0.03 * h, s) * smoothstep(0.0, 0.03 * h, h - s);
     return vec4<f32>(acc * ends, 1.0);
