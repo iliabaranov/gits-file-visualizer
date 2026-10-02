@@ -157,6 +157,21 @@ monitor's size, text stays crisp, and only the tower is drawn at
 30 fps 13-16%, 60 fps 25%). `pause_on_battery = true` draws nothing while
 unplugged.
 
+### If the wallpaper looks stuck
+
+```sh
+gits-restart               # or press Super+Shift+W, or search "Restart wallpaper"
+gits-restart --renderer    # quicker: only the renderer
+gits-restart --all         # also the file-watching collector (rescans your files)
+```
+
+It puts the saved monitor layout back, turns the GNOME extension off and on
+(rebuilding its copies of the wallpaper on every monitor), starts a fresh
+renderer and checks that every monitor picked it up: about 3 seconds.
+`tools/install-shortcut.sh` installs the command, the launcher entry and the
+shortcut (`tools/install-shortcut.sh '<Super><Alt>r'` for another key;
+`uninstall` removes them).
+
 ### On another machine without building
 
 ```sh
