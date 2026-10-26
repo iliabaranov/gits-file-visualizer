@@ -190,6 +190,7 @@ class Extension {
         this._enabled = true;
         this._hookBackgrounds();
         this._hookLockScreen();
+        this._watchDisplayPower();
         this._renderer = new RendererProcess(status => this._onRendererExit(status));
         this._connect(global.display, 'window-created', (d, w) => this._onWindowCreated(w));
         this._connect(global.window_manager, 'map', (wm, actor) => this._onMap(actor));
@@ -236,6 +237,7 @@ class Extension {
         this._sources.clear();
         this._unhookBackgrounds();
         this._unhookLockScreen();
+        this._unwatchDisplayPower();
         for (const h of [...this._holders])
             h.destroy();
         this._holders.clear();
@@ -278,6 +280,44 @@ class Extension {
             Background.BackgroundManager.prototype._createBackgroundActor = this._origCreate;
             this._origCreate = null;
         }
+    }
+
+    // --- display power ---------------------------------------------------------
+
+    /* Mutter's PowerSaveMode: 0 = displays on, > 0 = switched off (e.g. 30 s after the
+     * screen locks). The renderer stops drawing while nothing can be seen. */
+    _watchDisplayPower() {
+        this._powerProxy = null;
+        try {
+            Gio.DBusProxy.new_for_bus(Gio.BusType.SESSION, Gio.DBusProxyFlags.DO_NOT_AUTO_START_AT_CONSTRUCTION,
+                null, 'org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
+                'org.gnome.Mutter.DisplayConfig', null, (src, res) => {
+                    try {
+                        const proxy = Gio.DBusProxy.new_for_bus_finish(res);
+                        if (!this._enabled)
+                            return;
+                        this._powerProxy = proxy;
+                        this._powerId = proxy.connect('g-properties-changed', () => this._updateVisibility());
+                        this._updateVisibility();
+                    } catch (e) {
+                        log(`[gits] display power state unavailable: ${e.message}`);
+                    }
+                });
+        } catch (e) {
+            log(`[gits] display power state unavailable: ${e.message}`);
+        }
+    }
+
+    _unwatchDisplayPower() {
+        if (this._powerProxy && this._powerId)
+            this._powerProxy.disconnect(this._powerId);
+        this._powerProxy = null;
+        this._powerId = 0;
+    }
+
+    _displaysOff() {
+        const v = this._powerProxy?.get_cached_property('PowerSaveMode');
+        return !!v && v.unpack() > 0;
     }
 
     // --- lock screen ----------------------------------------------------------
@@ -585,6 +625,7 @@ class Extension {
             return;
         const locked = Main.sessionMode.isLocked;
         this._send('locked', `locked ${locked ? 1 : 0}`);
+        this._send('blanked', `blanked ${this._displaysOff() ? 1 : 0}`);
         this._send('sharing', `sharing ${this._handles.size > 0 ? 1 : 0}`);
         const overview = Main.overview.visible;
         const rects = overview ? [] : this._occluders();

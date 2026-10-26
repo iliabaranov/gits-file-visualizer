@@ -238,7 +238,9 @@ only reloaded at login). File names are hidden while locked unless
 shows the picture sharp and is also the cheapest: a blurred live image is
 re-blurred every frame and ballooned memory in testing. GNOME turns the monitors
 off about 30 s after the last input, and nothing here can change that, so this
-is a lock-screen background rather than a screensaver.
+is a lock-screen background rather than a screensaver. The renderer stops
+drawing while GNOME reports the displays as switched off (and resumes when
+they wake).
 
 ## Watch limit
 

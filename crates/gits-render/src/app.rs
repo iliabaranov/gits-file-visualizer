@@ -217,6 +217,8 @@ pub enum Control {
     Coverage(i32, f32),
     /// `locked 0|1`: screen locked (nothing drawn).
     Locked(bool),
+    /// `blanked 0|1`: the displays are switched off (power saving); nothing can be seen.
+    Blanked(bool),
     /// `sharing 0|1`: a screencast or screen share is running.
     Sharing(bool),
     /// stdin closed or `quit`.
@@ -230,6 +232,7 @@ fn parse_control(line: &str) -> Option<Control> {
         "visible" => Some(Control::Visible(it.next()?.parse().ok()?, flag(it.next())?)),
         "coverage" => Some(Control::Coverage(it.next()?.parse().ok()?, it.next()?.parse::<f32>().ok()?.clamp(0.0, 1.0))),
         "locked" => Some(Control::Locked(flag(it.next())?)),
+        "blanked" => Some(Control::Blanked(flag(it.next())?)),
         "sharing" => Some(Control::Sharing(flag(it.next())?)),
         "quit" => Some(Control::Quit),
         _ => None,
@@ -328,6 +331,7 @@ struct App {
     next_power_check: Instant,
     battery: bool,
     locked: bool,
+    blanked: bool,
     state: Option<State>,
     error: Option<anyhow::Error>,
     exit_code: i32,
@@ -350,6 +354,7 @@ pub fn run(cfg: Config, opts: Options) -> Result<i32> {
         next_power_check: Instant::now(),
         battery: on_battery(),
         locked: false,
+        blanked: false,
         state: None,
         error: None,
         exit_code: 0,
@@ -392,7 +397,7 @@ impl App {
 
     /// Whether drawing stops: screen locked, or unplugged with `pause_on_battery`.
     fn halt(&self) -> Halt {
-        if battery_halts(self.battery, self.cfg.performance.pause_on_battery) {
+        if self.blanked || battery_halts(self.battery, self.cfg.performance.pause_on_battery) {
             Halt::Yes
         } else if self.locked {
             if self.cfg.lock_screen.live { Halt::LiveLock } else { Halt::Yes }
@@ -772,6 +777,12 @@ impl ApplicationHandler<Control> for App {
                     s.world.locked = l;
                 }
             }
+            Control::Blanked(b) => {
+                if self.blanked != b {
+                    log::info!("displays {}", if b { "off: paused" } else { "on: resumed" });
+                    self.blanked = b;
+                }
+            }
             Control::Sharing(on) => {
                 if let Some(s) = &mut self.state {
                     s.world.sharing = on;
@@ -950,6 +961,7 @@ mod tests {
         assert!(matches!(parse_control("coverage 2 0.87"), Some(Control::Coverage(2, f)) if (f - 0.87).abs() < 1e-6));
         assert!(matches!(parse_control("locked 1"), Some(Control::Locked(true))));
         assert!(matches!(parse_control("sharing 0"), Some(Control::Sharing(false))));
+        assert!(matches!(parse_control("blanked 1"), Some(Control::Blanked(true))));
         assert!(parse_control("bogus").is_none());
     }
 }
