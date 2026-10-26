@@ -11,7 +11,8 @@
 #   gits-restart --all           full reset, and the file-watching collector too
 #                                (rescans your files: a few seconds)
 #
-# Bound to Super+Shift+W by tools/install-shortcut.sh.
+# Started by the dock icon, the launcher entry and Super+Shift+W
+# (tools/install-shortcut.sh).
 set -u
 
 UUID=gits-file-visualizer@iliabaranov.github.io
@@ -20,11 +21,16 @@ case "${1:-}" in
   --renderer) mode=renderer ;;
   --all) mode=all ;;
   ""|--full) ;;
-  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 2 ;;
 esac
 
 say() { echo "$*"; }
-notify() { command -v notify-send >/dev/null && notify-send -a gits-file-visualizer -i video-display "Wallpaper" "$1" 2>/dev/null || true; }
+# One notification that updates in place (when started from the dock or a shortcut).
+notify() {
+  command -v notify-send >/dev/null || return 0
+  notify-send -a gits-file-visualizer -i gits-restart -h string:x-canonical-private-synchronous:gits-restart "Wallpaper" "$1" 2>/dev/null || true
+}
+[[ -t 1 ]] || notify "Restarting..."
 
 # Monitors the renderer was started for, to know how many windows to wait for.
 want=$(pgrep -a gits-render | head -1 | grep -o -- '--output' | wc -l)
