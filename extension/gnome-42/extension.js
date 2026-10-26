@@ -4,7 +4,7 @@
  * can be recognised reliably and hidden from window lists), keeps those windows
  * minimized, and shows a Clutter.Clone of each one inside every background
  * actor for its monitor: desktop, overview workspaces and workspace-switch
- * animations. The lock screen keeps its normal wallpaper.
+ * animations. The lock screen keeps its normal wallpaper unless `[lock_screen] live` is set.
  *
  * It also tells the renderer, over its stdin, how much of each monitor is
  * covered by windows (it stops drawing mostly covered ones), when the screen
@@ -17,6 +17,7 @@ const { Clutter, Gio, GLib, Meta, St } = imports.gi;
 const ByteArray = imports.byteArray;
 const Main = imports.ui.main;
 const Background = imports.ui.background;
+const UnlockDialog = imports.ui.unlockDialog;
 const Config = imports.misc.config;
 
 const TITLE_PREFIX = 'gits-file-visualizer|';
@@ -172,6 +173,7 @@ class Extension {
     constructor() {
         this._renderer = null;
         this._origCreate = null;
+        this._origEffects = null;
         this._holders = new Set();
         this._sources = new Map(); // monitor index → renderer window actor
         this._windows = new Map(); // MetaWindow → signal ids (renderer windows)
@@ -187,6 +189,7 @@ class Extension {
     enable() {
         this._enabled = true;
         this._hookBackgrounds();
+        this._hookLockScreen();
         this._renderer = new RendererProcess(status => this._onRendererExit(status));
         this._connect(global.display, 'window-created', (d, w) => this._onWindowCreated(w));
         this._connect(global.window_manager, 'map', (wm, actor) => this._onMap(actor));
@@ -232,6 +235,7 @@ class Extension {
         this._renderer = null;
         this._sources.clear();
         this._unhookBackgrounds();
+        this._unhookLockScreen();
         for (const h of [...this._holders])
             h.destroy();
         this._holders.clear();
@@ -276,6 +280,66 @@ class Extension {
         }
     }
 
+    // --- lock screen ----------------------------------------------------------
+
+    /* `[lock_screen]` settings, as the renderer left them (see write_lock_info in app.rs). */
+    _lockSettings() {
+        const fallback = {live: false, blur: 0, dim: 0.7};
+        try {
+            const path = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'gits-file-visualizer', 'lock-screen.json']);
+            const [ok, bytes] = GLib.file_get_contents(path);
+            if (!ok)
+                return fallback;
+            const s = JSON.parse(ByteArray.toString(bytes));
+            const num = (v, d, lo, hi) => Number.isFinite(Number(v)) ? Math.min(hi, Math.max(lo, Number(v))) : d;
+            return {live: s.live === true, blur: num(s.blur, 0, 0, 1), dim: num(s.dim, 0.7, 0.05, 1)};
+        } catch (e) {
+            return fallback;
+        }
+    }
+
+    /* GNOME blurs the lock screen's background heavily and darkens it; with a
+     * live lock screen, use the configured amounts instead (it sets its own after
+     * building the backgrounds, so this runs after it). */
+    _hookLockScreen() {
+        const proto = UnlockDialog.UnlockDialog?.prototype;
+        if (!proto || typeof proto._updateBackgroundEffects !== 'function')
+            return;
+        this._origEffects = proto._updateBackgroundEffects;
+        const orig = this._origEffects;
+        const ext = this;
+        proto._updateBackgroundEffects = function () {
+            orig.call(this);
+            try {
+                ext._tuneLockEffects(this);
+            } catch (e) {
+                logError(e, '[gits] lock screen effects');
+            }
+        };
+    }
+
+    _unhookLockScreen() {
+        if (this._origEffects) {
+            UnlockDialog.UnlockDialog.prototype._updateBackgroundEffects = this._origEffects;
+            this._origEffects = null;
+        }
+    }
+
+    _tuneLockEffects(dialog) {
+        const s = this._lockSettings();
+        if (!s.live || !dialog._backgroundGroup)
+            return;
+        const scale = St.ThemeContext.get_for_stage(global.stage).scale_factor;
+        for (const widget of dialog._backgroundGroup) {
+            const effect = widget.get_effect('blur');
+            if (!effect)
+                continue;
+            // No blur at all: drop the effect (a blurred live picture is re-blurred every frame).
+            effect.set_enabled(s.blur > 0.001);
+            effect.set({brightness: s.dim, sigma: Math.max(1, 60 * scale * s.blur)});
+        }
+    }
+
     /* Recreate existing background actors so they pass through our hook. */
     _reloadBackgrounds() {
         Main.layoutManager._updateBackgrounds();
@@ -288,7 +352,7 @@ class Extension {
 
     _decorate(manager, bgActor) {
         const container = manager._container;
-        if (container instanceof St.Widget && container.has_style_class_name('screen-shield-background'))
+        if (container instanceof St.Widget && container.has_style_class_name('screen-shield-background') && !this._lockSettings().live)
             return; // lock screen: keep the normal wallpaper
         // No layout manager: children keep the position/size their constraints give them.
         const holder = new Clutter.Actor({ reactive: false, opacity: 0 });
@@ -526,7 +590,8 @@ class Extension {
         const rects = overview ? [] : this._occluders();
         for (const m of Main.layoutManager.monitors) {
             // The renderer decides what counts as mostly covered (its config).
-            const coverage = overview ? 0 : this._coverage(m.index, rects);
+            // The lock screen covers the windows below it.
+            const coverage = overview || locked ? 0 : this._coverage(m.index, rects);
             this._send(`coverage ${m.index}`, `coverage ${m.index} ${coverage.toFixed(2)}`);
         }
     }

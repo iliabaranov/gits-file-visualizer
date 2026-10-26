@@ -232,7 +232,7 @@ impl Fx {
             }
         }
 
-        if let Some(n) = w.notice.as_ref().filter(|n| t < n.until) {
+        if let Some(n) = w.notice.as_ref().filter(|n| t < n.until && !w.locked) {
             let col = if n.error { crimson } else { cream };
             let size = 14.0 * ui;
             let mut text: String = n.text.chars().take(170).collect();

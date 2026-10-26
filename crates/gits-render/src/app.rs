@@ -48,6 +48,18 @@ const SETTLE_DRAW: Duration = Duration::from_secs(4);
 /// ...but never for longer than this after its surface was set up (no collector).
 const SETTLE_GIVE_UP: Duration = Duration::from_secs(30);
 
+/// Why drawing stops, if it does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Halt {
+    /// Draw as usual (except covered or hidden monitors).
+    No,
+    /// Locked, or unplugged with `pause_on_battery`: nothing is drawn.
+    Yes,
+    /// Locked with `[lock_screen] live`: the lock screen shows the wallpaper,
+    /// so every monitor draws, whatever windows lie below it.
+    LiveLock,
+}
+
 /// Whether the power state stops all drawing (`[performance] pause_on_battery`).
 fn battery_halts(on_battery: bool, pause_on_battery: bool) -> bool {
     on_battery && pause_on_battery
@@ -275,8 +287,12 @@ struct Output {
 }
 
 impl Output {
-    fn paused(&self, halted: bool) -> bool {
-        (halted && self.drawn) || !self.visible || self.covered
+    fn paused(&self, halt: Halt) -> bool {
+        match halt {
+            Halt::LiveLock => false,
+            Halt::Yes => self.drawn || !self.visible || self.covered,
+            Halt::No => !self.visible || self.covered,
+        }
     }
 
     fn set_coverage(&mut self, coverage: f32, threshold: f32) {
@@ -374,9 +390,15 @@ impl App {
         monitor_scale(&self.cfg, connector, self.opts.wallpaper, integrated)
     }
 
-    /// Nothing is drawn: screen locked, or unplugged with `pause_on_battery`.
-    fn halted(&self) -> bool {
-        self.locked || battery_halts(self.battery, self.cfg.performance.pause_on_battery)
+    /// Whether drawing stops: screen locked, or unplugged with `pause_on_battery`.
+    fn halt(&self) -> Halt {
+        if battery_halts(self.battery, self.cfg.performance.pause_on_battery) {
+            Halt::Yes
+        } else if self.locked {
+            if self.cfg.lock_screen.live { Halt::LiveLock } else { Halt::Yes }
+        } else {
+            Halt::No
+        }
     }
 
     fn target_fps(&self) -> u32 {
@@ -512,6 +534,9 @@ impl App {
             if self.battery { if self.cfg.performance.pause_on_battery { "battery (drawing pauses once the tower is up)" } else { "battery" } } else { "mains" }
         );
         set_system_monitor(&mut outputs, &self.cfg);
+        if self.opts.wallpaper {
+            write_lock_info(&self.cfg);
+        }
         let mut world = World::new(self.cfg.clone(), renderer.max_rings(), self.opts.collector.clone());
         if self.opts.fell_back.is_some() && !self.opts.wallpaper {
             world.notice = Some(Notice {
@@ -560,6 +585,9 @@ impl App {
             Ok(cfg) => {
                 log::info!("reloaded {}", path.display());
                 self.cfg = cfg.clone();
+                if self.opts.wallpaper {
+                    write_lock_info(&self.cfg);
+                }
                 let Some(s) = &mut self.state else { return };
                 s.world.set_config(cfg);
                 s.world.notice =
@@ -626,7 +654,7 @@ impl App {
     }
 
     fn frame(&mut self, id: WindowId) {
-        let locked = self.halted();
+        let locked = self.halt();
         let Some(s) = &mut self.state else { return };
         let Some(i) = s.outputs.iter().position(|o| o.window.id() == id) else { return };
         if s.outputs[i].paused(locked) {
@@ -695,6 +723,21 @@ fn capture_dir() -> PathBuf {
     gits_core::protocol::default_socket_path().parent().map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
 }
 
+/// The GNOME extension decides what to do with the lock screen's background, but
+/// cannot read the merged config: the renderer leaves the `[lock_screen]` values
+/// it needs in `lock-screen.json`, next to the collector socket.
+fn write_lock_info(cfg: &Config) {
+    let l = &cfg.lock_screen;
+    let json = format!("{{\"live\":{},\"blur\":{},\"dim\":{}}}\n", l.live, l.blur.clamp(0.0, 1.0), l.dim.clamp(0.05, 1.0));
+    let path = capture_dir().join("lock-screen.json");
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(json.as_str()) {
+        let _ = std::fs::create_dir_all(capture_dir());
+        if let Err(e) = std::fs::write(&path, json) {
+            log::warn!("could not write {}: {e}", path.display());
+        }
+    }
+}
+
 /// Which views draw the system readout (`[system_monitor] show`).
 fn set_system_monitor(outputs: &mut [Output], cfg: &Config) {
     let sizes: Vec<(u32, u32)> = outputs.iter().map(|o| (o.spec.width, o.spec.height)).collect();
@@ -723,7 +766,12 @@ impl ApplicationHandler<Control> for App {
         log::debug!("control: {c:?}");
         match c {
             Control::Quit => el.exit(),
-            Control::Locked(l) => self.locked = l,
+            Control::Locked(l) => {
+                self.locked = l;
+                if let Some(s) = &mut self.state {
+                    s.world.locked = l;
+                }
+            }
             Control::Sharing(on) => {
                 if let Some(s) = &mut self.state {
                     s.world.sharing = on;
@@ -818,7 +866,7 @@ impl ApplicationHandler<Control> for App {
             }
         }
         let interval = Duration::from_secs_f64(1.0 / self.target_fps() as f64);
-        let locked = self.halted();
+        let locked = self.halt();
         let Some(s) = &mut self.state else { return };
         let now = Instant::now();
         // Nothing drawn for a while (paused, or the compositor withholds frames).

@@ -115,6 +115,8 @@ pub struct World {
     ring_share: Vec<f32>,
     /// A screencast/screen share is running (labels are obfuscated if configured).
     pub sharing: bool,
+    /// The screen is locked (names are hidden unless `[lock_screen] show_names`).
+    pub locked: bool,
     pub notice: Option<Notice>,
     /// Shared with the layout worker while a build runs (nothing mutates it then).
     pub model: Arc<Model>,
@@ -238,6 +240,7 @@ impl World {
             ring_share: vec![],
             hidden: false,
             sharing: false,
+            locked: false,
             initial_model,
             initial_files,
             loop_start: 0.0,
@@ -1399,7 +1402,13 @@ impl World {
     /// Short label for a file according to the privacy setting.
     /// The privacy text mode in effect: paths | dirs | glyphs | none.
     pub fn label_mode(&self) -> &str {
-        if self.sharing && self.cfg.privacy.obfuscate_when_sharing { "glyphs" } else { self.cfg.privacy.text.as_str() }
+        if self.locked && !self.cfg.lock_screen.show_names {
+            "none"
+        } else if self.sharing && self.cfg.privacy.obfuscate_when_sharing {
+            "glyphs"
+        } else {
+            self.cfg.privacy.text.as_str()
+        }
     }
 
     pub fn label_for(&self, file: u32) -> Option<String> {

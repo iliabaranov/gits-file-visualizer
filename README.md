@@ -229,6 +229,17 @@ connects it to the real collector.
 `stats` use synthetic data unless given `--source collector`. Snapshots and
 other scratch output go to `out/`, which is ignored by git.
 
+## Lock screen
+
+Off by default. With `[lock_screen] live = true` the tower keeps running behind
+GNOME's clock and password prompt (GNOME 42 extension for now; the extension is
+only reloaded at login). File names are hidden while locked unless
+`show_names = true`, and the system readout is hidden. `blur = 0` (default)
+shows the picture sharp and is also the cheapest: a blurred live image is
+re-blurred every frame and ballooned memory in testing. GNOME turns the monitors
+off about 30 s after the last input, and nothing here can change that, so this
+is a lock-screen background rather than a screensaver.
+
 ## Watch limit
 
 Live change detection uses Linux inotify, which needs one *watch* per folder.

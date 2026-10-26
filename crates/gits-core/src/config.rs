@@ -19,6 +19,7 @@ pub struct Config {
     pub tower: Tower,
     pub labels: Labels,
     pub system_monitor: SystemMonitor,
+    pub lock_screen: LockScreen,
     pub background: Background,
     pub camera: Camera,
     pub monitors: BTreeMap<String, MonitorConfig>,
@@ -149,6 +150,15 @@ pub struct Labels {
     pub repeat: Dur,
     pub per_second: f32,
     pub reads: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LockScreen {
+    pub live: bool,
+    pub show_names: bool,
+    pub blur: f32,
+    pub dim: f32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

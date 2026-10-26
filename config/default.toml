@@ -114,6 +114,15 @@ reads      = true           # also for reads (creates, edits and deletes always)
 [system_monitor]            # small readout in the lower right: CPU, memory, GPU, power, network
 show = "main"               # main (the monitor with the wide shot) | all | off
 
+[lock_screen]               # the wallpaper behind GNOME's lock screen
+live       = false          # true: keep it running (GNOME has no screensaver: it shows the picture behind
+                            # the clock / password prompt, and turns the monitors off 30 s after the last
+                            # input; nothing here can change that). The extension reads this at lock time
+show_names = false          # file names in the callouts while locked (anyone can read the screen)
+blur       = 0.0            # 0..1 of GNOME's own lock-screen blur (1 = as GNOME ships it, a smudge). 0 = none: the
+                            # sharpest and cheapest; a blurred live picture is re-blurred every frame (GPU, memory)
+dim        = 0.7            # brightness behind the prompt, 0..1 (GNOME: 0.55). Only applies while blur > 0
+
 [background]
 calligraphy            = true
 calligraphy_brightness = 0.10
