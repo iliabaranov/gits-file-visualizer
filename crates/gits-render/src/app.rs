@@ -419,11 +419,8 @@ impl App {
             if self.opts.wallpaper {
                 let (w, h) = self.wallpaper_size(spec, !want_discrete);
                 attrs = attrs.with_title(format!("{WALLPAPER_TITLE}{}", spec.index)).with_decorations(false).with_resizable(false);
-                attrs = if is_x11(el) {
-                    attrs.with_inner_size(PhysicalSize::new(w, h))
-                } else {
-                    attrs.with_inner_size(LogicalSize::new(w, h))
-                };
+                attrs =
+                    if is_x11(el) { attrs.with_inner_size(PhysicalSize::new(w, h)) } else { attrs.with_inner_size(LogicalSize::new(w, h)) };
             } else {
                 attrs = attrs.with_title("gits-file-visualizer").with_inner_size(PhysicalSize::new(spec.width, spec.height));
             }
@@ -536,7 +533,11 @@ impl App {
 
         log::info!(
             "power at start: {}",
-            if self.battery { if self.cfg.performance.pause_on_battery { "battery (drawing pauses once the tower is up)" } else { "battery" } } else { "mains" }
+            if self.battery {
+                if self.cfg.performance.pause_on_battery { "battery (drawing pauses once the tower is up)" } else { "battery" }
+            } else {
+                "mains"
+            }
         );
         set_system_monitor(&mut outputs, &self.cfg);
         if self.opts.wallpaper {
@@ -860,7 +861,11 @@ impl ApplicationHandler<Control> for App {
             self.next_power_check = Instant::now() + POWER_CHECK;
             let b = on_battery();
             if b != self.battery {
-                let on_battery_msg = if battery_halts(b, self.cfg.performance.pause_on_battery) { "battery (drawing paused)" } else { "battery (frame rate capped)" };
+                let on_battery_msg = if battery_halts(b, self.cfg.performance.pause_on_battery) {
+                    "battery (drawing paused)"
+                } else {
+                    "battery (frame rate capped)"
+                };
                 log::info!("power: {}", if b { on_battery_msg } else { "mains" });
                 self.battery = b;
                 // gpu = "auto": switch between discrete and integrated via a restart.
