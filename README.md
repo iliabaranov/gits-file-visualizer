@@ -1,5 +1,11 @@
 # gits-file-visualizer
 
+<p align="center">
+  <img src="docs/media/demo.gif" alt="The tower running live as a desktop wallpaper: rings flash and callouts name the files being read, edited, created and deleted" width="900">
+</p>
+
+<p align="center"><em>Captured live on a real desktop: the tower reacting to actual file activity.</em></p>
+
 A live GNOME desktop wallpaper that renders your filesystem as the glowing
 security-system tower from the LOCUS SOLUS hack in *Ghost in the Shell 2:
 Innocence*. Directories are bands of stacked rings and files are arc segments.
