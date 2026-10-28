@@ -123,6 +123,12 @@ blur       = 0.0            # 0..1 of GNOME's own lock-screen blur (1 = as GNOME
                             # sharpest and cheapest; a blurred live picture is re-blurred every frame (GPU, memory)
 dim        = 0.7            # brightness behind the prompt, 0..1 (GNOME: 0.55). Only applies while blur > 0
 
+[screensaver]               # read by the GNOME extension (GNOME 45+)
+enabled = true              # show the tower full screen over everything once you have been idle for `after`
+after   = "5m"              # idle time before it starts (0 = never). It ends when you touch the machine,
+                            # or when GNOME blanks the screen: Settings > Power > Screen Blank
+                            # (org.gnome.desktop.session idle-delay). The lock screen is [lock_screen] below.
+
 [background]
 calligraphy            = true
 calligraphy_brightness = 0.10

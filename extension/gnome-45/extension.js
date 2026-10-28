@@ -16,6 +16,7 @@ import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
+import Shell from 'gi://Shell';
 import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -37,8 +38,63 @@ const VISIBILITY_POLL_S = 3;
 const GRID_X = 32;
 const GRID_Y = 18;
 
+const CONFIG_PATH = GLib.build_filenamev([GLib.get_user_config_dir(), 'gits-file-visualizer', 'config.toml']);
+const SCREENSAVER_DEFAULT = {enabled: true, after: 300};
+// A screensaver wait that was skipped because something inhibits idle (a video,
+// a presentation) is retried this often.
+const INHIBIT_RECHECK_S = 30;
+// The shell reports idle a little before our own idle-delay watch fires.
+const IDLE_SLACK_MS = 2000;
+const SS_FADE_MS = 1500;
+const SESSION_INHIBIT_IDLE = 8;
+const SHIELD_OPACITY = 215;
+
 function info(msg) {
     log(`[gits] ${msg}`);
+}
+
+/* "5m", "1h", "30s", "300" -> seconds, or null. */
+function parseDuration(text) {
+    const m = /^\s*([0-9.]+)\s*(ms|s|m|min|h|d)?\s*$/.exec(text);
+    if (!m)
+        return null;
+    const unit = {ms: 0.001, s: 1, m: 60, min: 60, h: 3600, d: 86400}[m[2] ?? 's'];
+    return parseFloat(m[1]) * unit;
+}
+
+/* The [screensaver] section of the renderer's config (the extension reads only
+ * this; the renderer validates the rest). */
+function readScreensaverConfig() {
+    const cfg = {...SCREENSAVER_DEFAULT};
+    let text;
+    try {
+        const [ok, bytes] = GLib.file_get_contents(CONFIG_PATH);
+        if (!ok)
+            return cfg;
+        text = new TextDecoder().decode(bytes);
+    } catch (e) {
+        return cfg;
+    }
+    let section = '';
+    for (const raw of text.split('\n')) {
+        const line = raw.replace(/#.*$/, '').trim();
+        const sec = /^\[([^\]]+)\]$/.exec(line);
+        if (sec) {
+            section = sec[1].trim();
+            continue;
+        }
+        if (section !== 'screensaver')
+            continue;
+        const kv = /^([A-Za-z_]+)\s*=\s*(.+)$/.exec(line);
+        if (!kv)
+            continue;
+        const value = kv[2].trim().replace(/^"(.*)"$/, '$1');
+        if (kv[1] === 'enabled')
+            cfg.enabled = value === 'true';
+        else if (kv[1] === 'after')
+            cfg.after = parseDuration(value) ?? cfg.after;
+    }
+    return cfg;
 }
 
 function findRenderer() {
@@ -208,6 +264,19 @@ class Wallpaper {
         this._timers = new Set();
         this._respawns = [];
         this._enabled = false;
+        this._idleMonitor = null;
+        this._ssCfg = {...SCREENSAVER_DEFAULT};
+        this._ssWatch = 0;
+        this._blankWatch = 0;
+        this._activeWatch = 0;
+        this._ssActive = false;
+        this._ssActors = [];
+        this._ssRecheck = 0;
+        this._blanked = false;
+        this._pendingActive = false;
+        this._shieldContainers = new Set();
+        this._cfgMonitor = null;
+        this._sessionSettings = null;
     }
 
     enable() {
@@ -235,6 +304,7 @@ class Wallpaper {
         });
         this._reloadBackgrounds();
         this._concealStrays();
+        this._setupIdle();
         this._renderer.start(currentMonitors());
     }
 
@@ -256,6 +326,7 @@ class Wallpaper {
         this._windows.clear();
         this._releaseActors();
         this._handles.clear();
+        this._teardownIdle();
         this._renderer?.stop();
         this._renderer = null;
         this._sources.clear();
@@ -263,6 +334,7 @@ class Wallpaper {
         for (const h of [...this._holders])
             h.destroy();
         this._holders.clear();
+        this._restoreShieldBlur();
         this._sent.clear();
     }
 
@@ -308,6 +380,11 @@ class Wallpaper {
     _reloadBackgrounds() {
         Main.layoutManager._updateBackgrounds();
         try {
+            Main.screenShield?._dialog?._updateBackgrounds();
+        } catch (e) {
+            info(`lock screen backgrounds not refreshed: ${e.message}`);
+        }
+        try {
             Main.overview._overview._controls._workspacesDisplay._updateWorkspacesViews();
         } catch (e) {
             info(`overview backgrounds not refreshed: ${e.message}`);
@@ -316,12 +393,25 @@ class Wallpaper {
 
     _decorate(manager, bgActor) {
         const container = manager._container;
-        if (container instanceof St.Widget && container.has_style_class_name('screen-shield-background'))
-            return; // lock screen: keep the normal wallpaper
+        const shield = container instanceof St.Widget && container.has_style_class_name('screen-shield-background');
+        if (shield) {
+            // The lock screen blurs and dims its background heavily; the tower
+            // must stay sharp. The dialog skips a missing effect when it
+            // refreshes them.
+            if (container.get_effect('blur')) {
+                container.remove_effect_by_name('blur');
+                this._shieldContainers.add(container);
+                container.connect('destroy', () => this._shieldContainers.delete(container));
+            }
+        }
         // No layout manager: children keep the position/size their constraints give them.
-        const holder = new Clutter.Actor({ reactive: false, opacity: 0 });
+        // The lock screen gets an opaque black backing, so GNOME's wallpaper never shows through.
+        const holder = shield
+            ? new St.Widget({ reactive: false, opacity: 255, style: 'background-color: black;' })
+            : new Clutter.Actor({ reactive: false, opacity: 0 });
         holder.add_constraint(new Clutter.BindConstraint({ source: bgActor, coordinate: Clutter.BindCoordinate.SIZE }));
         holder._gitsMonitor = bgActor.monitor;
+        holder._gitsShield = shield;
         bgActor.add_child(holder);
         this._holders.add(holder);
         holder.connect('destroy', () => this._holders.delete(holder));
@@ -339,7 +429,7 @@ class Wallpaper {
         holder.destroy_all_children();
         if (!source) {
             holder.remove_all_transitions();
-            holder.opacity = 0;
+            holder.opacity = holder._gitsShield ? 255 : 0;
             return;
         }
         // A Clone paints its source scaled to its own allocation: the holder's size.
@@ -347,10 +437,17 @@ class Wallpaper {
         scaled._gitsSource = source;
         scaled.add_constraint(new Clutter.BindConstraint({ source: holder, coordinate: Clutter.BindCoordinate.SIZE }));
         holder.add_child(scaled);
-        holder.ease({ opacity: 255, duration: FADE_MS, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+        if (holder._gitsShield) {
+            // Slightly dimmed so the clock stays readable; fades in over the black.
+            scaled.opacity = 0;
+            scaled.ease({ opacity: SHIELD_OPACITY, duration: FADE_MS, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+        } else {
+            holder.ease({ opacity: 255, duration: FADE_MS, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+        }
     }
 
     _refill(monitor) {
+        this._syncOverlay();
         for (const h of this._holders) {
             if (monitor !== undefined && h._gitsMonitor !== monitor)
                 continue;
@@ -551,6 +648,301 @@ class Wallpaper {
         });
     }
 
+    // --- screensaver, lock screen, blanking ----------------------------------------
+
+    _idleDelayMs() {
+        return (this._sessionSettings?.get_uint('idle-delay') ?? 0) * 1000;
+    }
+
+    _setupIdle() {
+        this._idleMonitor = global.backend.get_core_idle_monitor();
+        this._sessionSettings = new Gio.Settings({schema_id: 'org.gnome.desktop.session'});
+        this._sessionSettingsId = this._sessionSettings.connect('changed::idle-delay', () => this._armIdle());
+        const file = Gio.File.new_for_path(CONFIG_PATH);
+        try {
+            this._cfgMonitor = file.monitor_file(Gio.FileMonitorFlags.NONE, null);
+            this._cfgMonitorId = this._cfgMonitor.connect('changed', () => this._armIdle());
+        } catch (e) {
+            info(`cannot watch ${CONFIG_PATH}: ${e.message}`);
+        }
+        this._hookScreenSaverSignal();
+        this._hookShieldFade();
+        this._connect(Main.screenShield, 'active-changed', () => this._onShieldChanged());
+        this._armIdle();
+    }
+
+    _teardownIdle() {
+        this._stopScreensaver(false);
+        this._removeWatches();
+        if (this._ssRecheck) {
+            GLib.source_remove(this._ssRecheck);
+            this._ssRecheck = 0;
+        }
+        if (this._sessionSettings && this._sessionSettingsId)
+            this._sessionSettings.disconnect(this._sessionSettingsId);
+        this._sessionSettings = null;
+        if (this._cfgMonitor) {
+            this._cfgMonitor.disconnect(this._cfgMonitorId);
+            this._cfgMonitor.cancel();
+            this._cfgMonitor = null;
+        }
+        this._unhookScreenSaverSignal();
+        this._blanked = false;
+        this._idleMonitor = null;
+    }
+
+    _removeWatches() {
+        for (const key of ['_ssWatch', '_blankWatch', '_activeWatch']) {
+            if (this[key]) {
+                this._idleMonitor?.remove_watch(this[key]);
+                this[key] = 0;
+            }
+        }
+    }
+
+    /* (Re)reads the config and the blank time and installs the idle watches. */
+    _armIdle() {
+        if (!this._idleMonitor)
+            return;
+        for (const key of ['_ssWatch', '_blankWatch']) {
+            if (this[key]) {
+                this._idleMonitor.remove_watch(this[key]);
+                this[key] = 0;
+            }
+        }
+        this._ssCfg = readScreensaverConfig();
+        if (this._ssCfg.enabled && this._ssCfg.after > 0)
+            this._ssWatch = this._idleMonitor.add_idle_watch(Math.round(this._ssCfg.after * 1000), () => this._onScreensaverIdle());
+        const blankMs = this._idleDelayMs();
+        if (blankMs > 0)
+            this._blankWatch = this._idleMonitor.add_idle_watch(blankMs, () => this._onBlankIdle());
+        if (!this._ssCfg.enabled && this._ssActive)
+            this._stopScreensaver(true);
+        info(`screensaver ${this._ssCfg.enabled && this._ssCfg.after > 0 ? `after ${this._ssCfg.after}s idle` : 'off'}; blank at ${blankMs / 1000}s idle`);
+    }
+
+    /* One user-activity watch serves the screensaver and the blanked state. */
+    _ensureActiveWatch() {
+        if (this._activeWatch || !this._idleMonitor)
+            return;
+        this._activeWatch = this._idleMonitor.add_user_active_watch(() => {
+            this._activeWatch = 0;
+            this._onUserActive();
+        });
+    }
+
+    _onUserActive() {
+        this._stopScreensaver(true);
+        if (this._ssRecheck) {
+            GLib.source_remove(this._ssRecheck);
+            this._ssRecheck = 0;
+        }
+        if (this._blanked) {
+            this._blanked = false;
+            this._updateVisibility();
+        }
+    }
+
+    _onScreensaverIdle() {
+        if (this._ssActive || Main.screenShield?.active || Main.sessionMode.isLocked)
+            return;
+        this._ensureActiveWatch();
+        this._tryStartScreensaver();
+    }
+
+    _tryStartScreensaver() {
+        this._ssRecheck = 0;
+        if (this._ssActive || Main.screenShield?.active || !this._renderer)
+            return;
+        if (this._idleMonitor.get_idletime() < this._ssCfg.after * 1000 - IDLE_SLACK_MS)
+            return; // the user came back
+        Gio.DBus.session.call('org.gnome.SessionManager', '/org/gnome/SessionManager',
+            'org.freedesktop.DBus.Properties', 'Get',
+            new GLib.Variant('(ss)', ['org.gnome.SessionManager', 'InhibitedActions']),
+            new GLib.VariantType('(v)'), Gio.DBusCallFlags.NONE, 1000, null, (conn, res) => {
+                let inhibited = false;
+                try {
+                    const flags = conn.call_finish(res).deepUnpack()[0].deepUnpack();
+                    inhibited = (flags & SESSION_INHIBIT_IDLE) !== 0;
+                } catch (e) {
+                    // No session manager (a nested shell): nothing inhibits.
+                }
+                if (!this._enabled)
+                    return;
+                if (inhibited) {
+                    this._ssRecheck = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, INHIBIT_RECHECK_S, () => {
+                        this._tryStartScreensaver();
+                        return GLib.SOURCE_REMOVE;
+                    });
+                    return;
+                }
+                this._startScreensaver();
+            });
+    }
+
+    _startScreensaver() {
+        if (this._ssActive || Main.screenShield?.active)
+            return;
+        this._ssActive = true;
+        info('screensaver on');
+        this._syncOverlay();
+        this._updateVisibility();
+    }
+
+    _stopScreensaver(animate) {
+        if (!this._ssActive && this._ssActors.length === 0)
+            return;
+        this._ssActive = false;
+        this._destroyOverlay(animate);
+        if (this._enabled)
+            this._updateVisibility();
+        info('screensaver off');
+    }
+
+    _destroyOverlay(animate) {
+        const actors = this._ssActors;
+        this._ssActors = [];
+        for (const a of actors) {
+            if (animate) {
+                a.remove_all_transitions();
+                a.ease({opacity: 0, duration: 300, mode: Clutter.AnimationMode.EASE_OUT_QUAD, onComplete: () => a.destroy()});
+            } else {
+                a.destroy();
+            }
+        }
+    }
+
+    /* A black, full-monitor actor per monitor with a clone of that monitor's
+     * renderer window, above everything (panel, windows, notifications). */
+    _syncOverlay() {
+        if (!this._ssActive)
+            return;
+        this._destroyOverlay(false);
+        for (const m of Main.layoutManager.monitors) {
+            const source = this._sources.get(m.index);
+            if (!source)
+                continue;
+            const box = new St.Widget({x: m.x, y: m.y, width: m.width, height: m.height, reactive: false, opacity: 0, style: 'background-color: black;'});
+            const clone = new Clutter.Clone({source});
+            clone.add_constraint(new Clutter.BindConstraint({source: box, coordinate: Clutter.BindCoordinate.SIZE}));
+            box.add_child(clone);
+            Main.uiGroup.add_child(box);
+            Main.uiGroup.set_child_above_sibling(box, null);
+            box.ease({opacity: 255, duration: SS_FADE_MS, mode: Clutter.AnimationMode.EASE_OUT_QUAD});
+            this._ssActors.push(box);
+        }
+    }
+
+    /* The lock screen shows its own copy of the tower: drop the overlay. */
+    _onShieldChanged() {
+        if (Main.screenShield.active)
+            this._stopScreensaver(false);
+        else
+            this._pendingActive = false;
+        this._updateVisibility();
+    }
+
+    /* Idle for as long as GNOME's blank time: the display is about to go dark. */
+    _onBlankIdle() {
+        this._blanked = true;
+        this._ensureActiveWatch();
+        this._releasePendingActive();
+        this._updateVisibility();
+    }
+
+    /* gnome-settings-daemon blanks the display the moment the shield reports
+     * itself active (any lock), whatever the idle time. The tower should stay
+     * lit on the lock screen, so that signal is held back until the session has
+     * been idle for the blank time (the shell's own idle lock arrives only after
+     * that); the blank watch above releases it if the lock came earlier. */
+    _hookScreenSaverSignal() {
+        const impl = Main.screenShield?._screenSaverDBus?._dbusImpl;
+        if (!impl) {
+            info('screen saver D-Bus object not found; the lock screen will blank as usual');
+            return;
+        }
+        this._ssImpl = impl;
+        this._origEmit = impl.emit_signal;
+        const ext = this;
+        impl.emit_signal = function (name, params) {
+            if (name === 'ActiveChanged' && ext._holdActiveChanged(params))
+                return undefined;
+            return ext._origEmit.call(this, name, params);
+        };
+    }
+
+    _unhookScreenSaverSignal() {
+        if (this._shieldFadeHooked) {
+            delete Main.screenShield._activateFade;
+            this._shieldFadeHooked = false;
+        }
+        if (!this._ssImpl)
+            return;
+        delete this._ssImpl.emit_signal;
+        this._releasePendingActive();
+        this._ssImpl = null;
+        this._origEmit = null;
+    }
+
+    /* A lock requested by the user (not by idling) slides the shield in and then
+     * fades the whole screen to black, so the lock screen is only seen after the
+     * next keypress. Skip that fade while the blank time has not been reached,
+     * but still complete the lock (the shield becomes active, `Lock` returns). */
+    _hookShieldFade() {
+        const shield = Main.screenShield;
+        const orig = shield._activateFade;
+        if (!orig)
+            return;
+        const ext = this;
+        shield._activateFade = function (lightbox, time) {
+            if (lightbox === this._shortLightbox && ext._enabled && !ext._idleLongEnough()) {
+                this._completeLockScreenShown();
+                return;
+            }
+            orig.call(this, lightbox, time);
+        };
+        this._shieldFadeHooked = true;
+    }
+
+    _idleLongEnough() {
+        const blankMs = this._idleDelayMs();
+        return blankMs > 0 && this._idleMonitor.get_idletime() >= blankMs - IDLE_SLACK_MS;
+    }
+
+    _holdActiveChanged(params) {
+        const active = params.deepUnpack()[0];
+        if (!active) {
+            this._pendingActive = false;
+            return false;
+        }
+        if (this._idleLongEnough())
+            return false;
+        this._pendingActive = true;
+        info('lock screen shown; keeping the display lit until the blank time');
+        return true;
+    }
+
+    _releasePendingActive() {
+        if (!this._pendingActive || !this._ssImpl)
+            return;
+        this._pendingActive = false;
+        if (Main.screenShield.active)
+            this._origEmit.call(this._ssImpl, 'ActiveChanged', GLib.Variant.new('(b)', [true]));
+    }
+
+    _restoreShieldBlur() {
+        for (const c of [...this._shieldContainers]) {
+            try {
+                if (!c.get_effect('blur'))
+                    c.add_effect_with_name('blur', new Shell.BlurEffect());
+            } catch (e) {}
+        }
+        this._shieldContainers.clear();
+        try {
+            Main.screenShield?._dialog?._updateBackgroundEffects();
+        } catch (e) {}
+    }
+
     // --- visibility -----------------------------------------------------------
 
     _track(window) {
@@ -627,14 +1019,16 @@ class Wallpaper {
         this._concealStrays();
         if (!this._renderer?.running)
             return;
-        const locked = Main.sessionMode.isLocked;
-        this._send('locked', `locked ${locked ? 1 : 0}`);
+        // The renderer's "locked" means "nothing is on screen": the lock screen shows
+        // the tower, so only a blanked display (idle past idle-delay) pauses it.
+        this._send('locked', `locked ${this._blanked ? 1 : 0}`);
         this._send('sharing', `sharing ${this._handles.size > 0 ? 1 : 0}`);
-        const overview = Main.overview.visible;
-        const rects = overview ? [] : this._occluders();
+        // Windows do not hide the wallpaper from the overview, the screensaver or the lock screen.
+        const unobstructed = Main.overview.visible || this._ssActive || Main.sessionMode.isLocked;
+        const rects = unobstructed ? [] : this._occluders();
         for (const m of Main.layoutManager.monitors) {
             // The renderer decides what counts as mostly covered (its config).
-            const coverage = overview ? 0 : this._coverage(m.index, rects);
+            const coverage = unobstructed ? 0 : this._coverage(m.index, rects);
             this._send(`coverage ${m.index}`, `coverage ${m.index} ${coverage.toFixed(2)}`);
         }
     }

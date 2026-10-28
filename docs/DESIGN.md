@@ -446,6 +446,28 @@ Sections: `palette`, `events.{read,write,create,delete}`, `age`, `calm`,
   arrived: background only, no rings. Power detection ignores `*source*` USB-C
   supplies (a port powering a device) and `scope = Device` batteries (a mouse),
   and is polled every 2 s.
+- Screensaver and lock screen (`extension/gnome-45` only). GNOME has no
+  screensaver: at `idle-delay` it fades to black, locks, and gsd-power blanks the
+  display the instant the shield reports `ActiveChanged(true)` (idle inhibitors
+  do not matter once the shield is active, see `idle_configure`). A user lock
+  (Super+L) also slides the shield in and fades to black (`_shortLightbox`), so
+  the lock screen is normally only seen after the next keypress. The extension
+  therefore (1) decorates the lock screen's `BackgroundManager` too and removes
+  its heavy `BlurEffect` (restored on disable); (2) wraps the shield D-Bus
+  object's `emit_signal` to hold `ActiveChanged(true)` until the core idle time
+  reaches `idle-delay` (released by an idle watch if the lock came first); (3)
+  wraps `ScreenShield._activateFade` to skip the short black fade before that,
+  completing the lock via `_completeLockScreenShown`; (4) after `[screensaver]
+  after` idle (core idle monitor; skipped while `InhibitedActions` has the idle
+  bit) puts a black actor plus a clone of each monitor's renderer window at the
+  top of `Main.uiGroup`, removed on input or when the shield activates. The
+  renderer's `locked` control now means only "display blanked" (idle past
+  `idle-delay`); the extension reports zero window coverage while the overview,
+  screensaver or lock screen is up. The extension reads only `[screensaver]` from
+  config.toml with a small line parser; the renderer just validates the section.
+  Tested in the headless sandbox with a virtual pointer (`imports.gi.Clutter`
+  seat) and `dbus-monitor` on `org.gnome.ScreenSaver`. ES modules stay cached
+  across disable/enable, so extension edits need a shell restart to test.
 - `[performance] integrated_native_window` and `pause_on_battery` (see README,
   quality knobs); the power source is checked every 5 s.
 

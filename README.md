@@ -173,6 +173,17 @@ a pin in the dock and the shortcut (`'<Super><Alt>r'` for another key,
 `--no-dock` to skip the pin; `uninstall` removes all of it). A notification
 says "Restarting..." and then how many monitors came back.
 
+### Screensaver (GNOME 45+)
+
+After `[screensaver] after` of inactivity (default 5 minutes, not while a video
+or presentation inhibits idle) the tower takes over every monitor, above windows
+and the panel; any input ends it. GNOME blanks the display at its own blank time
+(Settings > Power > Screen Blank, `org.gnome.desktop.session idle-delay`), which
+decides how long the screensaver runs: `gsettings set org.gnome.desktop.session
+idle-delay 3900` is 5 minutes plus one hour. `after = 0` or `enabled = false`
+turns it off. Not available in the GNOME 42 extension. See "Lock screen" below
+for the lock screen.
+
 ### On another machine without building
 
 ```sh
@@ -232,15 +243,21 @@ other scratch output go to `out/`, which is ignored by git.
 ## Lock screen
 
 Off by default. With `[lock_screen] live = true` the tower keeps running behind
-GNOME's clock and password prompt (GNOME 42 extension for now; the extension is
+GNOME's clock and password prompt (both extensions; the extension is
 only reloaded at login). File names are hidden while locked unless
 `show_names = true`, and the system readout is hidden. `blur = 0` (default)
 shows the picture sharp and is also the cheapest: a blurred live image is
-re-blurred every frame and ballooned memory in testing. GNOME turns the monitors
-off about 30 s after the last input, and nothing here can change that, so this
-is a lock-screen background rather than a screensaver. The renderer stops
+re-blurred every frame and ballooned memory in testing. The renderer stops
 drawing while GNOME reports the displays as switched off (and resumes when
 they wake).
+
+GNOME turns the monitors off as soon as the screen locks (about 30 s after the
+last input on older versions), and a manual lock also fades to black. The GNOME 42
+extension cannot change that, so there the live lock screen is only a background.
+The GNOME 45+ extension can: with `live = true` it holds both back until you have
+been idle for the blank time (`idle-delay`, see Screensaver above), so a locked
+screen stays lit until then (with a blank time of 0 ("never") it stays lit). The
+picture sits on an opaque black backing, never GNOME's wallpaper.
 
 ## Watch limit
 

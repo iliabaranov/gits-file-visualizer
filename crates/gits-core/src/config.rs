@@ -20,6 +20,7 @@ pub struct Config {
     pub labels: Labels,
     pub system_monitor: SystemMonitor,
     pub lock_screen: LockScreen,
+    pub screensaver: Screensaver,
     pub background: Background,
     pub camera: Camera,
     pub monitors: BTreeMap<String, MonitorConfig>,
@@ -150,6 +151,16 @@ pub struct Labels {
     pub repeat: Dur,
     pub per_second: f32,
     pub reads: bool,
+}
+
+/// Read by the GNOME extension (it does not parse TOML itself beyond this
+/// section); the renderer only validates it.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Screensaver {
+    pub enabled: bool,
+    /// Idle time before the visualization takes over the screen; 0 = off.
+    pub after: Dur,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
