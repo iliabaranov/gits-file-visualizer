@@ -460,11 +460,14 @@ Sections: `palette`, `events.{read,write,create,delete}`, `age`, `calm`,
   completing the lock via `_completeLockScreenShown`; (4) after `[screensaver]
   after` idle (core idle monitor; skipped while `InhibitedActions` has the idle
   bit) puts a black actor plus a clone of each monitor's renderer window at the
-  top of `Main.uiGroup`, removed on input or when the shield activates. The
-  renderer's `locked` control now means only "display blanked" (idle past
-  `idle-delay`); the extension reports zero window coverage while the overview,
-  screensaver or lock screen is up. The extension reads only `[screensaver]` from
-  config.toml with a small line parser; the renderer just validates the section.
+  top of `Main.uiGroup`, removed on input or when the shield activates. All of
+  (1)-(3) apply only with `[lock_screen] live` (read from the renderer's
+  `lock-screen.json`, as in the GNOME 42 extension), and the blur/dim come from the
+  same file. The extension sends `locked` (the real lock state: hides names, and
+  stops drawing unless `live`) and `blanked` (displays off per Mutter's
+  PowerSaveMode, or idle past `idle-delay`); it reports zero window coverage while
+  the overview, screensaver or lock screen is up. It reads only `[screensaver]`
+  from config.toml with a small line parser; the renderer just validates it.
   Tested in the headless sandbox with a virtual pointer (`imports.gi.Clutter`
   seat) and `dbus-monitor` on `org.gnome.ScreenSaver`. ES modules stay cached
   across disable/enable, so extension edits need a shell restart to test.

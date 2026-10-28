@@ -16,11 +16,11 @@ import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
-import Shell from 'gi://Shell';
 import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Background from 'resource:///org/gnome/shell/ui/background.js';
+import * as UnlockDialog from 'resource:///org/gnome/shell/ui/unlockDialog.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const ENCODER = new TextEncoder();
@@ -48,6 +48,7 @@ const IDLE_SLACK_MS = 2000;
 const SS_FADE_MS = 1500;
 const SESSION_INHIBIT_IDLE = 8;
 const SHIELD_OPACITY = 215;
+const BLUR_RADIUS = 90; // GNOME's own value for the lock screen
 
 function info(msg) {
     log(`[gits] ${msg}`);
@@ -274,7 +275,9 @@ class Wallpaper {
         this._ssRecheck = 0;
         this._blanked = false;
         this._pendingActive = false;
-        this._shieldContainers = new Set();
+        this._origEffects = null;
+        this._powerProxy = null;
+        this._powerId = 0;
         this._cfgMonitor = null;
         this._sessionSettings = null;
     }
@@ -282,6 +285,8 @@ class Wallpaper {
     enable() {
         this._enabled = true;
         this._hookBackgrounds();
+        this._hookLockScreen();
+        this._watchDisplayPower();
         this._renderer = new RendererProcess(status => this._onRendererExit(status));
         this._connect(global.display, 'window-created', (d, w) => this._onWindowCreated(w));
         this._connect(global.window_manager, 'map', (wm, actor) => this._onMap(actor));
@@ -331,10 +336,11 @@ class Wallpaper {
         this._renderer = null;
         this._sources.clear();
         this._unhookBackgrounds();
+        this._unhookLockScreen();
+        this._unwatchDisplayPower();
         for (const h of [...this._holders])
             h.destroy();
         this._holders.clear();
-        this._restoreShieldBlur();
         this._sent.clear();
     }
 
@@ -394,16 +400,8 @@ class Wallpaper {
     _decorate(manager, bgActor) {
         const container = manager._container;
         const shield = container instanceof St.Widget && container.has_style_class_name('screen-shield-background');
-        if (shield) {
-            // The lock screen blurs and dims its background heavily; the tower
-            // must stay sharp. The dialog skips a missing effect when it
-            // refreshes them.
-            if (container.get_effect('blur')) {
-                container.remove_effect_by_name('blur');
-                this._shieldContainers.add(container);
-                container.connect('destroy', () => this._shieldContainers.delete(container));
-            }
-        }
+        if (shield && !this._lockSettings().live)
+            return; // lock screen: keep GNOME's own wallpaper unless [lock_screen] live
         // No layout manager: children keep the position/size their constraints give them.
         // The lock screen gets an opaque black backing, so GNOME's wallpaper never shows through.
         const holder = shield
@@ -895,7 +893,7 @@ class Wallpaper {
             return;
         const ext = this;
         shield._activateFade = function (lightbox, time) {
-            if (lightbox === this._shortLightbox && ext._enabled && !ext._idleLongEnough()) {
+            if (lightbox === this._shortLightbox && ext._enabled && ext._lockLive() && !ext._idleLongEnough()) {
                 this._completeLockScreenShown();
                 return;
             }
@@ -915,7 +913,7 @@ class Wallpaper {
             this._pendingActive = false;
             return false;
         }
-        if (this._idleLongEnough())
+        if (!this._lockLive() || this._idleLongEnough())
             return false;
         this._pendingActive = true;
         info('lock screen shown; keeping the display lit until the blank time');
@@ -930,17 +928,109 @@ class Wallpaper {
             this._origEmit.call(this._ssImpl, 'ActiveChanged', GLib.Variant.new('(b)', [true]));
     }
 
-    _restoreShieldBlur() {
-        for (const c of [...this._shieldContainers]) {
-            try {
-                if (!c.get_effect('blur'))
-                    c.add_effect_with_name('blur', new Shell.BlurEffect());
-            } catch (e) {}
-        }
-        this._shieldContainers.clear();
+    // --- display power and lock screen settings --------------------------------
+
+    /* Mutter's PowerSaveMode: 0 = displays on, > 0 = switched off. */
+    _watchDisplayPower() {
         try {
-            Main.screenShield?._dialog?._updateBackgroundEffects();
+            Gio.DBusProxy.new_for_bus(Gio.BusType.SESSION, Gio.DBusProxyFlags.DO_NOT_AUTO_START_AT_CONSTRUCTION,
+                null, 'org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
+                'org.gnome.Mutter.DisplayConfig', null, (src, res) => {
+                    try {
+                        const proxy = Gio.DBusProxy.new_for_bus_finish(res);
+                        if (!this._enabled)
+                            return;
+                        this._powerProxy = proxy;
+                        this._powerId = proxy.connect('g-properties-changed', () => this._updateVisibility());
+                        this._updateVisibility();
+                    } catch (e) {
+                        info(`display power state unavailable: ${e.message}`);
+                    }
+                });
+        } catch (e) {
+            info(`display power state unavailable: ${e.message}`);
+        }
+    }
+
+    _unwatchDisplayPower() {
+        if (this._powerProxy && this._powerId)
+            this._powerProxy.disconnect(this._powerId);
+        this._powerProxy = null;
+        this._powerId = 0;
+    }
+
+    _displaysOff() {
+        const v = this._powerProxy?.get_cached_property('PowerSaveMode');
+        return !!v && v.unpack() > 0;
+    }
+
+    /* `[lock_screen]` settings, as the renderer left them (write_lock_info in app.rs). */
+    _lockSettings() {
+        const fallback = {live: false, blur: 0, dim: 0.7};
+        try {
+            const path = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'gits-file-visualizer', 'lock-screen.json']);
+            const [ok, bytes] = GLib.file_get_contents(path);
+            if (!ok)
+                return fallback;
+            const j = JSON.parse(new TextDecoder().decode(bytes));
+            const num = (v, d, lo, hi) => Number.isFinite(Number(v)) ? Math.min(hi, Math.max(lo, Number(v))) : d;
+            return {live: j.live === true, blur: num(j.blur, 0, 0, 1), dim: num(j.dim, 0.7, 0.05, 1)};
+        } catch (e) {
+            return fallback;
+        }
+    }
+
+    /* GNOME blurs and darkens the lock screen background heavily; with a live lock
+     * screen use the configured amounts (no blur at all drops the effect: a blurred
+     * live picture is re-blurred every frame). It sets its own values after building
+     * the backgrounds, so this runs after it. */
+    _hookLockScreen() {
+        const proto = UnlockDialog.UnlockDialog?.prototype;
+        if (!proto || typeof proto._updateBackgroundEffects !== 'function')
+            return;
+        this._origEffects = proto._updateBackgroundEffects;
+        const orig = this._origEffects;
+        const ext = this;
+        proto._updateBackgroundEffects = function () {
+            orig.call(this);
+            try {
+                ext._tuneLockEffects(this);
+            } catch (e) {
+                logError(e, '[gits] lock screen effects');
+            }
+        };
+    }
+
+    _unhookLockScreen() {
+        if (!this._origEffects)
+            return;
+        UnlockDialog.UnlockDialog.prototype._updateBackgroundEffects = this._origEffects;
+        this._origEffects = null;
+        const dialog = Main.screenShield?._dialog;
+        try {
+            for (const widget of dialog?._backgroundGroup ?? [])
+                widget.get_effect('blur')?.set_enabled(true);
+            dialog?._updateBackgroundEffects();
         } catch (e) {}
+    }
+
+    _tuneLockEffects(dialog) {
+        const s = this._lockSettings();
+        if (!s.live || !dialog._backgroundGroup)
+            return;
+        const scale = St.ThemeContext.get_for_stage(global.stage).scale_factor;
+        for (const widget of dialog._backgroundGroup) {
+            const effect = widget.get_effect('blur');
+            if (!effect)
+                continue;
+            effect.set_enabled(s.blur > 0.001);
+            effect.set({brightness: s.dim, radius: Math.max(1, BLUR_RADIUS * scale * s.blur)});
+        }
+    }
+
+    /* The live lock screen is on: hold back GNOME's black fade and display blanking. */
+    _lockLive() {
+        return this._lockSettings().live;
     }
 
     // --- visibility -----------------------------------------------------------
@@ -1019,9 +1109,10 @@ class Wallpaper {
         this._concealStrays();
         if (!this._renderer?.running)
             return;
-        // The renderer's "locked" means "nothing is on screen": the lock screen shows
-        // the tower, so only a blanked display (idle past idle-delay) pauses it.
-        this._send('locked', `locked ${this._blanked ? 1 : 0}`);
+        // `locked` hides file names and, unless [lock_screen] live, stops drawing; `blanked`
+        // (displays off, or idle past the blank time) stops it regardless.
+        this._send('locked', `locked ${Main.sessionMode.isLocked ? 1 : 0}`);
+        this._send('blanked', `blanked ${this._blanked || this._displaysOff() ? 1 : 0}`);
         this._send('sharing', `sharing ${this._handles.size > 0 ? 1 : 0}`);
         // Windows do not hide the wallpaper from the overview, the screensaver or the lock screen.
         const unobstructed = Main.overview.visible || this._ssActive || Main.sessionMode.isLocked;
