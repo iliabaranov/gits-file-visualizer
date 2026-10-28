@@ -190,7 +190,7 @@ for the lock screen.
 tools/make-bundle.sh      # -> out/gits-file-visualizer-linux-x86_64.tar.gz (~6 MB)
 ```
 
-Copy the file over, then on the other machine (x86_64 Linux with glibc 2.35+,
+Copy the file over, then on the other machine (x86_64 Linux with glibc 2.34+,
 e.g. Ubuntu 22.04 or newer; no Rust needed):
 
 ```sh

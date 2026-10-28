@@ -1,5 +1,5 @@
 # Publishes a GitHub release when a v* tag is pushed. The prebuilt bundle is
-# built on the oldest targeted Ubuntu (22.04), so it runs on 22.04 and newer.
+# built on the oldest targeted Ubuntu (22.04), so it runs on 22.04 and newer (glibc 2.34+).
 name: Release
 
 on:
@@ -27,13 +27,13 @@ jobs:
           [ "$want" = "$have" ] || { echo "tag $GITHUB_REF_NAME does not match crate version $have" >&2; exit 1; }
       - run: cargo test --release --locked --workspace
       - run: tools/make-bundle.sh
-      - name: glibc floor is 2.35 or lower
+      - name: glibc floor is 2.34 or lower
         run: |
           mkdir -p /tmp/check && tar xzf out/gits-file-visualizer-linux-x86_64.tar.gz -C /tmp/check
           for b in /tmp/check/gits-file-visualizer/bin/*; do
             floor=$(objdump -T "$b" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)
             echo "$(basename "$b"): $floor"
-            [ "$(printf '%s\n' "$floor" GLIBC_2.35 | sort -V | tail -1)" = GLIBC_2.35 ] || { echo "needs newer glibc than 2.35" >&2; exit 1; }
+            [ "$(printf '%s\n' "$floor" GLIBC_2.34 | sort -V | tail -1)" = GLIBC_2.34 ] || { echo "needs newer glibc than 2.34" >&2; exit 1; }
           done
       - name: checksum
         working-directory: out
