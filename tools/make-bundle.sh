@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds a prebuilt bundle to copy to another Linux machine (x86_64, glibc 2.34+,
+# Builds a prebuilt bundle to copy to another Linux machine (x86_64, glibc 2.35+,
 # e.g. Ubuntu 22.04 or newer): no Rust toolchain needed there.
 #
 #   tools/make-bundle.sh            -> out/gits-file-visualizer-linux-x86_64.tar.gz

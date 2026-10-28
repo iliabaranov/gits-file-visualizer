@@ -1,0 +1,51 @@
+# Publishes a GitHub release when a v* tag is pushed. The prebuilt bundle is
+# built on the oldest targeted Ubuntu (22.04), so it runs on 22.04 and newer.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write # create the release
+      id-token: write # build provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: tag matches the crate version
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          have=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          [ "$want" = "$have" ] || { echo "tag $GITHUB_REF_NAME does not match crate version $have" >&2; exit 1; }
+      - run: cargo test --release --locked --workspace
+      - run: tools/make-bundle.sh
+      - name: glibc floor is 2.35 or lower
+        run: |
+          mkdir -p /tmp/check && tar xzf out/gits-file-visualizer-linux-x86_64.tar.gz -C /tmp/check
+          for b in /tmp/check/gits-file-visualizer/bin/*; do
+            floor=$(objdump -T "$b" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)
+            echo "$(basename "$b"): $floor"
+            [ "$(printf '%s\n' "$floor" GLIBC_2.35 | sort -V | tail -1)" = GLIBC_2.35 ] || { echo "needs newer glibc than 2.35" >&2; exit 1; }
+          done
+      - name: checksum
+        working-directory: out
+        run: sha256sum gits-file-visualizer-linux-x86_64.tar.gz | tee gits-file-visualizer-linux-x86_64.tar.gz.sha256
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/gits-file-visualizer-linux-x86_64.tar.gz
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="docs/release-notes/$GITHUB_REF_NAME.md"
+          if [ -f "$notes" ]; then body=(--notes-file "$notes"); else body=(--generate-notes); fi
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "gits-file-visualizer ${GITHUB_REF_NAME#v}" "${body[@]}" \
+            out/gits-file-visualizer-linux-x86_64.tar.gz out/gits-file-visualizer-linux-x86_64.tar.gz.sha256
