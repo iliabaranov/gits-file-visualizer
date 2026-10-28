@@ -330,3 +330,9 @@ in `~/.cargo`).
 Committing from a new machine: this GitHub account rejects pushes that expose a
 private email address, so set the repo-local no-reply address once:
 `git config user.email "90713890+iliabaranov@users.noreply.github.com"`.
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE). The bundled fonts in `assets/fonts`
+keep their own licenses (DejaVu under Bitstream Vera, Noto Serif CJK under the
+SIL Open Font License 1.1), included next to the font files.
