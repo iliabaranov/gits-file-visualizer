@@ -46,7 +46,7 @@ const RINGS: [(f32, f32); LEVELS] = [(33.0, 55.0), (57.0, 67.0), (69.0, 76.0)];
 const LABEL_PITCH: f32 = 21.0;
 /// While measuring: a sweep goes round the rings once per this many seconds,
 /// leaving a short fading trail, and fades in and out over these times.
-const SWEEP_PERIOD: f32 = 3.2;
+const SWEEP_PERIOD: f32 = 9.0;
 const SWEEP_TRAIL: f32 = TAU * 0.16;
 const SWEEP_IN: f32 = 0.6;
 const SWEEP_OUT: f32 = 0.9;
@@ -393,6 +393,13 @@ pub fn size_text(b: u64) -> String {
     }
 }
 
+/// What stands in for a folder name when names must not be shown (the lock
+/// screen, or the `glyphs`/`none` privacy modes): a stable code, like the
+/// tower's obfuscated callouts.
+fn code_name(s: &str) -> String {
+    format!("{:08X}", gits_core::rng::mix64(gits_core::model::hash_str(s)) as u32)
+}
+
 fn short_name(s: &str) -> String {
     if s.chars().count() <= 11 { s.to_string() } else { format!("{}..", s.chars().take(9).collect::<String>()) }
 }
@@ -490,10 +497,9 @@ fn draw(
     let mut rule_x = left + face.measure("DISK", hs) + 8.0 * ui;
     if scan.vis > 0.0 {
         // A quiet pulse beside the title while measuring.
-        let cream = cfg.color(&cfg.events.read.color);
-        let pulse = 0.5 + 0.5 * (scan.t * TAU / 1.6).sin();
+        let pulse = 0.5 + 0.5 * (scan.t * TAU / 3.0).sin();
         let ks = 7.5 * ui;
-        text_px(out, face, "SCANNING", rule_x, head_y - 0.5 * ui, ks, col(cream, (0.22 + 0.22 * pulse) * scan.vis), w, h);
+        text_px(out, face, "SCANNING", rule_x, head_y - 0.5 * ui, ks, col(gold, (0.25 + 0.2 * pulse) * scan.vis), w, h);
         rule_x += (face.measure("SCANNING", ks) + 8.0 * ui) * scan.vis.max(0.0).sqrt();
     }
     line_px(out, [rule_x, head_y - 3.0 * ui], [right - sw - 8.0 * ui, head_y - 3.0 * ui], 1.0 * ui, col(gold, 0.18), w, h);
@@ -536,7 +542,7 @@ fn draw(
             w,
             h,
         );
-        draw_sweep(&mut ring, scan, cfg.color(&cfg.events.read.color));
+        draw_sweep(&mut ring, scan, gold);
         return;
     };
 
@@ -553,19 +559,19 @@ fn draw(
         }
         a += span;
     }
-    draw_sweep(&mut ring, scan, cfg.color(&cfg.events.read.color));
+    draw_sweep(&mut ring, scan, gold);
     draw_labels(&mut ring, labels, face, gold, names, top + 20.0 * ui, bottom);
 }
 
-/// While measuring: a thin cream line (the colour of reads on the tower) goes
-/// round over the folder rings with a short fading trail, lightly brightening
-/// the previous result as it passes.
-fn draw_sweep(ring: &mut Ring, scan: Scan, cream: [f32; 3]) {
+/// While measuring: a thin gold line goes slowly round over the folder rings
+/// with a short fading trail, lightly brightening the previous result as it
+/// passes.
+fn draw_sweep(ring: &mut Ring, scan: Scan, gold: [f32; 3]) {
     if scan.vis <= 0.001 {
         return;
     }
     let ui = ring.ui;
-    let col = |a: f32| [cream[0], cream[1], cream[2], a * scan.vis];
+    let col = |a: f32| [gold[0], gold[1], gold[2], a * scan.vis];
     let lead = (scan.t / SWEEP_PERIOD).fract() * TAU;
     let (r0, r1) = ((GAUGE.1 + 1.5) * ui, (RINGS[LEVELS - 1].1 + 2.0) * ui);
     const STEPS: usize = 16;
@@ -575,13 +581,13 @@ fn draw_sweep(ring: &mut Ring, scan: Scan, cream: [f32; 3]) {
         ring.band_exact(r0, r1, lead - SWEEP_TRAIL * f1, lead - SWEEP_TRAIL * f0, col(0.07 * k * k), [0.0; 4]);
     }
     let (a, b) = (ring.at(r0, lead), ring.at(r1, lead));
-    line_px(ring.out, a, b, 1.2 * ui, col(0.55), ring.w, ring.h);
+    line_px(ring.out, a, b, 1.2 * ui, col(0.6), ring.w, ring.h);
     let tip = ring.at(r1 + 2.0 * ui, lead);
     let d = 1.4 * ui;
     quad_px(
         ring.out,
         [[tip[0] - d, tip[1] - d], [tip[0] + d, tip[1] - d], [tip[0] + d, tip[1] + d], [tip[0] - d, tip[1] + d]],
-        col(0.8),
+        col(0.7),
         ring.w,
         ring.h,
     );
@@ -646,14 +652,11 @@ fn draw_labels(ring: &mut Ring, labels: Vec<Label>, face: &crate::text::Face, go
                 ring.h,
             );
             let (ns, zs) = (9.5 * ui, 8.0 * ui);
-            let name = if names { short_name(&l.name) } else { String::new() };
+            let name = if names { short_name(&l.name) } else { code_name(&l.name) };
             let size = size_text(l.size);
-            let (name_y, size_y) = if names { (y + 1.0 * ui, y + 10.0 * ui) } else { (y, y) };
             let place = |s: &str, sz: f32| if side > 0.0 { x_col } else { x_col - face.measure(s, sz) };
-            if names {
-                text_px(ring.out, face, &name, place(&name, ns), name_y, ns, col(0.75), ring.w, ring.h);
-            }
-            text_px(ring.out, face, &size, place(&size, zs), size_y + if names { 0.0 } else { 3.0 * ui }, zs, col(0.45), ring.w, ring.h);
+            text_px(ring.out, face, &name, place(&name, ns), y + 1.0 * ui, ns, col(0.75), ring.w, ring.h);
+            text_px(ring.out, face, &size, place(&size, zs), y + 10.0 * ui, zs, col(0.45), ring.w, ring.h);
         }
     }
 }
@@ -709,5 +712,8 @@ mod tests {
         assert_eq!(size_text(1_965_000_000_000), "1.97 TB");
         assert_eq!(size_text(3_400_000_000), "3.4 GB");
         assert_eq!(short_name("RobotVacuumSample"), "RobotVacu..");
+        assert_eq!(code_name("Downloads"), code_name("Downloads"));
+        assert_ne!(code_name("Downloads"), code_name(".local"));
+        assert_eq!(code_name("Downloads").len(), 8);
     }
 }

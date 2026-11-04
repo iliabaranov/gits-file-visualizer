@@ -262,7 +262,8 @@ other scratch output go to `out/`, which is ignored by git.
 Off by default. With `[lock_screen] live = true` the tower keeps running behind
 GNOME's clock and password prompt (both extensions; the extension is
 only reloaded at login). File names are hidden while locked unless
-`show_names = true`, and the system readout is hidden. `blur = 0` (default)
+`show_names = true`. The system readout and disk chart stay, with folder names
+replaced by codes. `blur = 0` (default)
 shows the picture sharp and is also the cheapest: a blurred live image is
 re-blurred every frame and ballooned memory in testing. The renderer stops
 drawing while GNOME reports the displays as switched off (and resumes when

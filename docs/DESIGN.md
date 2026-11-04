@@ -485,6 +485,10 @@ Sections: `palette`, `events.{read,write,create,delete}`, `age`, `calm`,
   reuse it until it is older than `disk_every`. `statvfs` on home gives the
   gauge (home / other used / free) every 60 s. Labels follow `label_mode`: no
   names unless paths or dirs.
+  On the lock screen (and in the `glyphs`/`none` privacy modes) folder names are
+  replaced by stable 8-digit codes, as the tower obfuscates callouts; the
+  readout itself has nothing personal. While measuring, a slow gold sweep
+  (9 s per turn) passes over the previous result.
 - `[performance] integrated_native_window` and `pause_on_battery` (see README,
   quality knobs); the power source is checked every 5 s.
 
