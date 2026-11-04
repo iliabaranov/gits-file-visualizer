@@ -11,6 +11,9 @@
 #   gits-restart --all           full reset, and the file-watching collector too
 #                                (rescans your files: a few seconds)
 #
+# Every mode also asks for a new measurement of the disk chart (it keeps showing
+# the previous one meanwhile; measuring the home folder takes 10-30 s).
+#
 # Started by the dock icon, the launcher entry and Super+Shift+W
 # (tools/install-shortcut.sh).
 set -u
@@ -31,6 +34,10 @@ notify() {
   notify-send -a gits-file-visualizer -i gits-restart -h string:x-canonical-private-synchronous:gits-restart "Wallpaper" "$1" 2>/dev/null || true
 }
 [[ -t 1 ]] || notify "Restarting..."
+
+# Ask the renderer to measure disk usage again (see crates/gits-render/src/disk.rs).
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/gits-file-visualizer"
+mkdir -p "$cache_dir" && touch "$cache_dir/disk-rescan"
 
 # Monitors the renderer was started for, to know how many windows to wait for.
 want=$(pgrep -a gits-render | head -1 | grep -o -- '--output' | wc -l)

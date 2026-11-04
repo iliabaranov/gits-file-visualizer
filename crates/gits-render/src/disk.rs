@@ -7,7 +7,9 @@
 //! at idle CPU and I/O priority, and only while the readout is on screen. Unlike
 //! the tower it includes caches and build folders, which are often what fills a
 //! disk. The result is cached in `~/.cache`, so a restarted renderer shows it at
-//! once and re-measures only when it is older than `[system_monitor] disk_every`.
+//! once and re-measures only when it is older than `[system_monitor] disk_every`,
+//! or when asked to: `gits-restart` creates `disk-rescan` next to the cache, and
+//! the chart keeps showing the previous result while it measures again.
 
 use crate::fx::{line_px, quad_px, text_px};
 use crate::gpu_types::SpriteVertex;
@@ -102,7 +104,14 @@ impl DiskUsage {
                         }
                     }
                     let every = ev.load(Ordering::Relaxed).max(60) as i64;
-                    if measured_at.is_none_or(|at| unix_now() - at >= every) {
+                    let requested = rescan_path().is_some_and(|p| p.exists());
+                    if requested || measured_at.is_none_or(|at| unix_now() - at >= every) {
+                        if requested {
+                            log::info!("disk: re-measuring on request");
+                            if let Some(p) = rescan_path() {
+                                let _ = std::fs::remove_file(p);
+                            }
+                        }
                         drop(shared);
                         let started = Instant::now();
                         let node = measure(&home);
@@ -288,6 +297,11 @@ fn cache_path() -> Option<PathBuf> {
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
     Some(base.join("gits-file-visualizer").join("disk-usage.txt"))
+}
+
+/// Created by `gits-restart` to ask for a new measurement now.
+fn rescan_path() -> Option<PathBuf> {
+    cache_path().map(|p| p.with_file_name("disk-rescan"))
 }
 
 fn write_cache(node: &Node, at: i64) {
