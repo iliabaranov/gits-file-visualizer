@@ -91,7 +91,8 @@ Rendering (see `[performance]` in `config/default.toml`):
   folder, dim gold the rest of what is used, grey is free (crimson above 90%
   full). Rings: top-level folders, then two levels of subfolders; gold and
   orange only tell neighbouring folders apart; gaps are loose files and folders
-  under 1% of home. The home folder is measured like
+  under 1% of home. While it re-measures (`gits-restart` asks for that too), a
+  faint sweep goes round the previous result and SCANNING shows beside the title. The home folder is measured like
   `du -x` (caches and build folders included, unlike the tower) at idle CPU and
   I/O priority, every `disk_every` (30 min) and only while the readout is on
   screen; the result is cached in `~/.cache/gits-file-visualizer`.

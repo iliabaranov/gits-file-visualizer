@@ -44,6 +44,12 @@ const GAUGE: (f32, f32) = (26.0, 30.0);
 /// Inner and outer radius of the folder rings, level 1 to 3.
 const RINGS: [(f32, f32); LEVELS] = [(33.0, 55.0), (57.0, 67.0), (69.0, 76.0)];
 const LABEL_PITCH: f32 = 21.0;
+/// While measuring: a sweep goes round the rings once per this many seconds,
+/// leaving a short fading trail, and fades in and out over these times.
+const SWEEP_PERIOD: f32 = 3.2;
+const SWEEP_TRAIL: f32 = TAU * 0.16;
+const SWEEP_IN: f32 = 0.6;
+const SWEEP_OUT: f32 = 0.9;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Node {
@@ -65,9 +71,13 @@ pub struct FsStats {
 struct Shared {
     home: Option<Arc<Node>>,
     fs: Option<FsStats>,
+    /// When the current measurement started, and when the last one ended.
+    scan: Option<Instant>,
+    scan_end: Option<Instant>,
 }
 
 pub struct DiskUsage {
+    clock: Instant,
     shared: Arc<Mutex<Shared>>,
     active: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
@@ -112,6 +122,7 @@ impl DiskUsage {
                                 let _ = std::fs::remove_file(p);
                             }
                         }
+                        lock(&shared).scan = Some(Instant::now());
                         drop(shared);
                         let started = Instant::now();
                         let node = measure(&home);
@@ -123,7 +134,11 @@ impl DiskUsage {
                         measured_at = Some(unix_now());
                         write_cache(&node, unix_now());
                         let Some(shared) = sh.upgrade() else { return };
-                        lock(&shared).home = Some(Arc::new(node));
+                        let mut s = lock(&shared);
+                        s.home = Some(Arc::new(node));
+                        s.scan = None;
+                        s.scan_end = Some(Instant::now());
+                        drop(s);
                         continue;
                     }
                 }
@@ -134,7 +149,7 @@ impl DiskUsage {
         if let Err(e) = spawned {
             log::warn!("disk usage thread: {e}");
         }
-        Self { shared, active, enabled, every_s }
+        Self { clock: Instant::now(), shared, active, enabled, every_s }
     }
 
     /// Waits until there is something to draw (snapshots), at most `timeout`.
@@ -162,11 +177,16 @@ impl DiskUsage {
         if !cfg.system_monitor.disk {
             return;
         }
-        let (home, fs) = {
+        let (home, fs, scan) = {
             let s = lock(&self.shared);
-            (s.home.clone(), s.fs)
+            let vis = match (s.scan, s.scan_end) {
+                (Some(t0), _) => crate::world::smoothstep(0.0, SWEEP_IN, t0.elapsed().as_secs_f32()),
+                (None, Some(t1)) => 1.0 - crate::world::smoothstep(0.0, SWEEP_OUT, t1.elapsed().as_secs_f32()),
+                _ => 0.0,
+            };
+            (s.home.clone(), s.fs, Scan { vis, t: self.clock.elapsed().as_secs_f32() })
         };
-        draw(home.as_deref(), fs, cfg, atlas, w, h, bottom, names, out);
+        draw(home.as_deref(), fs, scan, cfg, atlas, w, h, bottom, names, out);
     }
 }
 
@@ -399,6 +419,11 @@ impl Ring<'_> {
         if (a1 - a0) * r1 < 0.6 * self.ui {
             return;
         }
+        self.band_exact(r0, r1, a0, a1, fill, edge);
+    }
+
+    /// `band` without the space between neighbours (for continuous fills).
+    fn band_exact(&mut self, r0: f32, r1: f32, a0: f32, a1: f32, fill: [f32; 4], edge: [f32; 4]) {
         let steps = ((a1 - a0) / (TAU / 90.0)).ceil().max(1.0) as usize;
         for i in 0..steps {
             let (t0, t1) = (a0 + (a1 - a0) * i as f32 / steps as f32, a0 + (a1 - a0) * (i + 1) as f32 / steps as f32);
@@ -411,6 +436,14 @@ impl Ring<'_> {
     }
 }
 
+/// A measurement in progress: how visible its sweep is (0..1, eased in and out)
+/// and the animation clock (seconds).
+#[derive(Clone, Copy)]
+struct Scan {
+    vis: f32,
+    t: f32,
+}
+
 struct Label {
     name: String,
     size: u64,
@@ -421,6 +454,7 @@ struct Label {
 fn draw(
     home: Option<&Node>,
     fs: Option<FsStats>,
+    scan: Scan,
     cfg: &Config,
     atlas: &GlyphAtlas,
     w: f32,
@@ -453,7 +487,15 @@ fn draw(
     let ss = 9.5 * ui;
     let sw = face.measure(&summary, ss);
     text_px(out, face, &summary, right - sw, head_y, ss, col(if full { alert } else { gold }, 0.6), w, h);
-    let rule_x = left + face.measure("DISK", hs) + 8.0 * ui;
+    let mut rule_x = left + face.measure("DISK", hs) + 8.0 * ui;
+    if scan.vis > 0.0 {
+        // A quiet pulse beside the title while measuring.
+        let cream = cfg.color(&cfg.events.read.color);
+        let pulse = 0.5 + 0.5 * (scan.t * TAU / 1.6).sin();
+        let ks = 7.5 * ui;
+        text_px(out, face, "SCANNING", rule_x, head_y - 0.5 * ui, ks, col(cream, (0.22 + 0.22 * pulse) * scan.vis), w, h);
+        rule_x += (face.measure("SCANNING", ks) + 8.0 * ui) * scan.vis.max(0.0).sqrt();
+    }
     line_px(out, [rule_x, head_y - 3.0 * ui], [right - sw - 8.0 * ui, head_y - 3.0 * ui], 1.0 * ui, col(gold, 0.18), w, h);
 
     let center = [left + crate::sysmon::WIDTH * 0.5 * ui, top + (22.0 + RINGS[LEVELS - 1].1 + 4.0) * ui];
@@ -494,6 +536,7 @@ fn draw(
             w,
             h,
         );
+        draw_sweep(&mut ring, scan, cfg.color(&cfg.events.read.color));
         return;
     };
 
@@ -510,7 +553,38 @@ fn draw(
         }
         a += span;
     }
+    draw_sweep(&mut ring, scan, cfg.color(&cfg.events.read.color));
     draw_labels(&mut ring, labels, face, gold, names, top + 20.0 * ui, bottom);
+}
+
+/// While measuring: a thin cream line (the colour of reads on the tower) goes
+/// round over the folder rings with a short fading trail, lightly brightening
+/// the previous result as it passes.
+fn draw_sweep(ring: &mut Ring, scan: Scan, cream: [f32; 3]) {
+    if scan.vis <= 0.001 {
+        return;
+    }
+    let ui = ring.ui;
+    let col = |a: f32| [cream[0], cream[1], cream[2], a * scan.vis];
+    let lead = (scan.t / SWEEP_PERIOD).fract() * TAU;
+    let (r0, r1) = ((GAUGE.1 + 1.5) * ui, (RINGS[LEVELS - 1].1 + 2.0) * ui);
+    const STEPS: usize = 16;
+    for i in 0..STEPS {
+        let (f0, f1) = (i as f32 / STEPS as f32, (i + 1) as f32 / STEPS as f32);
+        let k = 1.0 - f0;
+        ring.band_exact(r0, r1, lead - SWEEP_TRAIL * f1, lead - SWEEP_TRAIL * f0, col(0.07 * k * k), [0.0; 4]);
+    }
+    let (a, b) = (ring.at(r0, lead), ring.at(r1, lead));
+    line_px(ring.out, a, b, 1.2 * ui, col(0.55), ring.w, ring.h);
+    let tip = ring.at(r1 + 2.0 * ui, lead);
+    let d = 1.4 * ui;
+    quad_px(
+        ring.out,
+        [[tip[0] - d, tip[1] - d], [tip[0] + d, tip[1] - d], [tip[0] + d, tip[1] + d], [tip[0] - d, tip[1] + d]],
+        col(0.8),
+        ring.w,
+        ring.h,
+    );
 }
 
 fn draw_node(ring: &mut Ring, node: &Node, level: usize, a0: f32, a1: f32, tone: [f32; 3]) {
