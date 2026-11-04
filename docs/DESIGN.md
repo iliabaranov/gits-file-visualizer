@@ -471,6 +471,20 @@ Sections: `palette`, `events.{read,write,create,delete}`, `age`, `calm`,
   Tested in the headless sandbox with a virtual pointer (`imports.gi.Clutter`
   seat) and `dbus-monitor` on `org.gnome.ScreenSaver`. ES modules stay cached
   across disable/enable, so extension edits need a shell restart to test.
+- Disk chart (`disk.rs`, above the system readout, same column). The tower's
+  model cannot be the source: the collector excludes caches, `node_modules`,
+  `target`, Trash and similar, which are often the largest users of a disk. So
+  a `disk` thread (idle CPU and I/O priority, per thread) measures the home
+  folder like `du -x`: allocated blocks, one file system, hard links once,
+  symlinks not followed; `stat` produces no inotify events, and the collector
+  ignores directory reads, so measuring does not light up the tower. Levels
+  1-3 below home are kept (folders >= 1% of home, at most 12 per folder),
+  deeper sizes add into their level-3 ancestor. 755 GB / ~740k files took 9 s
+  warm and 27 s cold. The tree is cached in `~/.cache/gits-file-visualizer/
+  disk-usage.txt` (pre-order "level, bytes, name" lines), so renderer restarts
+  reuse it until it is older than `disk_every`. `statvfs` on home gives the
+  gauge (home / other used / free) every 60 s. Labels follow `label_mode`: no
+  names unless paths or dirs.
 - `[performance] integrated_native_window` and `pause_on_battery` (see README,
   quality knobs); the power source is checked every 5 s.
 

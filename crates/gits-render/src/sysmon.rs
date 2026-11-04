@@ -19,10 +19,10 @@ use std::time::{Duration, Instant};
 const HISTORY_S: f64 = 60.0;
 const ROWS: [&str; 5] = ["CPU", "MEM", "GPU", "PWR", "NET"];
 // Layout at 1080p (scaled with the screen).
-const MARGIN_R: f32 = 32.0;
+pub(crate) const MARGIN_R: f32 = 32.0;
 const MARGIN_B: f32 = 34.0;
 const PITCH: f32 = 20.0;
-const WIDTH: f32 = 300.0;
+pub(crate) const WIDTH: f32 = 300.0;
 const SPARK_X: f32 = 38.0;
 const SPARK_W: f32 = 120.0;
 /// Power sparkline full scale (watts).
@@ -52,11 +52,13 @@ pub struct SysMon {
     history: Arc<Mutex<VecDeque<Sample>>>,
     active: Arc<AtomicBool>,
     start: Instant,
+    disk: crate::disk::DiskUsage,
 }
 
 impl SysMon {
-    /// Starts sampling. `vendor` is the PCI vendor id of the GPU in use.
-    pub fn start(vendor: u32) -> Self {
+    /// Starts sampling. `vendor` is the PCI vendor id of the GPU in use; `disk`
+    /// is `[system_monitor] disk`.
+    pub fn start(vendor: u32, disk: bool) -> Self {
         let history = Arc::new(Mutex::new(VecDeque::new()));
         let active = Arc::new(AtomicBool::new(true));
         let start = Instant::now();
@@ -82,27 +84,39 @@ impl SysMon {
         if let Err(e) = spawned {
             log::warn!("system monitor thread: {e}");
         }
-        Self { history, active, start }
+        Self { history, active, start, disk: crate::disk::DiskUsage::start(disk) }
+    }
+
+    /// The disk chart's data, for snapshots (see `DiskUsage::wait_ready`).
+    pub fn wait_disk(&self, timeout: Duration) -> bool {
+        self.disk.wait_ready(timeout)
     }
 
     /// Sampling runs only while the readout is on screen.
     pub fn set_active(&self, on: bool) {
         self.active.store(on, Ordering::Relaxed);
+        self.disk.set_active(on);
     }
 
-    /// Overlay sprites in the lower right of a `w`×`h` screen.
-    pub fn build(&self, cfg: &Config, atlas: &GlyphAtlas, w: f32, h: f32, out: &mut Vec<SpriteVertex>) {
+    /// Overlay sprites in the lower right of a `w`×`h` screen, with the disk
+    /// chart above them (`names`: whether folder names may be shown).
+    #[allow(clippy::too_many_arguments)]
+    pub fn build(&self, cfg: &Config, atlas: &GlyphAtlas, w: f32, h: f32, names: bool, out: &mut Vec<SpriteVertex>) {
         let now = self.start.elapsed().as_secs_f64();
         let hist: Vec<Sample> = self.history.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
         draw(&hist, now, cfg, atlas, w, h, out);
+        let readout_top = rect(w, h, false)[1];
+        self.disk.build(cfg, atlas, w, h, readout_top - 10.0 * w.min(h) / 1080.0, names, out);
     }
 }
 
-/// Screen rectangle (x0, y0, x1, y1) the readout occupies on a `w`×`h` screen.
-pub fn rect(w: f32, h: f32) -> [f32; 4] {
+/// Screen rectangle (x0, y0, x1, y1) the readout occupies on a `w`×`h` screen,
+/// including the disk chart above it when `disk` is on.
+pub fn rect(w: f32, h: f32, disk: bool) -> [f32; 4] {
     let ui = w.min(h) / 1080.0;
     let (right, bottom) = (w - MARGIN_R * ui, h - MARGIN_B * ui);
-    [right - (WIDTH + 12.0) * ui, bottom - (ROWS.len() as f32 + 1.0) * PITCH * ui - 8.0 * ui, w, h]
+    let top = bottom - (ROWS.len() as f32 + 1.0) * PITCH * ui - 8.0 * ui;
+    [right - (WIDTH + 12.0) * ui, if disk { top - crate::disk::panel_height(w, h) } else { top }, w, h]
 }
 
 fn draw(hist: &[Sample], now: f64, cfg: &Config, atlas: &GlyphAtlas, w: f32, h: f32, out: &mut Vec<SpriteVertex>) {
@@ -116,11 +130,12 @@ fn draw(hist: &[Sample], now: f64, cfg: &Config, atlas: &GlyphAtlas, w: f32, h: 
     let (x0, x1) = (left + SPARK_X * ui, left + (SPARK_X + SPARK_W) * ui);
     let last = hist.last().copied().unwrap_or_default();
 
-    // Header: 電脳 ("cyberbrain") and a thin rule.
+    // Header and a thin rule.
     let head_y = bottom - ROWS.len() as f32 * PITCH * ui - 2.0 * ui;
-    text_px(out, &atlas.cjk, "電脳", left, head_y, 11.0 * ui, col(gold, 0.4), w, h);
-    text_px(out, face, "SYSTEM", left + 28.0 * ui, head_y, 9.0 * ui, col(gold, 0.35), w, h);
-    line_px(out, [left + 80.0 * ui, head_y - 3.0 * ui], [right, head_y - 3.0 * ui], 1.0 * ui, col(gold, 0.18), w, h);
+    let hs = 9.5 * ui;
+    text_px(out, face, "SYSTEM", left, head_y, hs, col(gold, 0.45), w, h);
+    let rule_x = left + face.measure("SYSTEM", hs) + 8.0 * ui;
+    line_px(out, [rule_x, head_y - 3.0 * ui], [right, head_y - 3.0 * ui], 1.0 * ui, col(gold, 0.18), w, h);
 
     for (i, label) in ROWS.iter().enumerate() {
         let y = bottom - (ROWS.len() - 1 - i) as f32 * PITCH * ui;

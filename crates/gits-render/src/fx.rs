@@ -236,7 +236,9 @@ impl Fx {
             let col = if n.error { crimson } else { cream };
             let size = 14.0 * ui;
             let mut text: String = n.text.chars().take(170).collect();
-            while text.len() > 8 && atlas.mono.measure(&text, size) > width - 48.0 * ui {
+            // Stops short of the readout and disk panels in the lower right.
+            let x_max = reserve.map_or(width - 24.0 * ui, |q| q[0] - 16.0 * ui);
+            while text.chars().count() > 8 && 24.0 * ui + atlas.mono.measure(&text, size) > x_max {
                 text.pop();
             }
             let fade = if n.until.is_finite() { (((n.until - t) / 0.8) as f32).clamp(0.0, 1.0) } else { 1.0 };

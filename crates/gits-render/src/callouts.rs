@@ -26,6 +26,8 @@ const BURST: f32 = 4.0;
 /// Leader lines ease toward their file with this time constant (seconds), so a
 /// new file's line glides from its folder to the file when the file appears.
 const ANCHOR_TAU: f32 = 0.3;
+/// Space kept clear around the reserved panels (pixels at 1080p).
+const RESERVE_PAD: f32 = 8.0;
 
 #[derive(Clone, Debug)]
 struct Card {
@@ -172,6 +174,8 @@ impl Callouts {
         let left_x = (tl - gap).clamp(margin + min_w, (width * 0.5 - gap).max(margin + min_w));
         let right_x = (tr + gap).clamp((width * 0.5 + gap).min(width - margin - min_w), width - margin - min_w);
         let max_w = [(left_x - margin).min(300.0 * ui), (width - margin - right_x).min(300.0 * ui)];
+        // Keep a little air around the reserved panels.
+        let reserve = reserve.map(|q| [q[0] - RESERVE_PAD * ui, q[1] - RESERVE_PAD * ui, q[2], q[3]]);
         // Rows of each column that would overlap `reserve`.
         let blocked: [Vec<bool>; 2] = [(left_x - max_w[0], left_x), (right_x, right_x + max_w[1])].map(|(x0, x1)| {
             (0..rows)
@@ -181,6 +185,10 @@ impl Callouts {
                 })
                 .collect()
         });
+        // Labels placed before the panels appeared (while locked, or before the
+        // readout or the disk chart was switched on) or before the columns
+        // moved: give them a free row again below.
+        slots.evict_blocked(&blocked);
 
         // Place new callouts: the free row nearest their file, on its side of the axis.
         for c in &self.cards {
@@ -274,14 +282,50 @@ impl Callouts {
             let a = alpha * vis;
             let line_y = name_y - name_px * 0.3;
             let line_col = [gold[0], gold[1], gold[2], 0.55 * a];
-            line_px(hud, pl.anchor, [knee, line_y], 1.0 * ui, line_col, width, height);
-            line_px(hud, [knee, line_y], [edge, line_y], 1.0 * ui, line_col, width, height);
+            for (a, b) in outside(pl.anchor, [knee, line_y], reserve).into_iter().chain(outside([knee, line_y], [edge, line_y], reserve)) {
+                line_px(hud, a, b, 1.0 * ui, line_col, width, height);
+            }
             text_px(hud, face, &name, lx_name, name_y, name_px, [gold[0], gold[1], gold[2], 1.5 * a], width, height);
             text_px(hud, face, tag, lx_sub, sub_y, sub_px, [tag_col[0], tag_col[1], tag_col[2], 1.4 * a], width, height);
             let tag_w = face.measure(tag, sub_px);
             text_px(hud, face, &rest, lx_sub + tag_w, sub_y, sub_px, [gold[0], gold[1], gold[2], 0.75 * a], width, height);
         }
     }
+}
+
+/// The pieces of segment `a`–`b` outside rectangle `r` (x0, y0, x1, y1): none,
+/// one or two.
+pub(crate) fn outside(a: [f32; 2], b: [f32; 2], r: Option<[f32; 4]>) -> Vec<([f32; 2], [f32; 2])> {
+    let Some(r) = r else { return vec![(a, b)] };
+    let d = [b[0] - a[0], b[1] - a[1]];
+    // Liang-Barsky: the parameter range of the segment that lies inside.
+    let (mut t0, mut t1) = (0.0f32, 1.0f32);
+    for (p, q) in [(-d[0], a[0] - r[0]), (d[0], r[2] - a[0]), (-d[1], a[1] - r[1]), (d[1], r[3] - a[1])] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return vec![(a, b)]; // parallel to this edge and outside it
+            }
+        } else {
+            let t = q / p;
+            if p < 0.0 {
+                t0 = t0.max(t);
+            } else {
+                t1 = t1.min(t);
+            }
+        }
+    }
+    if t0 >= t1 {
+        return vec![(a, b)];
+    }
+    let at = |t: f32| [a[0] + d[0] * t, a[1] + d[1] * t];
+    let mut out = vec![];
+    if t0 > 1e-4 {
+        out.push((a, at(t0)));
+    }
+    if t1 < 1.0 - 1e-4 {
+        out.push((at(t1), b));
+    }
+    out
 }
 
 /// Horizontal pixel extent of the visible part of the tower on screen.
@@ -372,6 +416,19 @@ impl Slots {
             .find(|&r| r < rows.len() && rows[r].is_none() && !blocked.get(r).copied().unwrap_or(false))
     }
 
+    /// Frees the rows that are now blocked; their labels get placed again.
+    fn evict_blocked(&mut self, blocked: &[Vec<bool>; 2]) {
+        for (side, rows) in self.rows.iter_mut().enumerate() {
+            for (r, slot) in rows.iter_mut().enumerate() {
+                if blocked[side].get(r).copied().unwrap_or(false)
+                    && let Some(id) = slot.take()
+                {
+                    self.placed.remove(&id);
+                }
+            }
+        }
+    }
+
     fn take(&mut self, id: u64, side: usize, row: usize, t: f64, anchor: [f32; 2]) {
         self.rows[side][row] = Some(id);
         self.placed.insert(id, Placed { side, row, t, anchor });
@@ -387,6 +444,31 @@ mod tests {
         assert_eq!(fit_right("report-final.pdf", 40), "report-final.pdf");
         assert_eq!(fit_right("report-final.pdf", 8), "report..");
         assert_eq!(fit_left("~/a/b/c/deep", 8), "..c/deep");
+    }
+
+    #[test]
+    fn labels_leave_rows_that_become_blocked() {
+        let mut s = Slots::default();
+        s.reset_if(100.0, 100.0, 4);
+        s.take(1, 1, 3, 0.0, [0.0; 2]);
+        s.take(2, 1, 0, 0.0, [0.0; 2]);
+        s.evict_blocked(&[vec![false; 4], vec![false, false, false, true]]);
+        assert!(!s.placed.contains_key(&1) && s.rows[1][3].is_none());
+        assert!(s.placed.contains_key(&2));
+        assert_eq!(s.free_row(1, 3, &[false, false, false, true]), Some(2));
+    }
+
+    #[test]
+    fn leader_lines_skip_the_reserved_panels() {
+        let r = Some([10.0, 10.0, 20.0, 20.0]);
+        // Straight through: the parts before and after.
+        assert_eq!(outside([0.0, 15.0], [30.0, 15.0], r), vec![([0.0, 15.0], [10.0, 15.0]), ([20.0, 15.0], [30.0, 15.0])]);
+        // Ends inside: only the part before.
+        assert_eq!(outside([0.0, 15.0], [15.0, 15.0], r), vec![([0.0, 15.0], [10.0, 15.0])]);
+        // Entirely inside: nothing; entirely outside: unchanged.
+        assert!(outside([12.0, 12.0], [18.0, 18.0], r).is_empty());
+        assert_eq!(outside([0.0, 0.0], [5.0, 30.0], r), vec![([0.0, 0.0], [5.0, 30.0])]);
+        assert_eq!(outside([0.0, 0.0], [5.0, 5.0], None).len(), 1);
     }
 
     #[test]

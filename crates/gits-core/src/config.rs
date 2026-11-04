@@ -177,6 +177,10 @@ pub struct LockScreen {
 pub struct SystemMonitor {
     /// "main", "all" or "off".
     pub show: String,
+    /// Disk usage chart above the readout.
+    pub disk: bool,
+    /// How often the home folder is re-measured.
+    pub disk_every: Dur,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

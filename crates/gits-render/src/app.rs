@@ -476,7 +476,7 @@ impl App {
             caps.formats.iter().copied().find(|f| f.is_srgb()).or(caps.formats.first().copied()).context("surface has no formats")?;
         let mut renderer = Renderer::new(g.device.clone(), g.queue.clone(), format, crate::renderer::Quality::for_gpu(g.is_integrated()))?;
         if self.cfg.system_monitor.show != "off" {
-            renderer.sysmon = Some(crate::sysmon::SysMon::start(g.adapter.get_info().vendor));
+            renderer.sysmon = Some(crate::sysmon::SysMon::start(g.adapter.get_info().vendor, self.cfg.system_monitor.disk));
         }
         renderer.min_scene_megapixels = if integrated { 0.0 } else { self.cfg.performance.min_scene_megapixels };
         let now = Instant::now();
@@ -604,7 +604,7 @@ impl App {
                     o.set_coverage(o.coverage, self.cfg.performance.pause_when_covered);
                 }
                 if self.cfg.system_monitor.show != "off" && s.renderer.sysmon.is_none() {
-                    s.renderer.sysmon = Some(crate::sysmon::SysMon::start(s.gpu.adapter.get_info().vendor));
+                    s.renderer.sysmon = Some(crate::sysmon::SysMon::start(s.gpu.adapter.get_info().vendor, self.cfg.system_monitor.disk));
                 }
                 for o in &mut s.outputs {
                     let (scale, max_mp) = monitor_scale(&self.cfg, &o.spec.name, self.opts.wallpaper, s.integrated);

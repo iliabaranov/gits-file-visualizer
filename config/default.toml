@@ -113,6 +113,10 @@ reads      = true           # also for reads (creates, edits and deletes always)
 
 [system_monitor]            # small readout in the lower right: CPU, memory, GPU, power, network
 show = "main"               # main (the monitor with the wide shot) | all | off
+disk = true                 # a small disk-usage chart above the readout: how full the disk is (inner gauge)
+                            # and which folders in your home folder use the space (rings, largest labelled)
+disk_every = "30m"          # how often the home folder is re-measured (like `du`, at idle CPU and I/O priority;
+                            # the result is cached in ~/.cache, so restarts do not re-measure)
 
 [lock_screen]               # the wallpaper behind GNOME's lock screen
 live       = false          # true: keep it running (GNOME has no screensaver: it shows the picture behind

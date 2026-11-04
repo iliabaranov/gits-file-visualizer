@@ -53,7 +53,11 @@ pub fn run(cfg: Config, opts: Options, collector: Option<std::path::PathBuf>) ->
     renderer.resize(&mut view, opts.width, opts.height, sc, mp);
     let composition = composition_for(&cfg, opts.composition.as_deref(), opts.width, opts.height);
     if cfg.system_monitor.show == "all" || (cfg.system_monitor.show == "main" && composition == crate::camera::Composition::Wide) {
-        renderer.sysmon = Some(crate::sysmon::SysMon::start(g.adapter.get_info().vendor));
+        let sm = crate::sysmon::SysMon::start(g.adapter.get_info().vendor, cfg.system_monitor.disk);
+        if cfg.system_monitor.disk && !sm.wait_disk(std::time::Duration::from_secs(90)) {
+            log::warn!("disk usage not measured yet; the chart shows its waiting state");
+        }
+        renderer.sysmon = Some(sm);
         view.system_monitor = true;
     }
     let mut world = World::new(cfg, renderer.max_rings(), collector);
@@ -275,7 +279,7 @@ pub fn loadtest(cfg: Config, outputs: Vec<(u32, u32)>, seconds: f64, collector: 
     let comps = Composition::auto(&outputs);
     let main = crate::app::main_output(&outputs, &comps);
     if cfg.system_monitor.show != "off" {
-        renderer.sysmon = Some(crate::sysmon::SysMon::start(g.adapter.get_info().vendor));
+        renderer.sysmon = Some(crate::sysmon::SysMon::start(g.adapter.get_info().vendor, cfg.system_monitor.disk));
     }
     struct Out {
         view: crate::renderer::View,

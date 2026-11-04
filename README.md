@@ -85,6 +85,16 @@ Rendering (see `[performance]` in `config/default.toml`):
   right: CPU, memory, GPU, power and network with one-minute sparklines
   (`[system_monitor] show = "main" | "all" | "off"`). It reads /proc and /sys
   (and NVIDIA's NVML library if present) once a second, only while visible.
+- Above the readout, a small disk chart (`[system_monitor] disk`): an inner gauge
+  for how full the disk is, and up to three rings for which folders in your home
+  folder use the space, the largest labelled. Gauge: bright gold is the home
+  folder, dim gold the rest of what is used, grey is free (crimson above 90%
+  full). Rings: top-level folders, then two levels of subfolders; gold and
+  orange only tell neighbouring folders apart; gaps are loose files and folders
+  under 1% of home. The home folder is measured like
+  `du -x` (caches and build folders included, unlike the tower) at idle CPU and
+  I/O priority, every `disk_every` (30 min) and only while the readout is on
+  screen; the result is cached in `~/.cache/gits-file-visualizer`.
 - Where many rings share a pixel, all of them are averaged (up to 16), so the
   drum reads as fine striations instead of crawling noise.
 - Layouts are rebuilt on a worker thread (at most every 5 s, which is when new

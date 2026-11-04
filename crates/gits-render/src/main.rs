@@ -4,6 +4,7 @@
 mod app;
 mod callouts;
 mod camera;
+mod disk;
 mod fx;
 mod gpu;
 mod gpu_types;

@@ -1513,10 +1513,10 @@ impl Renderer {
         hud.clear();
         let (ow, oh) = (view.output_size().0 as f32, view.output_size().1 as f32);
         let sysmon = self.sysmon.as_ref().filter(|_| view.system_monitor && !w.locked);
-        let reserve = sysmon.map(|_| crate::sysmon::rect(ow, oh));
+        let reserve = sysmon.map(|_| crate::sysmon::rect(ow, oh, w.cfg.system_monitor.disk));
         w.fx.build(w, cam, &self.atlas, &mut view.callouts, reserve, (ow, oh), frame_dt, &mut scratch, &mut hud);
         if let Some(sm) = sysmon {
-            sm.build(&w.cfg, &self.atlas, ow, oh, &mut hud);
+            sm.build(&w.cfg, &self.atlas, ow, oh, matches!(w.label_mode(), "paths" | "dirs"), &mut hud);
         }
         if hud.len() > view.hud_cap {
             view.hud_cap = hud.len() * 3 / 2;
