@@ -1403,7 +1403,9 @@ impl World {
     /// The privacy text mode in effect: paths | dirs | glyphs | none.
     pub fn label_mode(&self) -> &str {
         if self.locked && !self.cfg.lock_screen.show_names {
-            "none"
+            // Callouts keep running on the lock screen, with codes instead of names
+            // (and no folder paths), unless names are hidden altogether.
+            if self.cfg.privacy.text == "none" { "none" } else { "glyphs" }
         } else if self.sharing && self.cfg.privacy.obfuscate_when_sharing {
             "glyphs"
         } else {
