@@ -53,11 +53,13 @@ and back in once; the script says when that is needed. The extension:
 
 - starts `gits-render wallpaper` (from `~/.local/bin`, `PATH`, or
   `GITS_RENDER_BIN`) and shows its output as the background of every monitor,
-  in the overview and during workspace switches; the lock screen keeps the normal
-  wallpaper;
+  in the overview and during workspace switches, and behind the lock screen
+  with `[lock_screen] live = true` (see "Lock screen");
 - keeps the renderer's windows out of the dock, alt-tab and the overview;
 - pauses a monitor while windows cover it, and everything while the screen is
-  locked;
+  locked (unless the lock screen is live) or the displays are off;
+- shows the tower full screen after a few idle minutes (GNOME 45+, see
+  "Screensaver");
 - picks a view per monitor (`[monitors]`, default `auto`): the largest landscape
   screen and portrait screens get the whole tower, others the top-down dial;
 - pauses a monitor once windows cover most of it (`[performance]
@@ -85,17 +87,19 @@ Rendering (see `[performance]` in `config/default.toml`):
   right: CPU, memory, GPU, power and network with one-minute sparklines
   (`[system_monitor] show = "main" | "all" | "off"`). It reads /proc and /sys
   (and NVIDIA's NVML library if present) once a second, only while visible.
+  Callouts and messages never cover it or the disk chart above it.
 - Above the readout, a small disk chart (`[system_monitor] disk`): an inner gauge
   for how full the disk is, and up to three rings for which folders in your home
   folder use the space, the largest labelled. Gauge: bright gold is the home
   folder, dim gold the rest of what is used, grey is free (crimson above 90%
   full). Rings: top-level folders, then two levels of subfolders; gold and
   orange only tell neighbouring folders apart; gaps are loose files and folders
-  under 1% of home. While it re-measures (`gits-restart` asks for that too), a
-  faint sweep goes round the previous result and SCANNING shows beside the title. The home folder is measured like
-  `du -x` (caches and build folders included, unlike the tower) at idle CPU and
-  I/O priority, every `disk_every` (30 min) and only while the readout is on
-  screen; the result is cached in `~/.cache/gits-file-visualizer`.
+  under 1% of home. The home folder is measured like `du -x` (caches and build
+  folders included, unlike the tower) at idle CPU and I/O priority, every
+  `disk_every` (30 min) and only while the readout is on screen; the result is
+  cached in `~/.cache/gits-file-visualizer`. While it re-measures
+  (`gits-restart` asks for that too), a slow gold sweep goes round the previous
+  result and SCANNING shows beside the title.
 - Where many rings share a pixel, all of them are averaged (up to 16), so the
   drum reads as fine striations instead of crawling noise.
 - Layouts are rebuilt on a worker thread (at most every 5 s, which is when new
@@ -184,7 +188,9 @@ gits-restart --all         # also the file-watching collector (rescans your file
 
 It puts the saved monitor layout back, turns the GNOME extension off and on
 (rebuilding its copies of the wallpaper on every monitor), starts a fresh
-renderer and checks that every monitor picked it up: about 3 seconds.
+renderer and checks that every monitor picked it up: about 3 seconds. It also
+asks the disk chart to measure the home folder again (10-30 s, shown by the
+scanning sweep).
 `tools/install-shortcut.sh` installs the command, its icon, the launcher entry,
 a pin in the dock and the shortcut (`'<Super><Alt>r'` for another key,
 `--no-dock` to skip the pin; `uninstall` removes all of it). A notification
@@ -260,10 +266,10 @@ other scratch output go to `out/`, which is ignored by git.
 ## Lock screen
 
 Off by default. With `[lock_screen] live = true` the tower keeps running behind
-GNOME's clock and password prompt (both extensions; the extension is
-only reloaded at login). While locked, file and folder names in the callouts and the disk chart are
-replaced by codes (no paths) unless `show_names = true`; the system readout
-and disk chart stay. `blur = 0` (default)
+GNOME's clock and password prompt (both extensions; the extension is only
+reloaded at login). The callouts, the system readout and the disk chart stay,
+but file and folder names are replaced by 8-digit codes (no paths) unless
+`show_names = true`: anyone can read a locked screen. `blur = 0` (default)
 shows the picture sharp and is also the cheapest: a blurred live image is
 re-blurred every frame and ballooned memory in testing. The renderer stops
 drawing while GNOME reports the displays as switched off (and resumes when
@@ -318,8 +324,10 @@ sudo sysctl --system
 Every option and its default lives in [`config/default.toml`](config/default.toml),
 which is compiled into the binary. To customise, put only the keys you want to
 change in `~/.config/gits-file-visualizer/config.toml`, or pass
-`--config file.toml`. The window reloads the file while running. Unknown keys
-are rejected, so typos surface immediately.
+`--config file.toml`. The renderer reloads the file a second after you save it
+(a few options, such as `integrated_native_window`, need `gits-restart`).
+Unknown keys are rejected, so typos surface immediately.
+`gits-render default-config` prints every option with its default.
 
 ## Repository layout
 
@@ -331,11 +339,15 @@ are rejected, so typos surface immediately.
 | `crates/gits-render/shaders` | WGSL: tower, sprites, post-processing |
 | `config/default.toml` | All defaults (compiled in) |
 | `extension/gnome-42` | GNOME Shell 42–44 extension (wallpaper embedding) |
-| `packaging/systemd` | User service for the collector |
-| `tools/` | `install-user.sh` (per-user install), `sandbox-shell.sh` (isolated test shell), `make-fonts.sh` |
+| `extension/gnome-45` | GNOME Shell 45+ extension (ES modules; Wayland and X11, screensaver, lit lock screen) |
+| `packaging/systemd`, `packaging/icons` | User service for the collector; icon of the restart tool |
+| `tools/` | `install-user.sh` (per-user install), `install-shortcut.sh` + `restart.sh` (`gits-restart`), `make-bundle.sh` (prebuilt bundle), `display-layout.py`, `stress.py`, `sandbox-shell.sh` (isolated test shell), `make-fonts.sh` |
 | `assets/fonts` | Bundled font subsets + licenses (compiled in; see `tools/make-fonts.sh`) |
 | `docs/DESIGN.md` | Design, decisions, milestones |
+| `docs/release-notes` | Notes published with each GitHub release |
+| `docs/media` | The README's screen recording |
 | `docs/ref` | Low-res reference frames from the film (look-dev only) |
+| `.github` | CI (build/test on Ubuntu 22.04 + 24.04, lint), security checks, Dependabot, releases |
 
 ## Portability
 

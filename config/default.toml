@@ -119,9 +119,10 @@ disk_every = "30m"          # how often the home folder is re-measured (like `du
                             # the result is cached in ~/.cache, so restarts do not re-measure)
 
 [lock_screen]               # the wallpaper behind GNOME's lock screen
-live       = false          # true: keep it running (GNOME has no screensaver: it shows the picture behind
-                            # the clock / password prompt, and turns the monitors off 30 s after the last
-                            # input; nothing here can change that). The extension reads this at lock time
+live       = false          # true: keep it running behind the clock / password prompt, with the callouts,
+                            # readout and disk chart (names as codes, see show_names). GNOME 45+ keeps a locked
+                            # screen lit until the blank time (Settings > Power > Screen Blank); GNOME 42-44
+                            # turns the monitors off ~30 s after the last input. Read at lock time
 show_names = false          # real file and folder names while locked (anyone can read the screen); false: codes
 blur       = 0.0            # 0..1 of GNOME's own lock-screen blur (1 = as GNOME ships it, a smudge). 0 = none: the
                             # sharpest and cheapest; a blurred live picture is re-blurred every frame (GPU, memory)
